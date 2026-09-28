@@ -1,0 +1,21 @@
+[package]
+name = "slask-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "Demo MCP server: echo + current-UTC-time tools (stdio + streamable HTTP)"
+authors = []
+license = "MIT"
+
+[dependencies]
+rmcp = { version = "3.5.0", features = ["transport-io", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7" }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+chrono = "0.4"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
