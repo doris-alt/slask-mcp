@@ -17,15 +17,13 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::transport::stdio;
 use rmcp::{ServiceExt, ServerHandler, tool, tool_handler, tool_router};
 
-use axum::body::Body;
-use axum::extract::DefaultBodyLimit;
+use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode};
-use axum::middleware::{from_fn_with_state, Next};
+use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::Router;
 use tokio_util::sync::CancellationToken;
 use std::time::Duration;
-use tower::timeout::TimeoutLayer;
 
 // ---------------------------------------------------------------------------
 // Tools
@@ -228,6 +226,54 @@ async fn auth_middleware(
     next.run(req).await
 }
 
+/// Hard cap for request execution duration so “hung” handlers can't tie up
+/// the server indefinitely.
+async fn timeout_middleware(req: Request<Body>, next: Next) -> Response<Body> {
+    let result = tokio::time::timeout(Duration::from_secs(10), next.run(req)).await;
+    match result {
+        Ok(res) => res,
+        Err(_) => Response::builder()
+            .status(StatusCode::GATEWAY_TIMEOUT)
+            .header(HeaderName::from_static("content-type"), "application/json")
+            .body(Body::from(
+                r#"{"error":"Timeout","detail":"Request execution exceeded 10 seconds."}"#,
+            ))
+            .unwrap_or_else(|_| Response::new(Body::empty())),
+    }
+}
+
+/// Hard cap for HTTP request bodies.
+///
+/// We read the full body up to `max_bytes`; if it exceeds that limit we
+/// return `413 Payload Too Large`. This is intentionally enforced in
+/// middleware (rather than `DefaultBodyLimit`), because the rmcp handler
+/// doesn't necessarily go through Axum's built-in body extractors.
+async fn body_limit_middleware(
+    req: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    const MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+
+    // Extract and reattach the body so downstream handlers can still read it.
+    let (parts, body) = req.into_parts();
+    match to_bytes(body, MAX_BYTES).await {
+        Ok(bytes) => {
+            let req = Request::from_parts(parts, Body::from(bytes));
+            next.run(req).await
+        }
+        Err(_) => Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header(
+                HeaderName::from_static("content-type"),
+                "application/json",
+            )
+            .body(Body::from(
+                r#"{"error":"PayloadTooLarge","detail":"Request body exceeded 1 MiB."}"#,
+            ))
+            .unwrap_or_else(|_| Response::new(Body::empty())),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stack construction
 // ---------------------------------------------------------------------------
@@ -252,8 +298,8 @@ pub fn new_http_stack(auth: AuthConfig) -> (Router, CancellationToken) {
         // Baseplate hardening for larger MCP servers.
         // 1) put an upper bound on request bodies to avoid unbounded memory use
         // 2) cap request duration so hung downstream code doesn't tie up the server
-        .layer(DefaultBodyLimit::max(1024 * 1024))
-        .layer(TimeoutLayer::new(Duration::from_secs(10)))
+        .layer(from_fn(body_limit_middleware))
+        .layer(from_fn(timeout_middleware))
         .layer(from_fn_with_state(auth, auth_middleware));
 
     (router, ct)

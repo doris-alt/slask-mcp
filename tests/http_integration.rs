@@ -245,6 +245,10 @@ async fn missing_authorization_header_is_401() -> anyhow::Result<()> {
     );
     let body = json_body(res).await?;
     assert_eq!(body["error"].as_str(), Some("Unauthorized"));
+    assert_eq!(
+        body["detail"].as_str(),
+        Some("Missing or invalid Authorization: Bearer header.")
+    );
     Ok(())
 }
 
@@ -333,5 +337,32 @@ async fn correct_bearer_with_lowercase_scheme_is_allowed() -> anyhow::Result<()>
     assert!(res.status().is_success());
     let body = json_body(res).await?;
     assert!(body["result"]["tools"].is_array());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Request size limits
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn payload_too_large_is_rejected() -> anyhow::Result<()> {
+    // Exceed the baseplate DefaultBodyLimit of 1 MiB in `new_http_stack`.
+    // Auth header must be correct so we reach the body limit check.
+    let (mut app, _ct) = new_http_stack(AuthConfig { token: Some(TEST_TOKEN.into()) });
+
+    let big_message = "x".repeat(1_200_000);
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"echo","arguments":{{"message":"{}"}}}}}}"#,
+        big_message
+    );
+
+    let res = send(
+        &mut app,
+        &body,
+        Some(&format!("Bearer {}", TEST_TOKEN)),
+    )
+    .await;
+
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
     Ok(())
 }
