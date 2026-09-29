@@ -56,9 +56,9 @@ The essentials are above; the full documentation lives in
 | [HTTP](docs/http.md) | endpoint, headers, curl examples |
 | [Authentication](docs/authentication.md) | optional Bearer auth (HTTP only) |
 | [Configuration](docs/configuration.md) | environment variables, `.env` |
-| [Testing](docs/testing.md) | the 10-test integration suite |
+| [Testing](docs/testing.md) | the 14-test integration suite |
 
-`cargo test` verifies everything (13 integration tests; no sockets needed).
+`cargo test` verifies everything (14 integration tests; no sockets needed).
 
 ## Requirements
 

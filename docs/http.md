@@ -33,6 +33,27 @@ The service is configured with `with_json_response(true)`, so replies are
 server-sent events. With `with_json_response(false)` rmcp would use SSE
 instead.
 
+## Request limits
+
+Two baseplate limits protect the server from oversized or hung clients
+(both run in middleware, **before** the rmcp handler):
+
+- **Body size — 1 MiB.** Every request body is read with a 1 MiB cap
+  (`axum::body::to_bytes`). Over the limit the server returns `413 Payload
+  Too Large`:
+  ```json
+  {"error":"PayloadTooLarge","detail":"Request body exceeded 1 MiB."}
+  ```
+- **Request duration — 10 s.** Each request is wrapped in a 10-second
+  timeout. A hung handler that exceeds it is cut off with `504 Gateway
+  Timeout`:
+  ```json
+  {"error":"Timeout","detail":"Request execution exceeded 10 seconds."}
+  ```
+
+The timeout timer covers the body read plus the rmcp handler execution, and
+auth runs first (so a missing token is a `401` before any body work).
+
 ## Examples
 
 Terminal 1 — start the server (token unset, so no `Authorization` header
