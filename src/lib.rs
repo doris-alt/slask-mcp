@@ -18,11 +18,14 @@ use rmcp::transport::stdio;
 use rmcp::{ServiceExt, ServerHandler, tool, tool_handler, tool_router};
 
 use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::Router;
 use tokio_util::sync::CancellationToken;
+use std::time::Duration;
+use tower::timeout::TimeoutLayer;
 
 // ---------------------------------------------------------------------------
 // Tools
@@ -119,8 +122,19 @@ impl SlaskTools {
                     .as_deref()
                     .map(|s| s.to_string())
                     .unwrap_or_default(),
-                input_schema: serde_json::to_value(route.attr.input_schema.as_ref())
-                    .expect("tool input schema must serialize to JSON"),
+                // Keep request handling robust: schema serialization is
+                // expected to succeed, but we never want a tool call to
+                // crash the whole server.
+                input_schema: match serde_json::to_value(route.attr.input_schema.as_ref()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(
+                            "failed to serialize tool input schema for `{}`: {e}",
+                            route.attr.name
+                        );
+                        serde_json::Value::Null
+                    }
+                },
             })
             .collect::<Vec<_>>();
         // HashMap iteration order is arbitrary; sort for deterministic output.
@@ -186,16 +200,18 @@ fn has_bearer(headers: &HeaderMap, token: &str) -> bool {
 
 /// `401 Unauthorized` with the header the MCP spec expects, so a client knows to authenticate.
 fn unauthorized_response() -> Response<Body> {
+    // Keep the JSON error body stable even in improbable error paths
+    // (e.g. if Response::builder() fails).
+    const BODY: &str =
+        r#"{"error":"Unauthorized","detail":"Missing or invalid Authorization: Bearer header."}"#;
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         // Lowercase: `HeaderName::from_static` (http 1.5) only accepts the
         // canonical lowercase token set, which matches the header's canonical form.
         .header(HeaderName::from_static("www-authenticate"), "Bearer realm=\"mcp\"")
         .header(HeaderName::from_static("content-type"), "application/json")
-        .body(Body::from(
-            r#"{"error":"Unauthorized","detail":"Missing or invalid Authorization: Bearer header."}"#,
-        ))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
+        .body(Body::from(BODY))
+        .unwrap_or_else(|_| Response::new(Body::from(BODY)))
 }
 
 /// Enforce `Authorization: Bearer` on the HTTP transport when a token is configured.
@@ -233,6 +249,11 @@ pub fn new_http_stack(auth: AuthConfig) -> (Router, CancellationToken) {
 
     let router = Router::new()
         .nest_service("/mcp", service)
+        // Baseplate hardening for larger MCP servers.
+        // 1) put an upper bound on request bodies to avoid unbounded memory use
+        // 2) cap request duration so hung downstream code doesn't tie up the server
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(TimeoutLayer::new(Duration::from_secs(10)))
         .layer(from_fn_with_state(auth, auth_middleware));
 
     (router, ct)
