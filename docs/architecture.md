@@ -17,7 +17,7 @@ src/
   lib.rs                 # tools, auth, new_http_stack, serve_stdio
   main.rs                # thin binary (stdio by default, `--http` flag)
 tests/
-  http_integration.rs    # 10 integration tests (no sockets)
+  http_integration.rs    # 13 integration tests (no sockets)
 ```
 
 ## Key abstractions
@@ -29,6 +29,7 @@ Tools are declared on one type via rmcp's `#[tool_router]` macro
 
 - `echo(message: String) -> String`
 - `current_time_utc() -> String`
+- `search_tools(query: String) -> Json<SearchResult>`
 
 The `#[tool_handler(name = "slask-mcp", instructions = "...")]` attribute on
 `impl ServerHandler for SlaskTools` auto-generates `call_tool`,
@@ -86,7 +87,7 @@ POST /mcp
   → axum Router
       └─ auth middleware (State<AuthConfig>)      [401 or pass through]
           └─ rmcp StreamableHttpService           [JSON-RPC ↔ HTTP]
-              └─ SlaskTools (ServerHandler)       [echo / current_time_utc]
+              └─ SlaskTools (ServerHandler) [echo / current_time_utc / search_tools]
 ```
 
 ## Sessions

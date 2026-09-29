@@ -5,7 +5,7 @@ Guides for building, running, extending, and testing **slask-mcp**.
 | Document | Covers |
 |---|---|
 | [Architecture](architecture.md) | Crate layout, rmcp integration, the HTTP request pipeline, session model, graceful shutdown |
-| [Tools](tools.md) | `echo` and `current_time_utc`: schemas, request/response examples |
+| [Tools](tools.md) | `echo`, `current_time_utc`, `search_tools`: schemas, request/response examples |
 | [Stdio transport](stdio.md) | stdin/stdout contract, raw JSON-RPC handshake, wiring up real clients |
 | [HTTP transport](http.md) | Streamable HTTP endpoint, required headers, curl examples |
 | [Authentication](authentication.md) | Optional Bearer-token auth (HTTP only) |

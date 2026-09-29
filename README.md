@@ -1,7 +1,7 @@
 # slask-mcp
 
 A minimal MCP server in Rust built on the official
-[rmcp](https://github.com/modelcontextprotocol/rust-sdk) SDK. Two demo
+[rmcp](https://github.com/modelcontextprotocol/rust-sdk) SDK. Three demo
 tools, two transports (stdio and streamable HTTP), optional Bearer auth on
 HTTP.
 
@@ -9,6 +9,7 @@ HTTP.
 |---|---|
 | `echo` | echoes a string: `{"message":"hi"}` → `"hi"` |
 | `current_time_utc` | current UTC time, ISO 8601 |
+| `search_tools` | case-insensitive search over tool names/descriptions, with input schemas |
 
 ## Quick start
 
@@ -50,14 +51,14 @@ The essentials are above; the full documentation lives in
 | | |
 |---|---|
 | [Architecture](docs/architecture.md) | crate layout, HTTP pipeline, session model, shutdown |
-| [Tools](docs/tools.md) | `echo` and `current_time_utc`: schemas + examples |
+| [Tools](docs/tools.md) | `echo`, `current_time_utc`, `search_tools`: schemas + examples |
 | [Stdio](docs/stdio.md) | raw JSON-RPC handshake, wiring up clients |
 | [HTTP](docs/http.md) | endpoint, headers, curl examples |
 | [Authentication](docs/authentication.md) | optional Bearer auth (HTTP only) |
 | [Configuration](docs/configuration.md) | environment variables, `.env` |
 | [Testing](docs/testing.md) | the 10-test integration suite |
 
-`cargo test` verifies everything (10 integration tests; no sockets needed).
+`cargo test` verifies everything (13 integration tests; no sockets needed).
 
 ## Requirements
 

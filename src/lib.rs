@@ -1,5 +1,5 @@
 //! Demo MCP server.
-//! Tools: `echo(message)` · `current_time_utc()`.
+//! Tools: `echo(message)` · `current_time_utc()` · `search_tools(query)`.
 //!
 //! - **Stdio**: `serve_stdio()` — speak JSON-RPC over stdin/stdout.
 //! - **Streamable HTTP**: `new_http_stack(auth)` — router at `/mcp`, optionally
@@ -7,7 +7,8 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use rmcp::handler::server::wrapper::Parameters;
+use rmcp::handler::server::wrapper::{Json, Parameters};
+use serde_json::Value;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager,
     StreamableHttpServerConfig,
@@ -33,6 +34,37 @@ struct EchoParams {
     message: String,
 }
 
+/// Tool input for `search_tools`.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SearchToolsParams {
+    query: String,
+}
+
+/// One tool matched by a `search_tools` query.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct SearchMatch {
+    /// The tool's name, as advertised by `tools/list`.
+    name: String,
+    /// The tool's JSON Schema, exactly as `tools/list` reports it.
+    #[serde(rename = "inputSchema")]
+    input_schema: Value,
+    /// The human-readable description used for matching and shown to the client.
+    description: String,
+}
+
+/// The full result of a `search_tools` query, delivered as structured output.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+struct SearchResult {
+    /// The query as submitted.
+    query: String,
+    /// Total number of tools the server advertises (`matched` when the query
+    /// is empty).
+    total: usize,
+    /// Tools whose name or description contains the query (case-insensitive
+    /// substring), sorted by name.
+    matched: Vec<SearchMatch>,
+}
+
 #[derive(Clone)]
 struct SlaskTools;
 
@@ -47,6 +79,59 @@ impl SlaskTools {
     fn current_time_utc(&self) -> String {
         Utc::now().to_rfc3339()
     }
+
+    /// Search the advertised tools by a case-insensitive substring of their
+    /// name or description (empty query matches all). Results are returned as
+    /// structured output (`structuredContent`) with each match carrying its
+    /// `inputSchema`, so clients can re-read the schema for any tool without
+    /// a fresh `tools/list`.
+    #[tool(description = "Search slask-mcp tools by a case-insensitive substring of their name or description. Returns a structured list of matching tools with their input schemas.")]
+    fn search_tools(
+        &self,
+        Parameters(SearchToolsParams { query }): Parameters<SearchToolsParams>,
+    ) -> Json<SearchResult> {
+        let query_lower = query.to_ascii_lowercase();
+        // The `#[tool_router]` macro emits `Self::tool_router()` with the full
+        // tool registry — the same source `tools/list` is generated from, so
+        // there is nothing to duplicate.
+        let router = Self::tool_router();
+        let total = router.map.len();
+        let mut matched = router
+            .map
+            .values()
+            .filter(|route| {
+                route
+                    .attr
+                    .name
+                    .to_ascii_lowercase()
+                    .contains(&query_lower)
+                    || route
+                        .attr
+                        .description
+                        .as_deref()
+                        .is_some_and(|d| d.to_ascii_lowercase().contains(&query_lower))
+            })
+            .map(|route| SearchMatch {
+                name: route.attr.name.to_string(),
+                description: route
+                    .attr
+                    .description
+                    .as_deref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                input_schema: serde_json::to_value(route.attr.input_schema.as_ref())
+                    .expect("tool input schema must serialize to JSON"),
+            })
+            .collect::<Vec<_>>();
+        // HashMap iteration order is arbitrary; sort for deterministic output.
+        matched.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Json(SearchResult {
+            query,
+            total,
+            matched,
+        })
+    }
 }
 
 /// `tool_handler` auto-generates `call_tool` / `list_tools` / `get_tool`
@@ -54,7 +139,7 @@ impl SlaskTools {
 /// An empty impl is therefore sufficient.
 #[tool_handler(
     name = "slask-mcp",
-    instructions = "Demo server. Tools: `echo({\"message\":...})` echoes a string; `current_time_utc()` returns the current UTC time in ISO 8601.",
+    instructions = "Demo server. Tools: `echo({\"message\":...})` echoes a string; `current_time_utc()` returns the current UTC time in ISO 8601; `search_tools({\"query\":...})` finds tools by name or description (case-insensitive) and returns them with their input schemas.",
 )]
 impl ServerHandler for SlaskTools {}
 

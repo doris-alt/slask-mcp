@@ -54,6 +54,19 @@ async fn json_body(res: Response) -> anyhow::Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Tool names in the `matched` list of a `search_tools` `tools/call` reply.
+/// The search tool returns its result as structured output, so the names live
+/// under `result.structuredContent.matched` (not in `content` like the text
+/// tools `echo` / `current_time_utc`).
+fn search_matched_names(body: &Value) -> Vec<&str> {
+    body["result"]["structuredContent"]["matched"]
+        .as_array()
+        .expect("search_tools result must have a matched array")
+        .iter()
+        .map(|m| m["name"].as_str().expect("matched tool must have a name"))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Auth disabled (SLASK_MCP_TOKEN unset / empty)
 // ---------------------------------------------------------------------------
@@ -134,6 +147,76 @@ async fn current_time_utc_is_rfc3339_utc_when_auth_disabled() -> anyhow::Result<
     assert_eq!(dt.naive_utc(), dt.naive_local());
     // Must be close to "now".
     assert!(dt.signed_duration_since(chrono::Utc::now()).abs() < chrono::TimeDelta::weeks(1));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// search_tools
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_tools_returns_all_tools_sorted_for_empty_query() -> anyhow::Result<()> {
+    let (mut app, _ct) = new_http_stack(AuthConfig { token: None });
+    let res = send(
+        &mut app,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_tools","arguments":{"query":""}}}"#,
+        None,
+    )
+    .await;
+
+    assert!(res.status().is_success());
+    let body = json_body(res).await?;
+    assert_eq!(body["result"]["isError"].as_bool(), Some(false));
+    assert_eq!(body["result"]["structuredContent"]["query"], "");
+    assert_eq!(body["result"]["structuredContent"]["total"], 3);
+    // The registry is a HashMap, so the tool sorts results by name to be
+    // deterministic.
+    assert_eq!(
+        search_matched_names(&body),
+        vec!["current_time_utc", "echo", "search_tools"]
+    );
+    // Every match mirrors the shape of a `tools/list` tool entry: name,
+    // description and inputSchema.
+    for m in body["result"]["structuredContent"]["matched"].as_array().unwrap() {
+        assert!(m["name"].is_string());
+        assert!(m["description"].is_string());
+        assert!(m["inputSchema"].is_object());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_tools_matches_name_case_insensitive() -> anyhow::Result<()> {
+    // Uppercase "ECHO" must match tool `echo` (name match, case-insensitive).
+    let (mut app, _ct) = new_http_stack(AuthConfig { token: None });
+    let res = send(
+        &mut app,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_tools","arguments":{"query":"ECHO"}}}"#,
+        None,
+    )
+    .await;
+
+    assert!(res.status().is_success());
+    let body = json_body(res).await?;
+    assert_eq!(search_matched_names(&body), vec!["echo"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_tools_matches_description_substring() -> anyhow::Result<()> {
+    // "client" appears in no tool name but in `echo`'s description — proves
+    // descriptions are searchable, not just names.
+    let (mut app, _ct) = new_http_stack(AuthConfig { token: None });
+    let res = send(
+        &mut app,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_tools","arguments":{"query":"client"}}}"#,
+        None,
+    )
+    .await;
+
+    assert!(res.status().is_success());
+    let body = json_body(res).await?;
+    assert_eq!(search_matched_names(&body), vec!["echo"]);
     Ok(())
 }
 
