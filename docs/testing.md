@@ -5,7 +5,7 @@ in the crate — none exist at this snapshot).
 
 ## Coverage
 
-`tests/http_integration.rs` contains **10 integration tests** that drive
+`tests/http_integration.rs` contains **13 integration tests** that drive
 the **real** router built by `new_http_stack(auth)` — the actual auth
 middleware plus the rmcp `StreamableHttpService` — with **no sockets**.
 An axum `Router` is a tower `Service`, so each test builds a `Request`,
@@ -16,20 +16,23 @@ calls `app.call(req).await`, and inspects the `Response`.
 | # | Test | Asserts |
 |---|---|---|
 | 1 | `initialize_returns_server_info_when_auth_disabled` | success status, `serverInfo.name == "slask-mcp"` |
-| 2 | `tools_list_works_without_auth` | success status, both tool names present |
+| 2 | `tools_list_works_without_auth` | success status, tool names present |
 | 3 | `echo_returns_message_when_auth_disabled` | success status, echoed text, `isError: false` |
 | 4 | `current_time_utc_is_rfc3339_utc_when_auth_disabled` | success status, valid RFC 3339 timestamp, UTC, within one week of now |
+| 5 | `search_tools_returns_all_tools_sorted_for_empty_query` | `structuredContent.total == 3`, all tools present and name-sorted |
+| 6 | `search_tools_matches_name_case_insensitive` | only `echo` matched for query `"ECHO"` |
+| 7 | `search_tools_matches_description_substring` | only `echo` matched via its description (no name match) |
 
 ### Auth enabled (`AuthConfig { token: Some(...) }`)
 
 | # | Test | Asserts |
 |---|---|---|
-| 5 | `missing_authorization_header_is_401` | 401 + `WWW-Authenticate: Bearer realm="mcp"` + JSON `{"error":"Unauthorized",...}` |
-| 6 | `wrong_bearer_token_is_401` | 401 |
-| 7 | `initialize_is_401_without_authorization_when_token_set` | 401 (auth applies to the handshake too) |
-| 8 | `tools_list_allowed_with_correct_bearer` | success status, both tools listed |
-| 9 | `echo_allowed_with_correct_bearer` | success status, text echoed |
-| 10 | `correct_bearer_with_lowercase_scheme_is_allowed` | success status (scheme match is case-insensitive) |
+| 8 | `missing_authorization_header_is_401` | 401 + `WWW-Authenticate: Bearer realm="mcp"` + JSON `{"error":"Unauthorized",...}` |
+| 9 | `wrong_bearer_token_is_401` | 401 |
+| 10 | `initialize_is_401_without_authorization_when_token_set` | 401 (auth applies to the handshake too) |
+| 11 | `tools_list_allowed_with_correct_bearer` | success status, tools listed |
+| 12 | `echo_allowed_with_correct_bearer` | success status, text echoed |
+| 13 | `correct_bearer_with_lowercase_scheme_is_allowed` | success status (scheme match is case-insensitive) |
 
 ## How it works
 
@@ -43,6 +46,10 @@ calls `app.call(req).await`, and inspects the `Response`.
 - **`json_body(res)`** — `axum::body::to_bytes(res.into_body(), usize::MAX)`
   then `serde_json::from_slice`. `Body` is not `Clone` and is consumed by
   `to_bytes`, so pass `res.into_body()`, not `res.body()`.
+- **`search_matched_names(body)`** — reads
+  `result.structuredContent.matched` for `search_tools` replies: that tool
+  returns structured output, so its names live in `structuredContent`, not
+  `content` like the text tools.
 
 ## Gotchas this suite ran into
 
