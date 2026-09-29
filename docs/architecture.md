@@ -17,7 +17,7 @@ src/
   lib.rs                 # tools, auth, new_http_stack, serve_stdio
   main.rs                # thin binary (stdio by default, `--http` flag)
 tests/
-  http_integration.rs    # 13 integration tests (no sockets)
+  http_integration.rs    # 14 integration tests (no sockets)
 ```
 
 ## Key abstractions
@@ -30,6 +30,12 @@ Tools are declared on one type via rmcp's `#[tool_router]` macro
 - `echo(message: String) -> String`
 - `current_time_utc() -> String`
 - `search_tools(query: String) -> Json<SearchResult>`
+
+  `search_tools` reads the live registry (`Self::tool_router()`), so its
+  `inputSchema` values are always the same ones `tools/list` reports — nothing
+  to keep in sync by hand. Schema serialization is made crash-proof: on the
+  (improbable) failure to serialize a schema it logs an error and returns
+  `inputSchema: null` instead of panicking the whole server.
 
 The `#[tool_handler(name = "slask-mcp", instructions = "...")]` attribute on
 `impl ServerHandler for SlaskTools` auto-generates `call_tool`,
@@ -48,17 +54,25 @@ See [authentication](authentication.md) for behaviour details.
 
 ### `new_http_stack(auth) -> (Router, CancellationToken)`
 
-Builds the streamable-HTTP stack in three steps:
+Builds the streamable-HTTP stack, then wraps it in the baseplate
+hardening layers. (Axum applies `.layer()` only to routes that already
+exist at the call site, and the **last** `.layer()` call becomes the
+outermost layer — the first one a request hits.)
 
 1. A `StreamableHttpService` (rmcp) with a `LocalSessionManager`,
    configured stateless (`legacy_session_mode(false)`) and with plain JSON
    replies (`with_json_response(true)`).
 2. Nest it at `/mcp`: `Router::new().nest_service("/mcp", service)`.
-3. Apply the auth middleware **after** the routes exist:
-   `.layer(from_fn_with_state(auth, auth_middleware))`.
-
-   This order matters: axum applies `.layer()` only to routes that already
-   exist at the call site.
+3. Apply the baseplate hardening, innermost → outermost:
+   - `.layer(from_fn(body_limit_middleware))` — read the whole body up to
+     1 MiB (`axum::body::to_bytes`); over the limit → `413 Payload Too
+     Large` with a JSON error body (see [http](http.md)).
+   - `.layer(from_fn(timeout_middleware))` — wrap the handler in
+     `tokio::time::timeout(10s)`; a hung handler past 10 s → `504 Gateway
+     Timeout` with a JSON error body (see [http](http.md)).
+   - `.layer(from_fn_with_state(auth, auth_middleware))` — the Bearer-token
+     guard, outermost: `401` before any body work when auth is configured
+     and the header is missing or invalid (see [authentication](authentication.md)).
 
 It also creates a `CancellationToken`, hands a child token to the rmcp
 service via `with_cancellation_token`, and returns the token for graceful
@@ -86,8 +100,10 @@ is closed.
 POST /mcp
   → axum Router
       └─ auth middleware (State<AuthConfig>)      [401 or pass through]
-          └─ rmcp StreamableHttpService           [JSON-RPC ↔ HTTP]
-              └─ SlaskTools (ServerHandler) [echo / current_time_utc / search_tools]
+          └─ timeout middleware                    [504 if the request runs > 10 s]
+              └─ body-limit middleware             [413 if the body exceeds 1 MiB]
+                  └─ rmcp StreamableHttpService   [JSON-RPC ↔ HTTP]
+                      └─ SlaskTools (ServerHandler) [echo / current_time_utc / search_tools]
 ```
 
 ## Sessions
@@ -126,4 +142,4 @@ tracing + tracing-subscriber:
 | anyhow | 1 | error propagation |
 | tracing / tracing-subscriber | 0.1 / 0.3 | logging |
 | dotenvy | 0.15 | loads `.env` (HTTP mode only) |
-| tower | 0.5 (dev) | `Router::call` in the integration tests |
+| tower | 0.5 (main) | `Service` trait for `Router::call` in the integration tests (main dep since baseplate hardening) |

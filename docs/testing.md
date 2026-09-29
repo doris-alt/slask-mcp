@@ -5,7 +5,7 @@ in the crate — none exist at this snapshot).
 
 ## Coverage
 
-`tests/http_integration.rs` contains **13 integration tests** that drive
+`tests/http_integration.rs` contains **14 integration tests** that drive
 the **real** router built by `new_http_stack(auth)` — the actual auth
 middleware plus the rmcp `StreamableHttpService` — with **no sockets**.
 An axum `Router` is a tower `Service`, so each test builds a `Request`,
@@ -27,12 +27,18 @@ calls `app.call(req).await`, and inspects the `Response`.
 
 | # | Test | Asserts |
 |---|---|---|
-| 8 | `missing_authorization_header_is_401` | 401 + `WWW-Authenticate: Bearer realm="mcp"` + JSON `{"error":"Unauthorized",...}` |
+| 8 | `missing_authorization_header_is_401` | 401 + `WWW-Authenticate: Bearer realm="mcp"` + JSON `{"error":"Unauthorized","detail":"Missing or invalid Authorization: Bearer header."}` |
 | 9 | `wrong_bearer_token_is_401` | 401 |
 | 10 | `initialize_is_401_without_authorization_when_token_set` | 401 (auth applies to the handshake too) |
 | 11 | `tools_list_allowed_with_correct_bearer` | success status, tools listed |
 | 12 | `echo_allowed_with_correct_bearer` | success status, text echoed |
 | 13 | `correct_bearer_with_lowercase_scheme_is_allowed` | success status (scheme match is case-insensitive) |
+
+### Request size limits
+
+| # | Test | Asserts |
+|---|---|---|
+| 14 | `payload_too_large_is_rejected` | 413 `Payload Too Large` for a > 1 MiB body (auth enabled with a correct Bearer; a 1.2 MiB `echo` payload) |
 
 ## How it works
 
