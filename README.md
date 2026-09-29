@@ -10,7 +10,7 @@ A minimal demo MCP server written in Rust with the official [`rmcp`](https://git
 ## Transports
 
 - **Stdio** (default): `./slask-mcp` — speak JSON-RPC over stdin/stdout. Point any MCP client (e.g. the [MCP Inspector](https://github.com/modelcontextprotocol/inspector) in Stdio mode) at the binary; it performs the handshake for you.
-- **Streamable HTTP**: `./slask-mcp --http` — listens at `127.0.0.1:$SLASK_MCP_PORT/mcp`.
+- **Streamable HTTP**: `./slask-mcp --http` — listens at `127.0.0.1:$SLASK_MCP_PORT/mcp`. When `SLASK_MCP_TOKEN` is set, requests must carry `Authorization: Bearer <token>` (see [Authentication](#authentication)).
 
 ## Configuration (`.env`)
 
@@ -19,7 +19,25 @@ Copy `.env.example` to `.env` and edit (only affects the HTTP transport):
 ```env
 SLASK_MCP_PORT=8000        # HTTP port (default 8000)
 SLASK_MCP_BIND=127.0.0.1   # HTTP bind address (default 127.0.0.1)
+SLASK_MCP_TOKEN=            # (optional) HTTP Bearer token — see Authentication
 ```
+
+## Authentication
+
+The **stdio** transport is never authenticated — `SLASK_MCP_TOKEN` only affects the HTTP transport. Auth is **opt-in**:
+
+- When `SLASK_MCP_TOKEN` is set and non-empty, every request to `/mcp` (including `initialize`) must send `Authorization: Bearer <token>`. Missing or invalid header → HTTP 401:
+
+```text
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer realm="mcp"
+content-type: application/json
+
+{"error":"Unauthorized","detail":"Missing or invalid Authorization: Bearer header."}
+```
+
+- When `SLASK_MCP_TOKEN` is unset or empty (the default), the HTTP transport is open and the `curl` examples below work without the header.
+- The token is compared in constant time and never logged. `WWW-Authenticate` follows the MCP spec so a client knows the endpoint expects a Bearer token.
 
 ## Quick tests
 
@@ -54,16 +72,20 @@ Logs (if any) go to **stderr**, so stdout stays clean JSON-RPC.
 ```bash
 # terminal 1 — start the server (reads SLASK_MCP_PORT from .env / env):
 SLASK_MCP_PORT=9000 cargo run -- --http
-# terminal 2 — the `Accept` header is required (406 without it):
+# terminal 2 — the `Accept` header is required (406 without it).
+# If the server has SLASK_MCP_TOKEN set, the `Authorization` header is
+# required too (see Authentication); omit it when the token is unset.
 curl -s -X POST http://127.0.0.1:9000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer $SLASK_MCP_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 # call a tool:
 curl -s -X POST http://127.0.0.1:9000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer $SLASK_MCP_TOKEN" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"message":"hi"}}}'
 ```
 
