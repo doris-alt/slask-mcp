@@ -15,6 +15,12 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::transport::stdio;
 use rmcp::{ServiceExt, ServerHandler, tool, tool_handler, tool_router};
 
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode};
+use axum::middleware::{from_fn_with_state, Next};
+use axum::Router;
+
 /// Tool input for `echo`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct EchoParams {
@@ -45,6 +51,73 @@ impl SlaskTools {
     instructions = "Demo server. Tools: `echo({\"message\":...})` echoes a string; `current_time_utc()` returns the current UTC time in ISO 8601.",
 )]
 impl ServerHandler for SlaskTools {}
+
+// --- HTTP Bearer-token auth (stdio is a separate code path; unaffected) ---
+
+/// HTTP auth config. `token` is `None` unless `SLASK_MCP_TOKEN` is set and
+/// non-empty; then every `/mcp` request must carry `Authorization: Bearer <token>`.
+#[derive(Clone)]
+struct AuthConfig {
+    token: Option<String>,
+}
+
+/// True if `headers` carry `Authorization: Bearer <token>` (scheme is case-insensitive).
+fn has_bearer(headers: &HeaderMap, token: &str) -> bool {
+    let Some(value) = headers.get("authorization").and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    let mut parts = value.split_whitespace();
+    let scheme = match parts.next() {
+        Some(s) => s,
+        None => return false,
+    };
+    let t = match parts.next() {
+        Some(t) => t,
+        None => return false,
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    // Constant-time comparison (length checked first; the loop never short-circuits).
+    let a = t.as_bytes();
+    let b = token.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut ok = true;
+    for (x, y) in a.iter().zip(b.iter()) {
+        ok &= x == y;
+    }
+    ok
+}
+
+/// `401 Unauthorized` with the header the MCP spec expects, so a client knows to authenticate.
+fn unauthorized_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        // Lowercase: `HeaderName::from_static` (http 1.5) only accepts the
+        // canonical lowercase token set, which matches the header's canonical form.
+        .header(HeaderName::from_static("www-authenticate"), "Bearer realm=\"mcp\"")
+        .header(HeaderName::from_static("content-type"), "application/json")
+        .body(Body::from(
+            r#"{"error":"Unauthorized","detail":"Missing or invalid Authorization: Bearer header."}"#,
+        ))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Enforce `Authorization: Bearer` on the HTTP transport when a token is configured.
+async fn auth_middleware(
+    State(cfg): State<AuthConfig>,
+    req: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    if let Some(token) = cfg.token.as_deref()
+        && !has_bearer(req.headers(), token)
+    {
+        return unauthorized_response();
+    }
+    next.run(req).await
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -85,6 +158,13 @@ async fn http_server() -> Result<()> {
         .parse::<u16>()
         .unwrap_or(8000);
 
+    // Optional Bearer token for the HTTP transport (stdio stays open).
+    let token = std::env::var("SLASK_MCP_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let auth = AuthConfig { token };
+
     let ct = tokio_util::sync::CancellationToken::new();
     let service = StreamableHttpService::new(
         || Ok(SlaskTools {}),
@@ -94,9 +174,17 @@ async fn http_server() -> Result<()> {
             .with_json_response(true)         // plain JSON replies (easy to test with curl)
             .with_cancellation_token(ct.child_token()),
     );
-    let router = axum::Router::new().nest_service("/mcp", service);
     let addr = format!("{}:{}", bind, port);
-    tracing::info!(addr, "serving MCP over streamable HTTP at {addr}/mcp");
+    if auth.token.is_some() {
+        tracing::info!(addr, "serving MCP over streamable HTTP at {addr}/mcp (Bearer auth enabled)");
+    } else {
+        tracing::info!(addr, "serving MCP over streamable HTTP at {addr}/mcp (no auth)");
+    }
+    // The layer must wrap the nested service, so it is applied *after*
+    // `nest_service` (axum applies layers to routes that already exist).
+    let router = Router::new()
+        .nest_service("/mcp", service)
+        .layer(from_fn_with_state(auth, auth_middleware));
     let tcp = tokio::net::TcpListener::bind(&addr).await?;
     let _ = axum::serve(tcp, router)
         .with_graceful_shutdown(async move {
