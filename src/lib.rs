@@ -17,12 +17,13 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::transport::stdio;
 use rmcp::{ServiceExt, ServerHandler, tool, tool_handler, tool_router};
 
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode};
-use axum::middleware::{from_fn_with_state, Next};
+use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::Router;
 use tokio_util::sync::CancellationToken;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Tools
@@ -119,8 +120,19 @@ impl SlaskTools {
                     .as_deref()
                     .map(|s| s.to_string())
                     .unwrap_or_default(),
-                input_schema: serde_json::to_value(route.attr.input_schema.as_ref())
-                    .expect("tool input schema must serialize to JSON"),
+                // Keep request handling robust: schema serialization is
+                // expected to succeed, but we never want a tool call to
+                // crash the whole server.
+                input_schema: match serde_json::to_value(route.attr.input_schema.as_ref()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(
+                            "failed to serialize tool input schema for `{}`: {e}",
+                            route.attr.name
+                        );
+                        serde_json::Value::Null
+                    }
+                },
             })
             .collect::<Vec<_>>();
         // HashMap iteration order is arbitrary; sort for deterministic output.
@@ -186,16 +198,18 @@ fn has_bearer(headers: &HeaderMap, token: &str) -> bool {
 
 /// `401 Unauthorized` with the header the MCP spec expects, so a client knows to authenticate.
 fn unauthorized_response() -> Response<Body> {
+    // Keep the JSON error body stable even in improbable error paths
+    // (e.g. if Response::builder() fails).
+    const BODY: &str =
+        r#"{"error":"Unauthorized","detail":"Missing or invalid Authorization: Bearer header."}"#;
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         // Lowercase: `HeaderName::from_static` (http 1.5) only accepts the
         // canonical lowercase token set, which matches the header's canonical form.
         .header(HeaderName::from_static("www-authenticate"), "Bearer realm=\"mcp\"")
         .header(HeaderName::from_static("content-type"), "application/json")
-        .body(Body::from(
-            r#"{"error":"Unauthorized","detail":"Missing or invalid Authorization: Bearer header."}"#,
-        ))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
+        .body(Body::from(BODY))
+        .unwrap_or_else(|_| Response::new(Body::from(BODY)))
 }
 
 /// Enforce `Authorization: Bearer` on the HTTP transport when a token is configured.
@@ -210,6 +224,54 @@ async fn auth_middleware(
         return unauthorized_response();
     }
     next.run(req).await
+}
+
+/// Hard cap for request execution duration so “hung” handlers can't tie up
+/// the server indefinitely.
+async fn timeout_middleware(req: Request<Body>, next: Next) -> Response<Body> {
+    let result = tokio::time::timeout(Duration::from_secs(10), next.run(req)).await;
+    match result {
+        Ok(res) => res,
+        Err(_) => Response::builder()
+            .status(StatusCode::GATEWAY_TIMEOUT)
+            .header(HeaderName::from_static("content-type"), "application/json")
+            .body(Body::from(
+                r#"{"error":"Timeout","detail":"Request execution exceeded 10 seconds."}"#,
+            ))
+            .unwrap_or_else(|_| Response::new(Body::empty())),
+    }
+}
+
+/// Hard cap for HTTP request bodies.
+///
+/// We read the full body up to `max_bytes`; if it exceeds that limit we
+/// return `413 Payload Too Large`. This is intentionally enforced in
+/// middleware (rather than `DefaultBodyLimit`), because the rmcp handler
+/// doesn't necessarily go through Axum's built-in body extractors.
+async fn body_limit_middleware(
+    req: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    const MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+
+    // Extract and reattach the body so downstream handlers can still read it.
+    let (parts, body) = req.into_parts();
+    match to_bytes(body, MAX_BYTES).await {
+        Ok(bytes) => {
+            let req = Request::from_parts(parts, Body::from(bytes));
+            next.run(req).await
+        }
+        Err(_) => Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header(
+                HeaderName::from_static("content-type"),
+                "application/json",
+            )
+            .body(Body::from(
+                r#"{"error":"PayloadTooLarge","detail":"Request body exceeded 1 MiB."}"#,
+            ))
+            .unwrap_or_else(|_| Response::new(Body::empty())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +295,11 @@ pub fn new_http_stack(auth: AuthConfig) -> (Router, CancellationToken) {
 
     let router = Router::new()
         .nest_service("/mcp", service)
+        // Baseplate hardening for larger MCP servers.
+        // 1) put an upper bound on request bodies to avoid unbounded memory use
+        // 2) cap request duration so hung downstream code doesn't tie up the server
+        .layer(from_fn(body_limit_middleware))
+        .layer(from_fn(timeout_middleware))
         .layer(from_fn_with_state(auth, auth_middleware));
 
     (router, ct)

@@ -2,3 +2,6 @@ target/
 .env
 
 *~
+
+# NFS temporary uploads (often appear when copying/mounting)
+.nfs*
