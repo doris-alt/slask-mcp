@@ -13,11 +13,11 @@ as a JSON-RPC body — see [stdio](stdio.md) for the message shapes.
 
 ## Required headers
 
-| Header | Value | Note |
-|---|---|---|
-| `Content-Type` | `application/json` | JSON-RPC body |
-| `Accept` | `application/json, text/event-stream` | required — 406 if missing |
-| `Authorization` | `Bearer <token>` | only when `SLASK_MCP_TOKEN` is set — see [authentication](authentication.md) |
+| Header           | Value                                  | Note                                                                          |
+| ---------------- | -------------------------------------- | ----------------------------------------------------------------------------- |
+| `Content-Type`   | `application/json`                     | JSON-RPC body                                                                 |
+| `Accept`         | `application/json, text/event-stream`  | required — 406 if missing                                                     |
+| `Authorization`  | `Bearer <token>`                       | only when `SLASK_MCP_TOKEN` is set — see [authentication](authentication.md)  |
 
 **`Host`** — rmcp enforces DNS-rebinding protection and validates the
 `Host` header (notably on `initialize`). Over a real connection the
