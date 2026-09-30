@@ -6,6 +6,7 @@
   "engines": { "node": ">=20" },
   "bin": { "slask-client": "./cli.js" },
   "dependencies": {
-    "@modelcontextprotocol/client": "^2.2.0"
+    "@modelcontextprotocol/client": "^2.2.0",
+    "openai": "^7.25.0"
   }
 }
