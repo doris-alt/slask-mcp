@@ -72,12 +72,12 @@ slask-agent >
 
 ### REPL commands
 
-| Command | What it does |
-|---|---|
-| `/help`, `/h` | show this help |
-| `/tools`, `/t` | list the slask-mcp tools (live, from the server) |
-| `/reset`, `/clear`, `/c` | clear the conversation history |
-| `/quit`, `/exit`, `/q` (or `Ctrl+C`) | leave the REPL |
+| Command                               | What it does                                      |
+| ------------------------------------- | ------------------------------------------------- |
+| `/help`, `/h`                         | show this help                                    |
+| `/tools`, `/t`                        | list the slask-mcp tools (live, from the server)  |
+| `/reset`, `/clear`, `/c`              | clear the conversation history                    |
+| `/quit`, `/exit`, `/q` (or `Ctrl+C`)  | leave the REPL                                    |
 
 Any other line is a chat turn. Tool failures are fed back to the model
 (instead of crashing), so a bad/unknown tool name just surfaces as an error
