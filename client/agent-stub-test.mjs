@@ -6,11 +6,12 @@ import { runAgentTurn, mcpToolsToOpenai, SYSTEM_PROMPT } from "./agent.js";
 import { connect, listTools, close } from "./client.js";
 
 const url = process.env.MCP_URL ?? "http://127.0.0.1:9000/mcp";
-console.log("using MCP at", url);
+const token = process.env.SLASK_MCP_TOKEN ?? null;
+console.log("using MCP at", url, token ? "(with Bearer token)" : "(no auth)");
 
 let client;
 try {
-  client = await connect({ url });
+  client = await connect({ url, token });
 } catch (e) {
   console.error("could not connect:", e.message);
   process.exit(2);
