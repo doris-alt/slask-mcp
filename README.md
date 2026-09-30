@@ -72,6 +72,7 @@ The essentials are above; the full documentation lives in
 | [Authentication](docs/authentication.md) | optional Bearer-token auth (HTTP only) |
 | [Configuration](docs/configuration.md) | environment variables, `.env` |
 | [Testing](docs/testing.md) | the 14-test integration suite — drives the real router, no sockets |
+| [Client](client/README.md) | small Node.js CLI over streamable HTTP: `list`, `call <tool>` |
 
 `cargo test` verifies everything: 14 integration tests, no sockets needed.
 
