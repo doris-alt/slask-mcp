@@ -95,13 +95,13 @@ node cli.js call echo --args '{"message":"hi"}'   # raw JSON arguments
 
 ## Options & environment
 
-| Setting | Flag | Env var | Default |
-|---|---|---|---|
-| MCP server endpoint (full URL, **incl. `/mcp`**) | `--url`, `-u` | `SLASK_MCP_URL` | `http://127.0.0.1:8000/mcp` |
-| Bearer token | `--token`, `-t` | `SLASK_MCP_TOKEN` | unset (no auth header sent) |
-| OpenAI base URL (chat) | `--base-url`, `-b` | `API_BASE` | `https://api.openai.com` |
-| OpenAI model (chat) | `--model`, `-m` | `MODEL` (or legacy `OPENAI_MODEL`) | `gpt-4o-mini` |
-| OpenAI API key (chat) | — | `OPENAI_API_KEY` | required for real OpenAI; **not** needed for a local OpenAI-compatible server |
+| Setting                                                                       | Flag                                                                          | Env var                                                                       | Default                                                                       |
+| ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| MCP server endpoint (full URL, **incl. `/mcp`**)                              | `--url`, `-u`                                                                 | `SLASK_MCP_URL`                                                               | `http://127.0.0.1:8000/mcp`                                                   |
+| Bearer token                                                                  | `--token`, `-t`                                                               | `SLASK_MCP_TOKEN`                                                             | unset (no auth header sent)                                                   |
+| OpenAI base URL (chat)                                                        | `--base-url`, `-b`                                                            | `API_BASE`                                                                    | `https://api.openai.com`                                                      |
+| OpenAI model (chat)                                                           | `--model`, `-m`                                                               | `MODEL` (or legacy `OPENAI_MODEL`)                                            | `gpt-4o-mini`                                                                 |
+| OpenAI API key (chat)                                                         | —                                                                             | `OPENAI_API_KEY`                                                              | required for real OpenAI; **not** needed for a local OpenAI-compatible server |
 
 Precedence: `--base-url` > `API_BASE` > default. Model: `--model` > `MODEL` >
 `OPENAI_MODEL` > `gpt-4o-mini`. The base URL is normalized to end in `/v1`
