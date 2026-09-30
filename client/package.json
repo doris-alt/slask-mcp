@@ -1,0 +1,12 @@
+{
+  "name": "slask-mcp-client",
+  "version": "0.1.0",
+  "description": "CLI client for the slask-mcp server (streamable HTTP transport)",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "bin": { "slask-client": "./cli.js" },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.2.0",
+    "openai": "^7.25.0"
+  }
+}
