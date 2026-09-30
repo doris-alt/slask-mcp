@@ -2,10 +2,10 @@
 
 slask-mcp is a single cargo package with **two crates**:
 
-| Crate | Path | Responsibility |
-|---|---|---|
-| Library `slask_mcp` | `src/lib.rs` | All server logic: tools, auth, stack construction |
-| Binary | `src/main.rs` | CLI flag selection, logging setup, TCP listener, graceful shutdown |
+| Crate                | Path           | Responsibility                                                      |
+| -------------------- | -------------- | ------------------------------------------------------------------- |
+| Library `slask_mcp`  | `src/lib.rs`   | All server logic: tools, auth, stack construction                   |
+| Binary               | `src/main.rs`  | CLI flag selection, logging setup, TCP listener, graceful shutdown  |
 
 Splitting the logic into the library crate is what lets the integration
 tests in `tests/` drive the *real* router without sockets.
@@ -131,15 +131,15 @@ tracing + tracing-subscriber:
 
 ## Dependencies
 
-| Dependency | Version | Role |
-|---|---|---|
-| rmcp | 3.5.0 | MCP protocol + both transports (`transport-io`, `transport-streamable-http-server`) |
-| axum | 0.8 | HTTP router, middleware, `Body` |
-| tokio | 1 (`full`) | async runtime, TCP listener, signals |
-| tokio-util | 0.7 | `CancellationToken` |
-| chrono | 0.4 | `Utc::now()` for `current_time_utc` |
-| serde / serde_json / schemars | 1 | JSON-RPC, schema generation |
-| anyhow | 1 | error propagation |
-| tracing / tracing-subscriber | 0.1 / 0.3 | logging |
-| dotenvy | 0.15 | loads `.env` (HTTP mode only) |
-| tower | 0.5 (main) | `Service` trait for `Router::call` in the integration tests (main dep since baseplate hardening) |
+| Dependency                     | Version     | Role                                                                                              |
+| ------------------------------ | ----------- | ------------------------------------------------------------------------------------------------- |
+| rmcp                           | 3.5.0       | MCP protocol + both transports (`transport-io`, `transport-streamable-http-server`)               |
+| axum                           | 0.8         | HTTP router, middleware, `Body`                                                                   |
+| tokio                          | 1 (`full`)  | async runtime, TCP listener, signals                                                              |
+| tokio-util                     | 0.7         | `CancellationToken`                                                                               |
+| chrono                         | 0.4         | `Utc::now()` for `current_time_utc`                                                               |
+| serde / serde_json / schemars  | 1           | JSON-RPC, schema generation                                                                       |
+| anyhow                         | 1           | error propagation                                                                                 |
+| tracing / tracing-subscriber   | 0.1 / 0.3   | logging                                                                                           |
+| dotenvy                        | 0.15        | loads `.env` (HTTP mode only)                                                                     |
+| tower                          | 0.5 (main)  | `Service` trait for `Router::call` in the integration tests (main dep since baseplate hardening)  |

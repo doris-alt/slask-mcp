@@ -216,9 +216,14 @@ export async function startChat({ url, token, model, base }) {
       }
 
       // A chat turn: spinner up for the whole round (LLM + any tool calls).
+      //
+      // The user message is pushed to the history *before* the model is asked,
+      // so it responds to the current line — not the previous turn's.
+      const userMsg = { role: "user", content: input };
       spinner.start("thinking…");
       let answer;
       try {
+        history.push(userMsg);
         answer = await runAgentTurn(
           {
             openai,
@@ -232,12 +237,14 @@ export async function startChat({ url, token, model, base }) {
         );
       } catch (err) {
         spinner.stop();
+        // Drop the unprocessed request so a failed turn doesn't pollute history.
+        if (history[history.length - 1] === userMsg) history.pop();
         console.log(color("red", `  ✖ ${err.message}\n`));
         return loop(); // stay alive; re-prompt
       }
       spinner.stopDown();
       console.log(color("blue", `  ${answer ? answer : "(no response)"}`));
-      history.push({ role: "user", content: input }, { role: "assistant", content: answer });
+      history.push({ role: "assistant", content: answer });
       console.log(); // blank line between turns
       loop();
     });

@@ -39,15 +39,15 @@ content-type: application/json
 
 ## Behaviour matrix
 
-| Scenario | Result |
-|---|---|
-| Token unset/empty, no header | accepted |
-| Token set, no `Authorization` header | 401 |
-| Token set, wrong scheme (e.g. `Basic ...`) | 401 |
-| Token set, wrong Bearer token | 401 |
-| Token set, `Authorization: bearer <token>` (lowercase scheme) | accepted |
-| Token set, correct `Bearer <token>` | accepted — normal JSON-RPC reply |
-| Any request without an `Accept` header | 406 (independent of auth) |
+| Scenario                                                       | Result                            |
+| -------------------------------------------------------------- | --------------------------------- |
+| Token unset/empty, no header                                   | accepted                          |
+| Token set, no `Authorization` header                           | 401                               |
+| Token set, wrong scheme (e.g. `Basic ...`)                     | 401                               |
+| Token set, wrong Bearer token                                  | 401                               |
+| Token set, `Authorization: bearer <token>` (lowercase scheme)  | accepted                          |
+| Token set, correct `Bearer <token>`                            | accepted — normal JSON-RPC reply  |
+| Any request without an `Accept` header                         | 406 (independent of auth)         |
 
 ## Production notes
 
