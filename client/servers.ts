@@ -1,10 +1,10 @@
-// servers.js — multi-server configuration and connection orchestration.
+// servers.ts — multi-server configuration and connection orchestration.
 //
 // Knows how to (1) load & validate the JSON config file, (2) build the full
 // list of server specs (the default slask HTTP server + any servers from the
 // config), (3) connect to all of them best-effort, and (4) expose a merged,
 // collision-safe view of every tool. Reuses the single-server primitives in
-// client.js (connect, connectStdio, listTools, close).
+// client.ts (connect, connectStdio, listTools, close).
 //
 // A server *view* is:  { name, kind, client, address, tools, keyedTools }
 //   kind        "http" | "stdio"
@@ -19,6 +19,16 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { close, connect, connectStdio, listTools } from "./client.js";
+import type {
+  CallToolResult,
+  Client,
+  McpToolLike,
+  Registry,
+  ServerSpec,
+  ServerView,
+  Tool,
+  Warning,
+} from "./types.js";
 
 const clientDir = dirname(fileURLToPath(import.meta.url));
 
@@ -30,7 +40,11 @@ export const DEFAULT_CONFIG_PATH = join(clientDir, "mcp.json");
  * default path. `explicit` means the user supplied it (flag/env); the default
  * path is treated as "may be absent".
  */
-function resolveConfigPath(flag, envVar, defaultPath) {
+function resolveConfigPath(
+  flag: string | null | undefined,
+  envVar: string | null | undefined,
+  defaultPath: string,
+): { path: string; explicit: boolean } {
   if (flag) return { path: flag, explicit: true };
   if (envVar) return { path: envVar, explicit: true };
   return { path: defaultPath, explicit: false };
@@ -41,7 +55,15 @@ function resolveConfigPath(flag, envVar, defaultPath) {
  * yields an empty list (no additional servers). A missing *explicitly*-given
  * path is an error.
  */
-export async function loadConfigServers({ flag, envVar, defaultPath = DEFAULT_CONFIG_PATH }) {
+export async function loadConfigServers({
+  flag,
+  envVar,
+  defaultPath = DEFAULT_CONFIG_PATH,
+}: {
+  flag?: string | null;
+  envVar?: string | null;
+  defaultPath?: string;
+}): Promise<ServerSpec[]> {
   const { path, explicit } = resolveConfigPath(flag, envVar, defaultPath);
   let st;
   try {
@@ -54,22 +76,40 @@ export async function loadConfigServers({ flag, envVar, defaultPath = DEFAULT_CO
     return [];
   }
   const raw = await fs.readFile(path, "utf8");
-  let obj;
+  let obj: unknown;
   try {
     obj = JSON.parse(raw);
   } catch (e) {
-    throw new Error(`config file is not valid JSON: ${e.message}`);
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`config file is not valid JSON: ${msg}`);
   }
-  if (!obj || typeof obj !== "object" || !Array.isArray(obj.servers)) {
+  if (!obj || typeof obj !== "object") {
     throw new Error("config must be an object with a top-level `servers` array");
   }
-  return obj.servers.map((s, i) => validateServer(s, i));
+  const cfg = obj as { servers?: unknown[] };
+  if (!Array.isArray(cfg.servers)) {
+    throw new Error("config must be an object with a top-level `servers` array");
+  }
+  return cfg.servers.map((s, i) => validateServer(s, i));
 }
 
 /** Turn one raw config entry into a unified server spec. Throws on bad input. */
-function validateServer(s, i) {
-  if (!s || typeof s !== "object") throw new Error(`servers[${i}] must be an object`);
-  const { name, type, url, token, command, args, env, cwd, stderr, maxBufferSize } = s;
+function validateServer(s: unknown, i: number): ServerSpec {
+  if (!s || typeof s !== "object") {
+    throw new Error(`servers[${i}] must be an object`);
+  }
+  const {
+    name,
+    type,
+    url,
+    token,
+    command,
+    args,
+    env,
+    cwd,
+    stderr,
+    maxBufferSize,
+  } = s as Record<string, unknown>;
   if (typeof name !== "string" || name.trim() === "") {
     throw new Error(`servers[${i}].name must be a non-empty string`);
   }
@@ -85,7 +125,12 @@ function validateServer(s, i) {
     } catch {
       throw new Error(`servers[${i}].url is not a valid URL: ${url}`);
     }
-    return { name, kind: "http", url, token: typeof token === "string" && token !== "" ? token : null };
+    return {
+      name,
+      kind: "http",
+      url,
+      token: typeof token === "string" && token !== "" ? token : null,
+    };
   } else if (type === "stdio") {
     if (!command || typeof command !== "string" || command.trim() === "") {
       throw new Error(`servers[${i}].command is required for type "stdio"`);
@@ -94,14 +139,26 @@ function validateServer(s, i) {
       name,
       kind: "stdio",
       command,
-      args: Array.isArray(args) ? args : undefined,
-      env: env && typeof env === "object" ? env : undefined,
+      args: Array.isArray(args) ? (args as string[]) : undefined,
+      env:
+        env && typeof env === "object" ? (env as Record<string, string>) : undefined,
       cwd: typeof cwd === "string" ? cwd : undefined,
-      stderr: typeof stderr === "string" ? stderr : undefined,
-      maxBufferSize: typeof maxBufferSize === "number" && maxBufferSize > 0 ? maxBufferSize : undefined,
+      stderr:
+        stderr === "inherit" ||
+        stderr === "pipe" ||
+        stderr === "ignore" ||
+        stderr === "overlapped"
+          ? stderr
+          : undefined,
+      maxBufferSize:
+        typeof maxBufferSize === "number" && maxBufferSize > 0
+          ? maxBufferSize
+          : undefined,
     };
   } else {
-    throw new Error(`servers[${i}].type must be "http" or "stdio", got ${JSON.stringify(type)}`);
+    throw new Error(
+      `servers[${i}].type must be "http" or "stdio", got ${JSON.stringify(type)}`
+    );
   }
 }
 
@@ -110,11 +167,17 @@ function validateServer(s, i) {
  * from `--url`/`--token` or the env defaults) plus any servers from the config.
  * Rejects duplicate names.
  */
-export function buildSpecs({ defaultSpec = null, configServers = [] }) {
-  const specs = [];
+export function buildSpecs({
+  defaultSpec = null,
+  configServers = [],
+}: {
+  defaultSpec?: ServerSpec | null;
+  configServers?: ServerSpec[];
+}): ServerSpec[] {
+  const specs: ServerSpec[] = [];
   if (defaultSpec) specs.push(defaultSpec);
   for (const s of configServers) specs.push(s);
-  const seen = new Set();
+  const seen = new Set<string>();
   for (const spec of specs) {
     if (seen.has(spec.name)) {
       throw new Error(`duplicate server name "${spec.name}"`);
@@ -124,10 +187,11 @@ export function buildSpecs({ defaultSpec = null, configServers = [] }) {
   return specs;
 }
 
-async function connectSpec(spec) {
-  const client = spec.kind === "http"
-    ? await connect({ url: spec.url, token: spec.token })
-    : await connectStdio(spec);
+async function connectSpec(spec: ServerSpec): Promise<{ client: Client; tools: Tool[] }> {
+  const client =
+    spec.kind === "http"
+      ? await connect({ url: spec.url, token: spec.token })
+      : await connectStdio(spec);
   const tools = await listTools(client);
   return { client, tools };
 }
@@ -137,13 +201,13 @@ async function connectSpec(spec) {
  * warning and the server skipped, so one dead server never sinks the rest.
  * Returns `{ views, warnings, keyedViews, byKey }`.
  */
-export async function connectAllServers(specs) {
-  const views = [];
-  const warnings = [];
+export async function connectAllServers(specs: ServerSpec[]): Promise<Registry> {
+  const views: ServerView[] = [];
+  const warnings: Warning[] = [];
   for (const spec of specs) {
     try {
       const { client, tools } = await connectSpec(spec);
-      const view = {
+      const view: ServerView = {
         name: spec.name,
         kind: spec.kind,
         client,
@@ -153,25 +217,27 @@ export async function connectAllServers(specs) {
       };
       views.push(view);
     } catch (e) {
-      warnings.push({ name: spec.name, error: e.message ?? String(e) });
+      const msg = e instanceof Error ? e.message : String(e);
+      warnings.push({ name: spec.name, error: msg });
     }
   }
 
   // Which raw tool names appear on more than one connected server?
-  const nameCount = {};
-  for (const view of views) for (const t of view.tools) {
-    nameCount[t.name] = (nameCount[t.name] ?? 0) + 1;
-  }
+  const nameCount = new Map<string, number>();
+  for (const view of views)
+    for (const t of view.tools) {
+      nameCount.set(t.name, (nameCount.get(t.name) ?? 0) + 1);
+    }
   const keyedViews = views.map((view) => {
     const keyedTools = view.tools.map((tool) => {
-      const key = nameCount[tool.name] > 1 ? `${view.name}__${tool.name}` : tool.name;
+      const key = (nameCount.get(tool.name) ?? 0) > 1 ? `${view.name}__${tool.name}` : tool.name;
       return { key, tool };
     });
     return { ...view, keyedTools };
   });
 
   // The collision-safe lookup used by `call` and the agent loop.
-  const byKey = new Map();
+  const byKey = new Map<string, { view: ServerView; tool: Tool }>();
   for (const view of keyedViews) {
     for (const { key, tool } of view.keyedTools) {
       if (byKey.has(key)) {
@@ -185,10 +251,10 @@ export async function connectAllServers(specs) {
 
 /**
  * Resolve a user-supplied tool name to the server/tool it belongs to.
- * Returns `{ view, tool, key }` or `null`.
+ * Returns `{ view, tool }` or `null`.
  */
-export function resolveTool(name, registry) {
-  return registry.byKey.get(name);
+export function resolveTool(name: string, registry: Registry): { view: ServerView; tool: Tool } | null {
+  return registry.byKey.get(name) ?? null;
 }
 
 /**
@@ -196,7 +262,11 @@ export function resolveTool(name, registry) {
  * client. The client is called with the tool's *raw* name (each server only
  * knows its own tool names by their raw names).
  */
-export async function callToolBy(name, registry, args = {}) {
+export async function callToolBy(
+  name: string,
+  registry: Registry,
+  args: Record<string, unknown> = {},
+): Promise<CallToolResult> {
   const entry = registry.byKey.get(name);
   if (!entry) {
     throw new Error(`tool "${name}" not found (run \`list\` to see available tools)`);
@@ -205,7 +275,7 @@ export async function callToolBy(name, registry, args = {}) {
 }
 
 /** Flatten the registry into key-named, OpenAI-function-ready tool descriptors. */
-export function openAiTools(registry) {
+export function openAiTools(registry: Registry): McpToolLike[] {
   return registry.keyedViews.flatMap((view) =>
     view.keyedTools.map(({ key, tool }) => ({
       name: key,
@@ -215,7 +285,7 @@ export function openAiTools(registry) {
   );
 }
 
-async function closeView(view) {
+async function closeView(view: ServerView): Promise<void> {
   try {
     await close(view.client);
   } catch {
@@ -223,6 +293,6 @@ async function closeView(view) {
   }
 }
 
-export async function closeAll(registry) {
+export async function closeAll(registry: Registry): Promise<void> {
   await Promise.all(registry.views.map(closeView));
 }

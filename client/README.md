@@ -7,14 +7,25 @@ function-calling) or by hand (`list` / `call`).
 
 ## Setup
 
+The client is written in **TypeScript** and compiled to `client/dist` by the
+TypeScript compiler. It is a Node.js ESM CLI (`"type": "module"`) that talks to
+MCP servers over streamable HTTP or raw stdio.
+
 Prerequisites:
 
-- A recent Node.js (v20+), with `npx` available
+- A recent Node.js (v20+) with `npm`
 
-### Install
+### Install & build
 
-1. From the repository root, run `npm install` in the client directory.
-2. Copy `client/.env.example` to `client/.env` and fill in your values (see `client/.env.example`).
+1. In the `client` directory, run `npm install`.
+2. Run `npm run build` — compiles the `.ts` source to `dist/*.js` (what the
+   `slask-client` binary points at). Re-run after any source change.
+3. (Optional) copy `client/.env.example` to `client/.env` and fill in your
+   values (see `client/.env.example`).
+
+After the build, `slask-client` (the package `bin` → `dist/cli.js`) is available
+via `npx slask-client …` or a local install (`npm link`) from the `client`
+directory.
 
 
 ## Start the server
@@ -74,8 +85,8 @@ to get started:
 | `args`         | ignored        | optional (stdio)| command-line arguments passed to the process                      |
 | `env`          | ignored        | optional (stdio)| extra environment variables for the process                       |
 | `cwd`          | ignored        | optional (stdio)| working directory for the stdio process (default: current dir)    |
-| `stderr`       | ignored        | optional (stdio)| capture stderr: `"stderr"` or `"out"` (default: `"stderr"`)       |
-| `maxBufferSize`| ignored        | optional (stdio)| max bytes of buffered stdio output per read (default: 4096)       |
+| `stderr`       | ignored        | optional (stdio)| child stderr: `"inherit"`, `"pipe"`, `"ignore"`, or `"overlapped"` (default: `"inherit"`; mirrors Node `spawn` `stdio`) |
+| `maxBufferSize`| ignored        | optional (stdio)| max bytes of buffered stdio output per read (default: 10 MiB)     |
 
 
 **Tool naming and collisions.** Every tool from every connected server is listed once in the

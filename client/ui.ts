@@ -1,7 +1,7 @@
-// ui.js — the line-based chat REPL for slask-mcp.
+// ui.ts — the line-based chat REPL for slask-mcp.
 //
-// Wraps one or more MCP servers (already connected by cli.js via servers.js)
-// with the OpenAI agent loop (agent.js): the user types natural language, the
+// Wraps one or more MCP servers (already connected by cli.ts via servers.ts)
+// with the OpenAI agent loop (agent.ts): the user types natural language, the
 // model decides which MCP tools to call, the client executes them, results feed
 // back, and a final answer is printed. Non-streaming, with a small `thinking…`
 // spinner and a dependency-free color/ANSI helper. Built on node:readline only
@@ -10,7 +10,9 @@
 // REPL commands: /help /h  /tools /t  /reset /clear /c  /quit /exit /q
 
 import { createInterface } from "node:readline";
+import type { Writable } from "node:stream";
 
+import { OpenAI } from "openai";
 import { hintFor, printTools } from "./client.js";
 import { closeAll, callToolBy, openAiTools } from "./servers.js";
 import {
@@ -21,6 +23,11 @@ import {
   mcpToolsToOpenai,
   runAgentTurn,
 } from "./agent.js";
+import type {
+  ConversationMessage,
+  Registry,
+  ToolCallRecord,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
 // colors (tiny dependency-free ANSI helper)
@@ -34,36 +41,43 @@ const PALETTE = {
   yellow: "\x1b[33m",
   red: "\x1b[31m",
   cyan: "\x1b[36m",
-};
+} as const satisfies Record<string, string>;
+
 const COLOR_ENABLED = process.stdout.isTTY && !("NO_COLOR" in process.env);
-const color = (name, s) => (COLOR_ENABLED ? `${PALETTE[name]}${s}${PALETTE.reset}` : s);
+const color = (name: keyof typeof PALETTE, s: string) =>
+  COLOR_ENABLED ? `${PALETTE[name]}${s}${PALETTE.reset}` : s;
 const PROMPT = color("cyan", "slask-agent > ");
 
 // ---------------------------------------------------------------------------
 // spinner
 // ---------------------------------------------------------------------------
 const FRAMES = [
-  "▋", // ⠋
-  "▙", // ⠙
-  "▹", // ⠹
-  "▸", // ⠸
-  "▼", // ⠼
-  "▴", // ⠴
-  "◦", // ⠦
-  "◧", // ⠧
-  "◇", // ⠇
-  "●", // ⠏
-];
+  "▋",
+  "▙",
+  "▹",
+  "▸",
+  "▼",
+  "▴",
+  "◦",
+  "◧",
+  "◇",
+  "●",
+] as const;
 
 class Spinner {
-  constructor(out = process.stdout) {
+  out: Writable;
+  timer: ReturnType<typeof setInterval> | null;
+  label: string;
+  i: number;
+
+  constructor(out: Writable = process.stdout) {
     this.out = out;
     this.timer = null;
     this.label = "";
     this.i = 0;
   }
 
-  start(label = "thinking…") {
+  start(label: string = "thinking…") {
     if (this.timer) return;
     this.label = label;
     this.i = 0;
@@ -92,7 +106,7 @@ class Spinner {
     this.out.write(`\r${" ".repeat(this.padWidth() + 4)}\r\n`);
   }
 
-  padWidth() {
+  padWidth(): number {
     return this.label ? this.label.length : 0;
   }
 }
@@ -100,7 +114,7 @@ class Spinner {
 // ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------
-function die(msg) {
+function die(msg: string): never {
   console.error(color("red", `\n✖ ${msg}`));
   process.exit(1);
 }
@@ -121,18 +135,26 @@ const REPLY_HELP = [
 // ---------------------------------------------------------------------------
 // the REPL
 // ---------------------------------------------------------------------------
-// The caller (cli.js) has already connected the servers (best-effort) and
+// The caller (cli.ts) has already connected the servers (best-effort) and
 // handed us a registry: { views, warnings, keyedViews, byKey }.
-export async function startChat({ registry, model, base }) {
+export async function startChat({
+  registry,
+  model,
+  base,
+}: {
+  registry: Registry;
+  model: string;
+  base?: string | null;
+}): Promise<void> {
   // 1) OpenAI client (chat-only) — fail fast, before touching the server.
   //    `base` (a `--base-url` flag) takes precedence over API_BASE, which
   //    defaults to the real OpenAI endpoint. Local servers (e.g. Ollama)
   //    accept a placeholder key, so no real key is required for them.
-  let openai;
+  let openai: InstanceType<typeof OpenAI>;
   try {
     openai = createOpenAiClient({ base });
   } catch (e) {
-    die(e.message);
+    die(e instanceof Error ? e.message : String(e));
   }
 
   // 2) Build the (possibly multi-server) tool list.
@@ -140,7 +162,9 @@ export async function startChat({ registry, model, base }) {
 
   // Report any servers we could not reach (they're skipped, not fatal).
   for (const w of registry.warnings) {
-    console.error(color("red", `  ⚠ could not reach server ${w.name}: ${w.error}${hintFor(w.error)}`));
+    console.error(
+      color("red", `  ⚠ could not reach server ${w.name}: ${w.error}${hintFor(w.error)}`)
+    );
   }
 
   // Banner.
@@ -154,12 +178,17 @@ export async function startChat({ registry, model, base }) {
   }
   console.log(`  model  : ${color("cyan", model)}`);
   console.log(`  api    : ${color("cyan", effectiveBase)}`);
-  console.log(`  tools  : ${color("cyan", openaiTools.length ? openaiTools.map((t) => t.function.name).join(", ") : "(none)")}`);
+  console.log(
+    `  tools  : ${color(
+      "cyan",
+      openaiTools.length ? openaiTools.map((t) => t.function.name).join(", ") : "(none)"
+    )}`
+  );
   console.log(color("dim", "\nType a request (e.g. 'what time is it?'), or /help for commands.\n"));
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const spinner = new Spinner();
-  const history = [];
+  const history: ConversationMessage[] = [];
   let exited = false;
 
   const shutdown = () => {
@@ -183,7 +212,7 @@ export async function startChat({ registry, model, base }) {
   };
 
   // Print a tool trace (called by the agent loop while the spinner is up).
-  const onToolCall = ({ name, args, resultText }) => {
+  const onToolCall = ({ name, args, resultText }: ToolCallRecord) => {
     spinner.stopDown();
     console.log(color("yellow", `  ▸ ${name}(${JSON.stringify(args)})`));
     console.log(color("dim", `      ${resultText.replace(/\n/g, "\n      ")}`));
@@ -193,7 +222,7 @@ export async function startChat({ registry, model, base }) {
   // Re-prompt after a turn completes.
   const loop = async () => {
     if (exited) return;
-    rl.question(PROMPT, async (line) => {
+    rl.question(PROMPT, async (line: string) => {
       if (exited) return;
       const input = line.trim();
       if (input === "") return loop();
@@ -224,9 +253,9 @@ export async function startChat({ registry, model, base }) {
       //
       // The user message is pushed to the history *before* the model is asked,
       // so it responds to the current line — not the previous turn's.
-      const userMsg = { role: "user", content: input };
+      const userMsg: ConversationMessage = { role: "user", content: input };
       spinner.start("thinking…");
-      let answer;
+      let answer: string;
       try {
         history.push(userMsg);
         answer = await runAgentTurn(
@@ -244,7 +273,9 @@ export async function startChat({ registry, model, base }) {
         spinner.stop();
         // Drop the unprocessed request so a failed turn doesn't pollute history.
         if (history[history.length - 1] === userMsg) history.pop();
-        console.log(color("red", `  ✖ ${err.message}\n`));
+        console.log(
+          color("red", `${err instanceof Error ? err.message : String(err)}\n`)
+        );
         return loop(); // stay alive; re-prompt
       }
       spinner.stopDown();

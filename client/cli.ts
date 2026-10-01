@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// slask-client — a CLI for MCP servers (streamable HTTP + stdio).
+// cli.ts — a CLI for MCP servers (streamable HTTP + stdio).
 //
 //   slask-client                 interactive chat (OpenAI agent + MCP tools)
 //   slask-client chat            same
@@ -33,6 +33,7 @@ import {
   loadConfigServers,
 } from "./servers.js";
 import { DEFAULT_MODEL } from "./agent.js";
+import type { CallToolResult, HttpSpec, Registry, ServerSpec } from "./types.js";
 
 const DEFAULT_URL = "http://127.0.0.1:8000/mcp";
 
@@ -88,14 +89,26 @@ Examples:
   --no-default slask-client                     # only the servers from the config
 `;
 
-function fail(msg) {
+interface CliConfig {
+  url: string;
+  token: string | null;
+  config: string | null;
+  noDefault: boolean;
+  model: string | null;
+  base: string | null;
+  positional: string[];
+  args: Record<string, unknown>;
+  help: boolean;
+}
+
+function fail(msg: string): never {
   console.error(msg);
   process.exit(1);
 }
 
 // Hand-rolled flag/positional parsing (no dependencies).
-function parse(argv) {
-  const config = {
+function parse(argv: string[]): CliConfig {
+  const config: CliConfig = {
     url: process.env.SLASK_MCP_URL ?? DEFAULT_URL,
     token: process.env.SLASK_MCP_TOKEN ?? null,
     config: null,
@@ -126,7 +139,7 @@ function parse(argv) {
       if (++i < argv.length) config.base = argv[i];
     } else if (f === "--args") {
       if (++i < argv.length) {
-        let parsed;
+        let parsed: unknown;
         try {
           parsed = JSON.parse(argv[i]);
         } catch {
@@ -149,7 +162,7 @@ function parse(argv) {
   return config;
 }
 
-function onMcpError(err, action, { sub, tool } = {}) {
+function onMcpError(err: any, action: string, { sub, tool }: { sub?: string; tool?: string | undefined }) {
   const message = err.message ?? err.code ?? String(err);
   let extra = hintFor(message);
   if (sub === "call" && tool && /tool not found|unknown tool/i.test(message)) {
@@ -159,7 +172,7 @@ function onMcpError(err, action, { sub, tool } = {}) {
   process.exit(1);
 }
 
-function printResult(result) {
+function printResult(result: CallToolResult): void {
   if (result.isError) {
     fail(`tool returned an error: ${textFrom(result.content) || String(result)}`);
   }
@@ -172,7 +185,7 @@ function printResult(result) {
   }
 }
 
-async function main() {
+async function main(): Promise<void> {
   const config = parse(process.argv.slice(2));
   const sub = config.positional[0];
 
@@ -190,24 +203,27 @@ async function main() {
 
   // Build the full server list (default slask + config servers) and connect
   // best-effort. This happens for chat, list, and call.
-  let registry;
+  let registry: Registry;
   try {
     const configServers = await loadConfigServers({
       flag: config.config,
       envVar: process.env.SLASK_MCP_CONFIG,
     });
-    const defaultSpec = config.noDefault
+    const defaultSpec: ServerSpec | null = config.noDefault
       ? null
-      : { name: "slask", kind: "http", url: config.url, token: config.token };
+      : ({ name: "slask", kind: "http", url: config.url, token: config.token } as HttpSpec);
     const specs = buildSpecs({ defaultSpec, configServers });
     registry = await connectAllServers(specs);
   } catch (e) {
-    fail(`config error: ${e.message}`);
+    const msg = e instanceof Error ? e.message : String(e);
+    fail(`config error: ${msg}`);
     return;
   }
 
   if (registry.views.length === 0) {
-    const last = registry.warnings.length ? registry.warnings[registry.warnings.length - 1] : null;
+    const last = registry.warnings.length
+      ? registry.warnings[registry.warnings.length - 1]
+      : null;
     fail(`no MCP servers could be reached` + (last ? ` (last error: ${last.error})` : ""));
     return;
   }
