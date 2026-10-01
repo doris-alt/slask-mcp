@@ -1,4 +1,4 @@
-// agent.js — the OpenAI + MCP agent loop.
+// agent.ts — the OpenAI + MCP agent loop.
 //
 // Runs one user turn through an OpenAI Chat Completions "function calling"
 // loop: the model decides which tools to call, `callTool` (a resolver supplied
@@ -15,17 +15,25 @@
 
 import { OpenAI } from "openai";
 
-import { callTool, mcpResultToText } from "./client.js";
+import { mcpResultToText } from "./client.js";
+import type {
+  AgentTurnConfig,
+  ConversationMessage,
+  FunctionToolCall,
+  McpToolLike,
+  OpenAiFunctionTool,
+  ToolCallRecord,
+} from "./types.js";
 
 export const DEFAULT_MODEL = "gpt-4o-mini"; // cheap/fast for real OpenAI; override via MODEL/OPENAI_MODEL/--model
 export const DEFAULT_API_BASE = "https://api.openai.com"; // normalize to /v1 below
 const MAX_TOOL_ITERATIONS = 8; // safety cap: tool round-trips per turn
-const MAX_TOKENS = 1024;       // hard cap on each completion
+const MAX_TOKENS = 1024; // hard cap on each completion
 
 // The OpenAI SDK appends /chat/completions to your baseURL, so the base must
 // already point at the /v1 root. Normalize any input (with or without /v1,
 // with or without a trailing slash) to that form.
-function ensureV1Path(base) {
+function ensureV1Path(base: string): string {
   let url = base.replace(/\/+$/, "");
   if (!url.endsWith("/v1")) {
     url += "/v1";
@@ -36,7 +44,7 @@ function ensureV1Path(base) {
 // A request is aimed at the real OpenAI service only when the host is
 // api.openai.com (independent of path/port). Only that case requires an
 // API key; every other (local/compatible) endpoint gets a placeholder key.
-function isRealOpenAi(base) {
+function isRealOpenAi(base: string): boolean {
   try {
     return new URL(base).hostname === "api.openai.com";
   } catch {
@@ -62,7 +70,7 @@ export const SYSTEM_PROMPT = [
 // no API key, so when the target is anything other than the real OpenAI
 // endpoint we pass a placeholder key instead of requiring one. Pointing at
 // the real OpenAI endpoint without a key is an error.
-function resolveApiConfig(base) {
+function resolveApiConfig(base?: string | null): { baseURL: string; apiKey: string } {
   const rawBase = base ?? process.env.API_BASE ?? DEFAULT_API_BASE;
   const key = process.env.OPENAI_API_KEY ?? "";
   const real = isRealOpenAi(rawBase);
@@ -82,7 +90,7 @@ function resolveApiConfig(base) {
  * Build the OpenAI client. `base` (a `--base-url` flag) takes precedence over
  * `API_BASE`, which defaults to the real OpenAI endpoint.
  */
-export function createOpenAiClient({ base } = {}) {
+export function createOpenAiClient({ base }: { base?: string | null }): InstanceType<typeof OpenAI> {
   const { baseURL, apiKey } = resolveApiConfig(base);
   return new OpenAI({ baseURL, apiKey });
 }
@@ -92,9 +100,9 @@ export function createOpenAiClient({ base } = {}) {
  * array. The MCP `inputSchema` may carry a `$schema` key, which we strip to
  * avoid strict-mode surprises in OpenAI.
  */
-export function mcpToolsToOpenai(mcpTools) {
-  const parametersFromSchema = (schema) => {
-    const p = { ...(schema ?? {}) };
+export function mcpToolsToOpenai(mcpTools: McpToolLike[]): OpenAiFunctionTool[] {
+  const parametersFromSchema = (schema?: Record<string, unknown> | null) => {
+    const p: Record<string, unknown> = { ...(schema ?? {}) };
     delete p.$schema;
     return p;
   };
@@ -111,17 +119,25 @@ export function mcpToolsToOpenai(mcpTools) {
 /**
  * Run one user turn.
  *
- * @param {{openai, model, systemPrompt, tools, callTool}} cfg
+ * @param cfg
  *   - `tools`    OpenAI-function-shaped array (names are the caller's keys).
  *   - `callTool` resolver: `async (toolName, args) => result`, routed to the
  *     right per-server client.
- * @param {Array<{role, content}>} requestMessages prior conversation (no system)
- * @param {({name, args, resultText}) => void} [onToolCall] optional callback the UI
- *        prints a tool trace for each MCP tool the model calls.
- * @returns {Promise<string>} the model's final answer.
+ * @param requestMessages prior conversation (no system)
+ * @param onToolCall optional callback the UI prints a tool trace for each MCP
+ *        tool the model calls.
+ * @returns the model's final answer.
  */
-export async function runAgentTurn({ openai, model, systemPrompt, tools, callTool }, requestMessages, onToolCall) {
-  const messages = [{ role: "system", content: systemPrompt }, ...requestMessages];
+export async function runAgentTurn(
+  cfg: AgentTurnConfig,
+  requestMessages: ConversationMessage[],
+  onToolCall?: (record: ToolCallRecord) => void,
+): Promise<string> {
+  const { openai, model, systemPrompt, tools, callTool } = cfg;
+  const messages: ConversationMessage[] = [
+    { role: "system", content: systemPrompt },
+    ...requestMessages,
+  ];
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     const res = await openai.chat.completions.create({
@@ -131,36 +147,47 @@ export async function runAgentTurn({ openai, model, systemPrompt, tools, callToo
       max_tokens: MAX_TOKENS,
     });
     const choice = res.choices?.[0];
-    const message = choice?.message ?? {};
+    const message = choice?.message;
+    if (!message) {
+      // The model returned no message body; nothing to act on this iteration.
+      continue;
+    }
     const finishReason = choice?.finish_reason;
-
     const toolCalls = message.tool_calls;
     if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+      // Narrow to function tool calls — the only kind we can execute. The SDK
+      // tool-call type also covers custom tool calls, which have no `function`
+      // and are dropped rather than run.
+      const funcCalls: FunctionToolCall[] = toolCalls.filter(
+        (tc): tc is FunctionToolCall => tc.type === "function",
+      );
       // Emit the assistant turn that requested the tools, then run each one
       // and append its result; loop back for the model's next decision.
       messages.push({
         role: "assistant",
         content: message.content ?? null,
-        tool_calls: toolCalls,
+        tool_calls: funcCalls,
       });
-      for (const tc of toolCalls) {
-        let args = {};
+      for (const tc of funcCalls) {
+        const toolName = tc.function.name;
+        let args: Record<string, unknown> = {};
         try {
           args = JSON.parse(tc.function.arguments ?? "{}");
         } catch {
           args = {};
         }
-        let resultText;
+        let resultText: string;
         try {
-          const result = await callTool(tc.function.name, args);
+          const result = await callTool(toolName, args);
           resultText = mcpResultToText(result);
         } catch (e) {
           // A bad/unknown tool, a transport error, or a 4xx/5xx from the
           // server: feed the failure back to the model instead of crashing the
           // session.
-          resultText = `ERROR calling ${tc.function.name}: ${e.message}`;
+          const msg = e instanceof Error ? e.message : String(e);
+          resultText = `ERROR calling ${toolName}: ${msg}`;
         }
-        onToolCall?.({ name: tc.function.name, args, resultText });
+        onToolCall?.({ name: toolName, args, resultText });
         messages.push({ role: "tool", tool_call_id: tc.id, content: resultText });
       }
       continue;
@@ -172,7 +199,5 @@ export async function runAgentTurn({ openai, model, systemPrompt, tools, callToo
     return message.content ?? "";
   }
 
-  throw new Error(
-    `stopped after ${MAX_TOOL_ITERATIONS} tool calls in one turn (safety cap)`
-  );
+  throw new Error(`stopped after ${MAX_TOOL_ITERATIONS} tool calls in one turn (safety cap)`);
 }

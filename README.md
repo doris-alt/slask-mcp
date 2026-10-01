@@ -46,10 +46,13 @@ curl -s -X POST http://127.0.0.1:9000/mcp \
 
 ## Client
 
-`slask-client` is a Node.js CLI that makes this server (and other MCP servers)
-usable by a language model. It connects to the slask server over streamable
-HTTP and — via a JSON config file with **no fixed limit** on entries — to any
-number of additional stdio or HTTP MCP servers. Two ways to drive it:
+`slask-client` is a **TypeScript** Node.js CLI that makes this server (and any
+other MCP server) usable by a language model. It connects to the slask server
+over streamable HTTP and — via a JSON config file with **no fixed limit** on
+entries — to any number of additional stdio or HTTP MCP servers. It is compiled
+from `client/*.ts` to `client/dist` with `npm run build` in the `client`
+directory (see [`client/README.md`](client/README.md) for setup). Two ways to
+drive it:
 
 - **Agent chat** (`slask-client` with no args): a line-based REPL where an OpenAI-
   compatible model picks tools via function-calling, runs them, and answers. It

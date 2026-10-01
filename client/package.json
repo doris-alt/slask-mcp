@@ -3,10 +3,24 @@
   "version": "0.1.0",
   "description": "CLI client for the slask-mcp server (streamable HTTP transport)",
   "type": "module",
-  "engines": { "node": ">=20" },
-  "bin": { "slask-client": "./cli.js" },
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "slask-client": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node dist/agent-stub-test.js",
+    "clean": "rm -rf dist"
+  },
   "dependencies": {
     "@modelcontextprotocol/client": "^2.2.0",
     "openai": "^7.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^7.0.2"
   }
 }
