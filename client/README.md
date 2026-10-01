@@ -1,5 +1,9 @@
 # slask-mcp-client
 
+A Node.js CLI that makes MCP servers usable by a language model. Point it at
+the slask server — or at any number of your own stdio and HTTP MCP servers —
+and drive the tools it exposes either interactively (an agent chat using OpenAI
+function-calling) or by hand (`list` / `call`).
 
 ## Setup
 
