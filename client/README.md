@@ -1,136 +1,180 @@
 # slask-mcp-client
 
-A tiny Node.js CLI for [slask-mcp](../README.md), talking to it over the
-[streamable HTTP](../docs/http.md) transport. It ships in two modes:
-
-1. **Interactive agent chat (default).** A line-based REPL where you type
-   natural language, an OpenAI model decides *which* slask-mcp tools to call
-   (`echo`, `current_time_utc`, `search_tools`) using the OpenAI **function
-   calling** API, the client runs those tools against the MCP server, feeds
-   the results back, and prints the model's final answer. No streaming — one
-   complete response at a time, with a `thinking…` spinner.
-2. **Direct, non-LLM commands.** `list` and `call <tool>` work exactly as before,
-   with no model involved.
-
-Built on the official [`@modelcontextprotocol/client`](https://www.npmjs.com/package/@modelcontextprotocol/client)
-SDK and the [`openai`](https://www.npmjs.com/package/openai) JS SDK (v7,
-Chat Completions). Plain ESM, no build step.
+A Node.js CLI that makes MCP servers usable by a language model. Point it at
+the slask server — or at any number of your own stdio and HTTP MCP servers —
+and drive the tools it exposes either interactively (an agent chat using OpenAI
+function-calling) or by hand (`list` / `call`).
 
 ## Setup
 
-```bash
-cd client
-npm install
-```
+Prerequisites:
+
+- A recent Node.js (v20+), with `npx` available
+
+### Install
+
+1. From the repository root, run `npm install` in the client directory.
+2. Copy `client/.env.example` to `client/.env` and fill in your values (see `client/.env.example`).
+
 
 ## Start the server
 
-```bash
-# no auth
-SLASK_MCP_PORT=9000 cargo run -- --http
+Run the slask-mcp server on the same machine (or on any host reachable by URL). Default bind: `127.0.0.1:8000`, default path: `/mcp`. The server is HTTP with optional Bearer-token auth:
+
+```
+# no auth (default)
+slask-mcp
 
 # with Bearer auth
-SLASK_MCP_PORT=9000 SLASK_MCP_TOKEN=secret cargo run -- --http
+SLASK_MCP_TOKEN=my-secret slask-mcp
 ```
+
+## Multiple servers (configuration file)
+
+The slask server is configured with `--url`/`--token` (or `SLASK_MCP_URL`/
+`SLASK_MCP_TOKEN`) and is always connected — named **`slask`** — in
+addition to any servers you list in a JSON config file. There is **no fixed
+limit** on how many you can add; each entry is a complete, self-contained
+spec.
+
+The default config path is `client/mcp.json` (next to `cli.js`, not the current
+directory). Override it with `--config`/`-c` or the `SLASK_MCP_CONFIG` env var.
+A missing *default* file simply means "no extra servers"; a missing *explicitly
+given* file is an error. Copy `client/mcp.example.json` to `client/mcp.json`
+to get started:
+
+```json
+{
+  "servers": [
+    {
+      "name": "weather",
+      "type": "stdio",
+      "command": "/path/to/weather-mcp",
+      "args": ["--verbose"],
+      "env": {"WEATHER_API_KEY": ""}
+    },
+    {
+      "name": "calendar",
+      "type": "http",
+      "url": "http://127.0.0.1:9001/mcp",
+      "token": "secret"
+    }
+  ]
+}
+```
+
+
+| Field          | HTTP           | stdio           | Notes                                                             |
+|----------------|----------------|-----------------|-------------------------------------------------------------------|
+| `name`         | required       | required        | unique; must not contain a space or `__` (reserved for collisions)|
+| `type`         | http or stdio  | http or stdio   | connection kind                                                   |
+| `url`          | required (http)| ignored         | full endpoint including `/mcp`                                    |
+| `token`        | optional (http)| ignored         | bearer token; sent as `Authorization: Bearer ...`                 |
+| `command`      | ignored        | required (stdio)| executable path to run as the server process                      |
+| `args`         | ignored        | optional (stdio)| command-line arguments passed to the process                      |
+| `env`          | ignored        | optional (stdio)| extra environment variables for the process                       |
+| `cwd`          | ignored        | optional (stdio)| working directory for the stdio process (default: current dir)    |
+| `stderr`       | ignored        | optional (stdio)| capture stderr: `"stderr"` or `"out"` (default: `"stderr"`)       |
+| `maxBufferSize`| ignored        | optional (stdio)| max bytes of buffered stdio output per read (default: 4096)       |
+
+
+**Tool naming and collisions.** Every tool from every connected server is listed once in the
+OpenAI function-calling `tools` array. A tool whose name is unique across all connected
+servers is exposed under its raw name. When two or more servers expose a tool with the
+same raw name, each occurrence is namespaced as `<serverName>__<toolName>` (e.g.
+`weather__forecast`, `calendar__forecast`), and the client routes each call back to the
+server it came from. The model sees only the namespaced names, so there is no ambiguity.
+
+**Best-effort connect.** Each server is connected independently. A server that fails to
+connect (bad URL, token, command not found, timeout) is reported on stderr with a hint
+and then skipped; the other servers keep working. The CLI exits with code 1 only when
+**no** servers could be reached.
 
 ## Interactive agent chat
 
-Run the REPL with no subcommand:
+Run with no subcommand (or `chat`):
 
-```bash
-node cli.js
 ```
-
-Or the explicit `chat` subcommand. Point it at your MCP server and model:
-
-```bash
 # local OpenAI-compatible model (e.g. Ollama), no API key needed
-SLASK_MCP_URL=http://127.0.0.1:9000/mcp API_BASE=http://192.168.68.73:11434 MODEL=gemma4:12b-mlx node cli.js
+SLASK_MCP_URL=http://127.0.0.1:9000/mcp API_BASE=http://192.168.68.73:11434 MODEL=gemma4:12b-mlx slask-client
 
-# real OpenAI (needs OPENAI_API_KEY; API_BASE defaults to https://api.openai.com)
-SLASK_MCP_URL=http://127.0.0.1:9000/mcp OPENAI_API_KEY=sk-… MODEL=gpt-4o-mini node cli.js
+# real OpenAI (needs OPENAI_API_KEY; API_BASE defaults to https://api.openai.com/v1)
+OPENAI_API_KEY=sk-… SLASK_MCP_URL=http://127.0.0.1:9000/mcp slask-client
 ```
 
-Example session:
+On startup the client shows a banner listing every connected server (name, kind,
+address), the model, and the full set of tools. Then it drops into a line-based REPL:
 
 ```
-slask-mcp agent
-
-  server : http://127.0.0.1:9000/mcp
-  model  : gemma4:12b-mlx
-  api    : http://192.168.68.73:11434
-  tools  : current_time_utc, echo, search_tools
-
-Type a request (e.g. 'what time is it?'), or /help for commands.
-
-slask-agent > what time is it?
+slask-agent > what time is it now?
   ▸ current_time_utc({})
-      2026-09-30T13:36:53+00:00
-  The current UTC time is 2026-09-30T13:36:53.787583674+00:00.
+      2026-10-01T00:00:00Z
+  The UTC time is 2026-10-01T00:00:00Z.
+
 slask-agent >
 ```
 
 ### REPL commands
 
-| Command                               | What it does                                      |
-| ------------------------------------- | ------------------------------------------------- |
-| `/help`, `/h`                         | show this help                                    |
-| `/tools`, `/t`                        | list the slask-mcp tools (live, from the server)  |
-| `/reset`, `/clear`, `/c`              | clear the conversation history                    |
-| `/quit`, `/exit`, `/q` (or `Ctrl+C`)  | leave the REPL                                    |
+| Command| What it does                                  |
+|--------|-----------------------------------------------|
+| /help  | show REPL help                                |
+| /tools | list all tools (across every connected server)|
+| /reset | clear the conversation history                |
+| /quit  | exit the REPL (or /exit, /q, Ctrl+C)          |
 
-Any other line is a chat turn. Tool failures are fed back to the model
-(instead of crashing), so a bad/unknown tool name just surfaces as an error
-the model can recover from.
 
 ## Direct, non-LLM commands
 
-```bash
-node cli.js list                              # tools + input schemas
-node cli.js call echo --message "hi"          # echo
-node cli.js call current_time_utc             # current UTC time
-node cli.js call search_tools --query echo    # search tools by name/description
-node cli.js call echo --args '{"message":"hi"}'   # raw JSON arguments
+Run a tool without the agent:
+
 ```
+# list every tool (across every connected server) with its input schema
+slask-client list
+
+# call a tool directly
+slask-client call echo --message hello
+slask-client call current_time_utc
+slask-client call search_tools --query echo
+slask-client call echo --args '{"message": "hi"}'
+```
+
+Warnings about unreachable servers are printed to stderr; the exit code is 1 on failure.
 
 ## Options & environment
 
-| Setting                                           | Flag                | Env var                             | Default                                                                        |
-| ------------------------------------------------- | ------------------- | ----------------------------------- | ------------------------------------------------------------------------------ |
-| MCP server endpoint (full URL, **incl. `/mcp`**)  | `--url`, `-u`       | `SLASK_MCP_URL`                     | `http://127.0.0.1:8000/mcp`                                                    |
-| Bearer token                                      | `--token`, `-t`     | `SLASK_MCP_TOKEN`                   | unset (no auth header sent)                                                    |
-| OpenAI base URL (chat)                            | `--base-url`, `-b`  | `API_BASE`                          | `https://api.openai.com`                                                       |
-| OpenAI model (chat)                               | `--model`, `-m`     | `MODEL` (or legacy `OPENAI_MODEL`)  | `gpt-4o-mini`                                                                  |
-| OpenAI API key (chat)                             | —                   | `OPENAI_API_KEY`                    | required for real OpenAI; **not** needed for a local OpenAI-compatible server  |
+| Command           | Flag| Env var        | Description                                                                                                 |
+|-------------------|-----|----------------|-------------------------------------------------------------------------------------------------------------|
+| -u, --url <url>   | -u  |                | MCP server endpoint (default: http://127.0.0.1:8000/mcp)                                                    |
+| -t, --token <tok> | -t  | SLASK_MCP_TOKEN| bearer token for the default server (required when the server is set up with a token; otherwise leave blank)|
+| -m, --model <name>| -m  | MODEL          | openai model (chat; default: gpt-4o-mini)                                                                   |
+| --base-url <url>  |     | API_BASE       | openai base url (chat; default: https://api.openai.com)                                                     |
+| OPENAI_API_KEY    |     | OPENAI_API_KEY | openai api key; only needed for the real openai endpoint (see API_BASE note)                                |
+|                   |     | OPENAI_MODEL   | legacy model name (checked after MODEL)                                                                     |
 
-Precedence: `--base-url` > `API_BASE` > default. Model: `--model` > `MODEL` >
-`OPENAI_MODEL` > `gpt-4o-mini`. The base URL is normalized to end in `/v1`
-automatically, so you can pass either `http://host:11434` or
-`http://host:11434/v1`.
-
-A `.env.example` is provided — copy it to `.env` if you like (already
-git-ignored by the repo's `.gitignore`).
 
 ## How the agent loop works
 
-Each chat turn:
+Each user turn runs a bounded OpenAI **function-calling** loop (default: up to 8 tool
+round-trips per turn):
 
-1. The model (Chat Completions + `tools`) is asked with the conversation
-   history and a system prompt describing the slask-mcp tools.
-2. If it requests tool calls, each is executed via `callTool` against the
-   MCP server; the text result is appended as a `tool` message and the
-   model is asked again. A per-turn cap of 8 tool round-trips bounds runaway
-   loops.
-3. When the model stops calling tools, its `content` is printed as the answer
-   and both the user line and the assistant answer are pushed to the history.
+1. The model sees the system prompt, the conversation history, and the `tools` array
+   (built from `tools/list` on every connected server, with `$schema` keys stripped).
+2. If the model requests tool calls, each is **routed to the originating server** (raw
+   name or `<serverName>__<toolName>` when names collide), the text result is fed back
+   into the conversation, and the loop repeats.
+3. When the model produces a final (non-tool-call) answer, it is printed and stored in
+   history.
 
-The MCP `inputSchema` `inputSchema` `$schema` key is stripped before being
-passed to OpenAI to avoid strict-mode surprises.
+A failed tool call (unknown tool, transport error, or a server 4xx/5xx) is returned to
+the model as an `ERROR calling …` message so it can adapt and continue — the session does
+not crash.
 
 ## Errors
 
-Non-2xx responses and tool-level failures exit with code 1 and a one-line
-message, with hints for the baseplate limits (401 Bearer required, 413 body
-too large, 504 request timed out) and for unknown tools. During an agent
-turn, an OpenAI or MCP failure prints a red error line but the REPL stays
-alive and re-prompts.
+Errors go to stderr; the process exits non-zero. Common ones:
+
+- `no MCP servers could be reached` — every server failed to connect (all best-effort
+  warnings were shown first).
+- `tool not found` — the named tool is not exposed by any connected server (run `list`).
+

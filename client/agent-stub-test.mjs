@@ -3,7 +3,14 @@
 // final answer) and that the $schema keys are stripped, without a real API key.
 import assert from "node:assert/strict";
 import { runAgentTurn, mcpToolsToOpenai, SYSTEM_PROMPT } from "./agent.js";
-import { connect, listTools, close } from "./client.js";
+import { connect, listTools, close, callTool } from "./client.js";
+import {
+  buildSpecs,
+  callToolBy,
+  closeAll,
+  connectAllServers,
+  openAiTools,
+} from "./servers.js";
 
 const url = process.env.MCP_URL ?? "http://127.0.0.1:9000/mcp";
 const token = process.env.SLASK_MCP_TOKEN ?? null;
@@ -61,7 +68,7 @@ const choice = (message, finish_reason) => ({
 });
 
 // ---- Test 1: single tool call then final answer --------------------------------
-const cfg = (openai) => ({ openai, model: "gpt-4o-mini", systemPrompt: SYSTEM_PROMPT, mcpClient: client, mcpTools: openaiTools });
+const cfg = (openai) => ({ openai, model: "gpt-4o-mini", systemPrompt: SYSTEM_PROMPT, tools: openaiTools, callTool: (name, args) => callTool(client, name, args) });
 let spy1 = [];
 const fake1 = makeFakeModel((n) => {
   if (n === 1) return choice({ tool_calls: [toolCall("c1", "current_time_utc", "{}")] }, "tool_calls");
@@ -147,6 +154,29 @@ assert(spy4.length === 1, `expected 1, got ${spy4.length}`);
 assert(/ERROR calling no_such_tool/i.test(spy4[0].resultText), `no error: ${spy4[0].resultText}`);
 assert(ans4, "expected a non-empty answer after a tool failure");
 console.log("PASS test4 — unknown tool error fed back, session survives");
+
+// ---- Test 5: multi-server collision — same server under two names; shared
+// tool names get the <serverName>__<toolName> prefix, and each key routes to
+// its server. -------------------------------------------
+{
+  const specs = buildSpecs({
+    defaultSpec: null,
+    configServers: [
+      { name: "weather", kind: "http", url, token },
+      { name: "calendar", kind: "http", url, token },
+    ],
+  });
+  const registry = await connectAllServers(specs);
+  assert(registry.views.length === 2, `expected 2 connected servers, got ${registry.views.length}`);
+  const names = openAiTools(registry).map((t) => t.name);
+  assert(names.includes("weather__current_time_utc"), `missing weather__current_time_utc: ${names.join(", ")}`);
+  assert(names.includes("calendar__current_time_utc"), `missing calendar__current_time_utc: ${names.join(", ")}`);
+  assert(!names.includes("current_time_utc"), "shared name should be namespaced");
+  const res = await callToolBy("weather__current_time_utc", registry, {});
+  assert(/^2026-/.test(res.content[0].text ?? ""), `weather__current_time_utc bad: ${JSON.stringify(res)}`);
+  console.log("PASS test5 — collision namespacing:", names.join(", "));
+  await closeAll(registry);
+}
 
 console.log("\nALL AGENT-LOOP STUB TESTS PASSED");
 await close(client);

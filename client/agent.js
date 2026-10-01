@@ -1,10 +1,12 @@
 // agent.js — the OpenAI + MCP agent loop.
 //
 // Runs one user turn through an OpenAI Chat Completions "function calling"
-// loop: the model decides which slask-mcp tools to call, `callTool` runs
-// them against the MCP server, the (text) results are appended back to the
-// message history, and the loop repeats until the model produces a final
-// answer. A per-turn cap on tool iterations bounds runaway loops.
+// loop: the model decides which tools to call, `callTool` (a resolver supplied
+// by the caller) routes the call to the right server, the (text) results are
+// appended back to the message history, and the loop repeats until the model
+// produces a final answer. A per-turn cap on tool iterations bounds runaway
+// loops. Tools may span several servers; their names are whatever the caller
+// put in `tools` (raw name, or `<server>__<name>` when names collide).
 //
 // The model side is any **OpenAI-compatible** chat endpoint:
 //   - real OpenAI (default: https://api.openai.com, requires OPENAI_API_KEY)
@@ -43,12 +45,12 @@ function isRealOpenAi(base) {
 }
 
 export const SYSTEM_PROMPT = [
-  "You are a helpful agent that answers the user's requests by using the tools",
-  "that talk to the slask-mcp server. The tools are passed in via `tools`.",
-  "Available tools (call only these; do not invent others):",
-  "  - echo({message})            echoes a string back to you.",
-  "  - current_time_utc()         returns the current UTC date/time (ISO 8601).",
-  "  - search_tools({query})      finds tools by a case-insensitive name/description substring.",
+  "You are a helpful agent that answers the user's requests using the tools",
+  "passed in via `tools`. Call only tools that appear in that list; never invent",
+  "names. Each tool's name is exactly the `name` in the list — when several MCP",
+  "servers are connected, tools that would otherwise collide are prefixed with",
+  "their server name (e.g. `slask__echo`, `weather__forecast`). Use the exact",
+  "names provided.",
   "Use a tool when the user's request needs it; otherwise just answer directly.",
   "Keep answers concise and in the user's language. If a tool call fails, say so",
   "clearly and continue with what you can (do not pretend the tool succeeded).",
@@ -109,20 +111,23 @@ export function mcpToolsToOpenai(mcpTools) {
 /**
  * Run one user turn.
  *
- * @param {{openai, model, systemPrompt, mcpClient, mcpTools}} cfg
+ * @param {{openai, model, systemPrompt, tools, callTool}} cfg
+ *   - `tools`    OpenAI-function-shaped array (names are the caller's keys).
+ *   - `callTool` resolver: `async (toolName, args) => result`, routed to the
+ *     right per-server client.
  * @param {Array<{role, content}>} requestMessages prior conversation (no system)
  * @param {({name, args, resultText}) => void} [onToolCall] optional callback the UI
  *        prints a tool trace for each MCP tool the model calls.
  * @returns {Promise<string>} the model's final answer.
  */
-export async function runAgentTurn({ openai, model, systemPrompt, mcpClient, mcpTools }, requestMessages, onToolCall) {
+export async function runAgentTurn({ openai, model, systemPrompt, tools, callTool }, requestMessages, onToolCall) {
   const messages = [{ role: "system", content: systemPrompt }, ...requestMessages];
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     const res = await openai.chat.completions.create({
       model,
       messages,
-      tools: mcpTools,
+      tools,
       max_tokens: MAX_TOKENS,
     });
     const choice = res.choices?.[0];
@@ -147,7 +152,7 @@ export async function runAgentTurn({ openai, model, systemPrompt, mcpClient, mcp
         }
         let resultText;
         try {
-          const result = await callTool(mcpClient, tc.function.name, args);
+          const result = await callTool(tc.function.name, args);
           resultText = mcpResultToText(result);
         } catch (e) {
           // A bad/unknown tool, a transport error, or a 4xx/5xx from the

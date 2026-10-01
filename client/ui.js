@@ -1,16 +1,18 @@
 // ui.js — the line-based chat REPL for slask-mcp.
 //
-// Wraps the slask-mcp MCP server (client.js) with the OpenAI agent loop
-// (agent.js): the user types natural language, the model decides which MCP
-// tools to call, the client executes them, results feed back, and a final
-// answer is printed. Non-streaming, with a small `thinking…` spinner and a
-// dependency-free color/ANSI helper. Built on node:readline only (no TUI lib).
+// Wraps one or more MCP servers (already connected by cli.js via servers.js)
+// with the OpenAI agent loop (agent.js): the user types natural language, the
+// model decides which MCP tools to call, the client executes them, results feed
+// back, and a final answer is printed. Non-streaming, with a small `thinking…`
+// spinner and a dependency-free color/ANSI helper. Built on node:readline only
+// (no TUI lib).
 //
 // REPL commands: /help /h  /tools /t  /reset /clear /c  /quit /exit /q
 
 import { createInterface } from "node:readline";
 
-import { close, connect, hintFor, listTools, printTools } from "./client.js";
+import { hintFor, printTools } from "./client.js";
+import { closeAll, callToolBy, openAiTools } from "./servers.js";
 import {
   DEFAULT_API_BASE,
   DEFAULT_MODEL,
@@ -106,7 +108,7 @@ function die(msg) {
 const REPLY_HELP = [
   "REPL commands:",
   "  /help     show this help",
-  "  /tools    list the slask-mcp tools",
+  "  /tools    list all tools (across every connected server)",
   "  /reset    clear the conversation history",
   "  /quit     (or /exit, /q, or Ctrl+C) leave the REPL",
   "",
@@ -119,7 +121,9 @@ const REPLY_HELP = [
 // ---------------------------------------------------------------------------
 // the REPL
 // ---------------------------------------------------------------------------
-export async function startChat({ url, token, model, base }) {
+// The caller (cli.js) has already connected the servers (best-effort) and
+// handed us a registry: { views, warnings, keyedViews, byKey }.
+export async function startChat({ registry, model, base }) {
   // 1) OpenAI client (chat-only) — fail fast, before touching the server.
   //    `base` (a `--base-url` flag) takes precedence over API_BASE, which
   //    defaults to the real OpenAI endpoint. Local servers (e.g. Ollama)
@@ -131,25 +135,26 @@ export async function startChat({ url, token, model, base }) {
     die(e.message);
   }
 
-  // 2) Connect to the MCP server + read its tools.
-  let client;
-  let mcpTools;
-  try {
-    client = await connect({ url, token });
-    mcpTools = await listTools(client);
-  } catch (e) {
-    const message = e.message ?? e.code ?? String(e);
-    die(`couldn't reach the slask-mcp server at ${url}${hintFor(message)}`);
+  // 2) Build the (possibly multi-server) tool list.
+  const openaiTools = mcpToolsToOpenai(openAiTools(registry));
+
+  // Report any servers we could not reach (they're skipped, not fatal).
+  for (const w of registry.warnings) {
+    console.error(color("red", `  ⚠ could not reach server ${w.name}: ${w.error}${hintFor(w.error)}`));
   }
-  const openaiTools = mcpToolsToOpenai(mcpTools);
 
   // Banner.
   const effectiveBase = base ?? process.env.API_BASE ?? DEFAULT_API_BASE;
   console.log(color("bold", "\nslask-mcp agent\n"));
-  console.log(`  server : ${color("cyan", url)}`);
+  for (const v of registry.keyedViews) {
+    console.log(`  server : ${color("cyan", v.name)} (${v.kind}) ${v.address}`);
+  }
+  if (registry.keyedViews.length === 0) {
+    console.log(`  server : ${color("dim", "(none reached)")}`);
+  }
   console.log(`  model  : ${color("cyan", model)}`);
   console.log(`  api    : ${color("cyan", effectiveBase)}`);
-  console.log(`  tools  : ${color("cyan", mcpTools.map((t) => t.name).join(", "))}`);
+  console.log(`  tools  : ${color("cyan", openaiTools.length ? openaiTools.map((t) => t.function.name).join(", ") : "(none)")}`);
   console.log(color("dim", "\nType a request (e.g. 'what time is it?'), or /help for commands.\n"));
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -168,9 +173,9 @@ export async function startChat({ url, token, model, base }) {
     }
     (async () => {
       try {
-        await close(client);
+        await closeAll(registry);
       } catch {
-        /* server may already be gone */
+        /* servers may already be gone */
       }
       rl.close();
       process.exit(0);
@@ -202,7 +207,7 @@ export async function startChat({ url, token, model, base }) {
       }
       if (cmd === "/tools" || cmd === "/t") {
         process.stdout.write("\n");
-        printTools(mcpTools);
+        printTools(registry.keyedViews);
         return loop();
       }
       if (cmd === "/reset" || cmd === "/clear" || cmd === "/c") {
@@ -229,8 +234,8 @@ export async function startChat({ url, token, model, base }) {
             openai,
             model,
             systemPrompt: SYSTEM_PROMPT,
-            mcpClient: client,
-            mcpTools: openaiTools,
+            tools: openaiTools,
+            callTool: (name, args) => callToolBy(name, registry, args),
           },
           history,
           onToolCall
