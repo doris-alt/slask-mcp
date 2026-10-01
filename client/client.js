@@ -1,4 +1,5 @@
-// Minimal slask-mcp client — connects over streamable HTTP using the
+// Minimal slask-mcp client — connects to one MCP server at a time, over
+// streamable HTTP (`connect`) or raw stdio (`connectStdio`), using the
 // official @modelcontextprotocol/client SDK.
 //
 // `url` must be the full endpoint (including `/mcp`). `token`, when
@@ -11,6 +12,7 @@
 // printTools.
 
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
 const CLIENT_INFO = { name: "slask-mcp-client", version: "0.1.0" };
 
@@ -30,6 +32,31 @@ export async function connect({ url, token } = {}) {
       : undefined;
 
   const transport = new StreamableHTTPClientTransport(new URL(url), transportOptions);
+  const client = new Client(CLIENT_INFO);
+  await client.connect(transport);
+  return client;
+}
+
+/**
+ * Create and connect a stdio client. `params` is the `StdioServerParameters`
+ * shape used by the transport:
+ *   command       (required) executable to spawn
+ *   args          (optional) argument list
+ *   env           (optional) env vars, merged over the inherited defaults
+ *   cwd           (optional) working directory
+ *   stderr        (optional) default "inherit"
+ *   maxBufferSize (optional, bytes) default 10 MiB
+ * Returns a connected `Client`.
+ */
+export async function connectStdio({ command, args, env, cwd, stderr, maxBufferSize } = {}) {
+  const transport = new StdioClientTransport({
+    command,
+    args,
+    env,
+    cwd,
+    stderr,
+    maxBufferSize,
+  });
   const client = new Client(CLIENT_INFO);
   await client.connect(transport);
   return client;
@@ -99,11 +126,29 @@ export function hintFor(message) {
   return "";
 }
 
-/** Pretty-print a set of MCP tools (used by `list` and the REPL's `/tools`). */
-export function printTools(tools) {
-  console.log(`${tools.length} tool(s):\n`);
-  for (const tool of tools) {
-    console.log(`  ${tool.name}  —  ${tool.description}`);
-    if (tool.inputSchema) console.log(`      ${JSON.stringify(tool.inputSchema)}`);
+/**
+ * Pretty-print a set of MCP tools, grouped by server (used by `list` and the
+ * REPL's `/tools`).
+ *
+ * `views` is an array of server views, each
+ *   `{ name, kind, keyedTools: [{ key, tool }] }`
+ * where `tool` is a raw tool `{ name, description, inputSchema }` and `key` is the
+ * name users use to call it — the raw name when unique across servers, or
+ * `<serverName>__<toolName>` when two or more servers share that tool name.
+ * With a single view the output matches the original flat format (no group
+ * header, 2-space tool indent, 6-space schema indent).
+ */
+export function printTools(views) {
+  const total = views.reduce((n, v) => n + v.keyedTools.length, 0);
+  console.log(`${total} tool(s):\n`);
+  const grouped = views.length > 1;
+  const toolPad = grouped ? "    " : "  ";
+  const schemaPad = grouped ? "        " : "      ";
+  for (const view of views) {
+    if (grouped) console.log(`${toolPad}${view.name} (${view.kind})`);
+    for (const { key, tool } of view.keyedTools) {
+      console.log(`${toolPad}${key}  —  ${tool.description ?? ""}`);
+      if (tool.inputSchema) console.log(`${schemaPad}${JSON.stringify(tool.inputSchema)}`);
+    }
   }
 }

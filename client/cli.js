@@ -1,45 +1,48 @@
 #!/usr/bin/env node
-// slask-client — CLI for slask-mcp (streamable HTTP transport).
+// slask-client — a CLI for MCP servers (streamable HTTP + stdio).
 //
 //   slask-client                 interactive chat (OpenAI agent + MCP tools)
 //   slask-client chat            same
-//   slask-client list            list the server's tools
+//   slask-client list            list all tools (across every connected server)
 //   slask-client call <tool> …   call a tool directly and print its result
 //   slask-client help
 //
-// Server config via flags or environment:
-//   --url / SLASK_MCP_URL        (default: http://127.0.0.1:8000/mcp)
-//   --token / SLASK_MCP_TOKEN    (Bearer, only when the server asks for one)
+// The default slask server is configured via --url/--token (or
+// SLASK_MCP_URL/SLASK_MCP_TOKEN) and is always included (named "slask") unless
+// --no-default. Additional servers — HTTP or stdio, any number — come from a
+// JSON config file (default client/mcp.json; override with --config/-c or
+// SLASK_MCP_CONFIG).
 //
 // Chat (OpenAI agent) config — any OpenAI-compatible endpoint:
 //   --base-url / -b <url>       base URL (chat); overrides API_BASE
 //   API_BASE                    base URL (default: https://api.openai.com)
-//   MODEL                       model name (default: gpt-4o-mini); OPENAI_MODEL and
-//                               --model/-m also work. Precedence: flag > MODEL > OPENAI_MODEL.
-//   OPENAI_API_KEY              required only when pointing at real OpenAI; a local
-//                               server (e.g. Ollama) is used with a placeholder key
+//   MODEL                       model name (default: gpt-4o-mini); OPENAI_MODEL
+//                               and --model/-m also work. Precedence: flag >
+//                               MODEL > OPENAI_MODEL.
+//   OPENAI_API_KEY              required only when pointing at real OpenAI; a
+//                               local server (e.g. Ollama) is used with a
+//                               placeholder key
 
 import { startChat } from "./ui.js";
+import { hintFor, printTools, textFrom } from "./client.js";
 import {
-  callTool,
-  close,
-  connect,
-  hintFor,
-  listTools,
-  printTools,
-  textFrom,
-} from "./client.js";
+  buildSpecs,
+  callToolBy,
+  closeAll,
+  connectAllServers,
+  loadConfigServers,
+} from "./servers.js";
 import { DEFAULT_MODEL } from "./agent.js";
 
 const DEFAULT_URL = "http://127.0.0.1:8000/mcp";
 
-const HELP = `slask-client — a CLI for the slask-mcp server (streamable HTTP)
+const HELP = `slask-client — a CLI for MCP servers (streamable HTTP + stdio)
 
 Usage:
   slask-client                 Run the interactive agent chat (default).
   slask-client chat            Same as the default.
   slask-client list
-      List the server's tools with their input schemas.
+      List all tools (across every connected server) with their input schemas.
   slask-client call <tool> [options]
       Call a tool and print its result.
         --args '<json>'   JSON object of arguments
@@ -49,13 +52,26 @@ Usage:
       Show this help (also: --help).
 
 Options:
-  -u, --url <url>        Server endpoint (default: ${DEFAULT_URL})
-  -t, --token <token>    Bearer token for the HTTP transport
+  -u, --url <url>        Default (slask) server endpoint (default: ${DEFAULT_URL})
+  -t, --token <token>    Bearer token for the default server
+  -c, --config <path>    MCP servers config file (JSON; default: mcp.json in the client dir)
+      --no-default       Do not include the default slask server
   -m, --model <model>    OpenAI model (chat mode; default: gpt-4o-mini)
   -b, --base-url <url>   OpenAI-compatible base URL (chat; overrides API_BASE)
-  Env vars: SLASK_MCP_URL, SLASK_MCP_TOKEN (server); API_BASE (default
-               https://api.openai.com), MODEL/OPENAI_MODEL, OPENAI_API_KEY (chat).
-               A local OpenAI-compatible server (e.g. Ollama) needs no API key.
+  Env vars: SLASK_MCP_URL, SLASK_MCP_TOKEN (default server); SLASK_MCP_CONFIG
+             (config file); API_BASE (default https://api.openai.com),
+             MODEL/OPENAI_MODEL, OPENAI_API_KEY (chat). A local OpenAI-compatible
+             server (e.g. Ollama) needs no API key.
+
+Multiple servers:
+  The default slask HTTP server is always included (named "slask", from
+  --url / SLASK_MCP_URL). To add servers, copy client/mcp.example.json to
+  client/mcp.json and list entries — each is a full server spec. Any number
+  of servers is allowed:
+      {"name":"weather","type":"stdio","command":"/path/weather-mcp","args":["--verbose"],"env":{"KEY":""}}
+      {"name":"cal","type":"http","url":"http://host:9001/mcp","token":"secret"}
+  When two servers expose a tool with the same name it is namespaced as
+  <serverName>__<toolName>; names unique across servers are called un-prefixed.
 
 Examples:
   slask-client                                  # interactive agent chat
@@ -68,6 +84,8 @@ Examples:
   slask-client call search_tools --query echo
   slask-client call echo --args '{"message":"hi"}'
   SLASK_MCP_TOKEN=secret slask-client call current_time_utc
+  --config ./my-servers.json slask-client       # extra servers from a JSON file
+  --no-default slask-client                     # only the servers from the config
 `;
 
 function fail(msg) {
@@ -80,6 +98,8 @@ function parse(argv) {
   const config = {
     url: process.env.SLASK_MCP_URL ?? DEFAULT_URL,
     token: process.env.SLASK_MCP_TOKEN ?? null,
+    config: null,
+    noDefault: false,
     model: null,
     base: null,
     positional: [],
@@ -96,6 +116,10 @@ function parse(argv) {
       if (++i < argv.length) config.url = argv[i];
     } else if (f === "--token" || f === "-t") {
       if (++i < argv.length) config.token = argv[i];
+    } else if (f === "--config" || f === "-c") {
+      if (++i < argv.length) config.config = argv[i];
+    } else if (f === "--no-default") {
+      config.noDefault = true;
     } else if (f === "--model" || f === "-m") {
       if (++i < argv.length) config.model = argv[i];
     } else if (f === "--base-url" || f === "-b") {
@@ -158,16 +182,39 @@ async function main() {
     return;
   }
 
-  // No subcommand (or an explicit `chat`) → the interactive agent REPL.
+  // Fail fast on an unknown command before touching any server.
+  if (sub !== "" && sub !== "chat" && sub !== "list" && sub !== "call") {
+    fail(`unknown command: ${sub}\n\n${HELP}`);
+    return;
+  }
+
+  // Build the full server list (default slask + config servers) and connect
+  // best-effort. This happens for chat, list, and call.
+  let registry;
+  try {
+    const configServers = await loadConfigServers({
+      flag: config.config,
+      envVar: process.env.SLASK_MCP_CONFIG,
+    });
+    const defaultSpec = config.noDefault
+      ? null
+      : { name: "slask", kind: "http", url: config.url, token: config.token };
+    const specs = buildSpecs({ defaultSpec, configServers });
+    registry = await connectAllServers(specs);
+  } catch (e) {
+    fail(`config error: ${e.message}`);
+    return;
+  }
+
+  if (registry.views.length === 0) {
+    const last = registry.warnings.length ? registry.warnings[registry.warnings.length - 1] : null;
+    fail(`no MCP servers could be reached` + (last ? ` (last error: ${last.error})` : ""));
+    return;
+  }
+
   if (!sub || sub === "chat") {
-    // Precedence: --model flag > MODEL > OPENAI_MODEL > default.
-    const model =
-      config.model ?? process.env.MODEL ?? process.env.OPENAI_MODEL ?? DEFAULT_MODEL;
-    // Pass only the flag value; agent.js applies API_BASE, then the default.
-    const base = config.base;
-    // startChat owns its lifecycle (reads the key, connects, runs the REPL)
-    // and exits the process on quit / startup failure.
-    await startChat({ url: config.url, token: config.token, model, base });
+    const model = config.model ?? process.env.MODEL ?? process.env.OPENAI_MODEL ?? DEFAULT_MODEL;
+    await startChat({ registry, model, base: config.base });
     return;
   }
 
@@ -176,28 +223,30 @@ async function main() {
     return;
   }
 
-  let client;
+  // Show any servers we could not reach (skipped, not fatal).
+  for (const w of registry.warnings) {
+    console.error(`⚠ could not reach server ${w.name}: ${w.error}${hintFor(w.error)}`);
+  }
+
   let action = "the request";
   try {
-    client = await connect(config);
-
     if (sub === "list") {
       action = "listing tools";
-      printTools(await listTools(client));
+      printTools(registry.keyedViews);
     } else {
       const tool = config.positional[1];
       if (!tool) fail("usage: call <tool> [options]");
       action = `calling ${tool}`;
-      printResult(await callTool(client, tool, config.args));
+      printResult(await callToolBy(tool, registry, config.args));
     }
   } catch (err) {
     onMcpError(err, action, {
       sub,
       tool: config.positional.length > 1 ? config.positional[1] : undefined,
     });
-  } finally {
-    if (client) await close(client);
+    return;
   }
+  await closeAll(registry);
 }
 
 main();
