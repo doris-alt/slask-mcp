@@ -5,59 +5,41 @@ the slask server — or at any number of your own stdio and HTTP MCP servers —
 and drive the tools it exposes either interactively (an agent chat using OpenAI
 function-calling) or by hand (`list` / `call`).
 
-## Setup
+## Usage
 
 The client is a **TypeScript** Node.js ESM CLI (`"type": "module"`, Node v20+
 required) that talks to MCP servers over streamable HTTP or raw stdio. The
 source lives in `client/*.ts`; the runnable program is the compiled
 `client/dist/` — so the build must be (re)done before running.
 
-### 1. Prerequisites
+### Build
 
-- Node.js v20+ with `npm`
-
-### 2. Install
+Prerequisite: Node.js v20+ with `npm`.
 
 ```bash
 cd client
 npm install
-```
-
-### 3. Build
-
-```bash
 npm run build
 ```
 
-Compiles every `.ts` file to `client/dist/*.js`. The `slask-client` binary is
-`dist/cli.js` (the `bin` entry in `package.json`). Re-run this after every
-source change.
+`npm run build` compiles every `.ts` file to `client/dist/*.js`. The
+`slask-client` binary is `dist/cli.js` (the `bin` entry in `package.json`).
+Re-run it after every source change.
 
 ```bash
 npm run typecheck   # type-checks without emitting anything
 npm run clean       # deletes dist/ (then rebuild)
 ```
 
-### 4. (Optional) Global command — `npm link`
+(Optional) To put `slask-client` on your `PATH` from any directory, run `npm
+link` once from `client/` — it symlinks this package into npm's global
+prefix, so `slask-client …` works from any terminal. Because it's a symlink,
+the global command always executes the latest `dist/` build — after a source
+change, re-run `npm run build`, but you never need to re-link. Undo with `npm
+unlink` (from `client/`). If you only ever run from inside `client/`, skip
+this — `npx slask-client …` already covers it.
 
-If you want `slask-client` to work from **any** directory, not just
-`client/`, make it a global command once (run from `client/`):
-
-```bash
-npm link
-```
-
-This symlinks this directory into npm's global prefix and drops a
-`slask-client` launcher script in the global `bin` directory, so
-`slask-client …` runs from any terminal. Because it's a symlink, the
-global command always executes the latest `dist/` build — after a source
-change, re-run `npm run build`, but you never need to re-link. Undo with
-`npm unlink` (from `client/`).
-
-If you only ever run from inside `client/`, skip this step — `npx
-slask-client …` covers it.
-
-### 5. Running the client
+### Run
 
 After a build, three equivalent ways to launch the CLI — all of them run
 `client/dist/cli.js`:
@@ -68,23 +50,24 @@ After a build, three equivalent ways to launch the CLI — all of them run
 | Direct | `node dist/cli.js list` | Always works once built; no npm resolution step |
 | Global | `npm link` in `client/`, then `slask-client list` | Puts `slask-client` on your `PATH` from anywhere |
 
-`slask-client help` (or `--help`) prints the full command reference. For
-agent chat, configure the model via a `.env` file in the current working
-directory (copy `client/.env.example` to `./.env` first — it lists
-`SLASK_MCP_URL`, `API_BASE`, `MODEL`, `OPENAI_API_KEY`), env vars, or
-flags; shell env wins over the file; every setting is covered in the
-**Options & environment** section below.
+`slask-client help` (or `--help`) prints the full command reference.
 
-Typical first run, once the slask server is up (see **Start the server**
-below):
+Typical first run, once the slask server is up (see **Configure** below):
 
 ```bash
 npx slask-client list                        # can the client see the tools?
 npx slask-client call echo --message hello
 ```
 
+### Configure
 
-## Start the server
+For agent chat, configure the model via a `.env` file in the current working
+directory (copy `client/.env.example` to `./.env` first — it lists
+`SLASK_MCP_URL`, `API_BASE`, `MODEL`, `OPENAI_API_KEY`), env vars, or
+flags; shell env wins over the file; every setting is covered in the
+**Options & environment** section below.
+
+#### Start the server
 
 Run the slask-mcp server on the same machine (or on any host reachable by URL). Default bind: `127.0.0.1:8000`, default path: `/mcp`. The server is HTTP with optional Bearer-token auth:
 
@@ -96,7 +79,7 @@ slask-mcp
 SLASK_MCP_TOKEN=my-secret slask-mcp
 ```
 
-## Multiple servers (configuration file)
+#### Multiple servers (configuration file)
 
 The slask server is configured with `--url`/`--token` (or `SLASK_MCP_URL`/
 `SLASK_MCP_TOKEN`) and is always connected — named **`slask`** — in

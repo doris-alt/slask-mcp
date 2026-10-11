@@ -1,6 +1,6 @@
 {
   "name": "slask-mcp-client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CLI client for the slask-mcp server (streamable HTTP transport)",
   "type": "module",
   "engines": {
