@@ -91,7 +91,12 @@ export async function loadConfigServers({
   if (!Array.isArray(cfg.servers)) {
     throw new Error("config must be an object with a top-level `servers` array");
   }
-  return cfg.servers.map((s, i) => validateServer(s, i));
+  return cfg.servers.flatMap((s, i) => {
+    if (s && typeof s === "object" && (s as Record<string, unknown>).disabled === true) {
+      return [];
+    }
+    return [validateServer(s, i)];
+  });
 }
 
 /** Turn one raw config entry into a unified server spec. Throws on bad input. */
