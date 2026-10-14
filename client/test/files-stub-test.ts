@@ -251,6 +251,47 @@ const disk = async (p: string): Promise<string> => readFile(p, "utf8");
 }
 
 // ---------------------------------------------------------------------------
+// 5b. writeFileInBase append mode: extend existing, create-if-missing,
+//     chunked write, preserve existing content, escapes still reject ----------
+// ---------------------------------------------------------------------------
+{
+  // append to an existing file preserves and extends its content
+  await writeFileInBase(root, "app.txt", "first", false);
+  const a1 = await writeFileInBase(root, "app.txt", "second", true);
+  assert(a1.appended === true, String(a1.appended));
+  assert(a1.created === false, String(a1.created));
+  assert((await disk(join(root, "app.txt"))) === "firstsecond");
+
+  // chunked write: first chunk overwrites, the rest append
+  await writeFileInBase(root, "chunk.txt", "AAA", false);
+  await writeFileInBase(root, "chunk.txt", "BBB", true);
+  await writeFileInBase(root, "chunk.txt", "CCC", true);
+  assert((await disk(join(root, "chunk.txt"))) === "AAABBBCCC");
+
+  // append on a missing file creates it (created: true, appended: true)
+  const a2 = await writeFileInBase(root, "newappend.txt", "solo", true);
+  assert(a2.created === true, String(a2.created));
+  assert((await disk(join(root, "newappend.txt"))) === "solo");
+
+  // existing content is preserved (never truncated) when append: true
+  await writeFileInBase(root, "app2.txt", "keep", false);
+  await writeFileInBase(root, "app2.txt", " more", true);
+  assert((await disk(join(root, "app2.txt"))) === "keep more");
+
+  // append is sandboxed identically: directory + escape targets are refused
+  const mDirAppend = await thrown(() => writeFileInBase(root, "subdir", "x", true));
+  assert(/is a directory/.test(mDirAppend), mDirAppend);
+  const mEscAppend = await thrown(() => writeFileInBase(root, "../outside.txt", "x", true));
+  assert(/escapes the launch directory/.test(mEscAppend), mEscAppend);
+  const mEscParentAppend = await thrown(() =>
+    writeFileInBase(root, "escparent/new.txt", "x", true),
+  );
+  assert(/escapes the launch directory \(symlink\)/.test(mEscParentAppend), mEscParentAppend);
+
+  console.log("PASS test5b — writeFileInBase append (extend, chunk, create, preserve, reject)");
+}
+
+// ---------------------------------------------------------------------------
 // 6. fileTools(): 3 tools, names, required arrays, non-empty descriptions ----
 // ---------------------------------------------------------------------------
 {
@@ -268,6 +309,8 @@ const disk = async (p: string): Promise<string> => readFile(p, "utf8");
   assert(rp.properties.path.type === "string", "read_file.path should be a string");
   assert(rp.properties.offset.type === "integer", "read_file.offset should be an integer");
   assert(rp.properties.bytes.type === "integer", "read_file.bytes should be an integer");
+  const wp = (byName.get("write_file")!.function.parameters) as any;
+  assert(wp.properties.append.type === "boolean", "write_file.append should be a boolean");
   for (const t of tools) {
     assert(t.type === "function", t.function.name);
     const d = t.function.description;
@@ -307,6 +350,16 @@ const disk = async (p: string): Promise<string> => readFile(p, "utf8");
   assert(writeRes.isError === false, JSON.stringify(writeRes));
   assert((await disk(join(root, "route2.txt"))) === "fresh\n");
   assert(textOf(writeRes).includes("route2.txt"), textOf(writeRes));
+
+  // append routes through the router and extends the existing file
+  const appRes = await callFileTool(root, "write_file", {
+    path: "route2.txt",
+    content: " and more\n",
+    append: true,
+  });
+  assert(appRes.isError === false, JSON.stringify(appRes));
+  assert((await disk(join(root, "route2.txt"))) === "fresh\n and more\n");
+  assert(/appended/.test(textOf(appRes)), textOf(appRes));
 
   // unknown name -> throw (not an isError result)
   const mUnknown = await thrown(() => callFileTool(root, "no_such_tool", {}));
