@@ -280,7 +280,7 @@ agent (they appear in the startup banner alongside server and skill tools):
 |-----------------|----------------------------------------------------------|---------------------------|
 | `read_file`     | read a plain-text file — the whole file, or a byte range via `offset`/`bytes` | `path`, optional `offset`, `bytes` |
 | `edit_file`     | atomic search-and-replace; never modifies unless it succeeds | `path`, `search`, `replace`, optional `replaceAll` |
-| `write_file`    | create or overwrite a file (parent dirs created as needed) | `path`, `content` |
+| `write_file`    | create or overwrite a file, or append with `append: true` (parent dirs created as needed) | `path`, `content`, optional `append` |
 
 - **`read_file(path, offset?, bytes?)`** returns the file text, its total
   byte count, and a `truncated` flag. The default read covers bytes from 0
@@ -299,8 +299,13 @@ agent (they appear in the startup banner alongside server and skill tools):
   pass `replaceAll: true` to change every occurrence); an empty `replace`
   deletes the match. This avoids re-sending the whole file to a small model
   with a 1024-token completion cap.
-- **`write_file(path, content)`** creates or overwrites a plain-text file,
-  creating any missing parent directories along the way.
+- **`write_file(path, content[, append])`** creates or overwrites a plain-text
+  file, creating any missing parent directories along the way. With `append`
+  omitted or `false`, the file is created or fully overwritten (truncating).
+  With `append: true`, `content` is added to the end of the file — the file is
+  created if it does not yet exist. Use the append mode to write a large file
+  in chunks: one `write_file` call for the first chunk (default overwrite),
+  then each following chunk with `append: true`.
 
 **Sandbox (enforced in client code, not by the agent).** All three tools only
 touch paths under the **launch directory** — the directory where

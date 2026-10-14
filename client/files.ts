@@ -24,6 +24,7 @@ import {
   realpath,
   stat,
   writeFile,
+  appendFile,
 } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -283,18 +284,26 @@ export interface FileWriteResult {
   path: string;
   bytes: number;
   created: boolean;
+  appended: boolean;
 }
 
 /**
- * Create or overwrite a plain-text file inside the sandbox. Parent
+ * Create, overwrite, or append to a plain-text file inside the sandbox. Parent
  * directories are created as needed (all of them stay inside the base by
  * construction). Refuses to target an existing directory or the launch
  * directory itself.
+ *
+ * `append` false (default): create or fully overwrite (truncating) — use for
+ * new files or full rewrites. `append` true: add the text to the end of the
+ * file, creating it if it does not yet exist — the chunked-write path, where
+ * you start the file once with `append` false and send each following chunk
+ * with `append` true.
  */
 export async function writeFileInBase(
   baseDir: string,
   rawPath: unknown,
   rawContent: unknown,
+  rawAppend?: unknown,
 ): Promise<FileWriteResult> {
   const abs = resolveInBase(baseDir, rawPath);
   const rel = relOf(baseDir, abs);
@@ -305,6 +314,7 @@ export async function writeFileInBase(
     throw new Error("content is required");
   }
   const content = String(rawContent);
+  const append = Boolean(rawAppend);
 
   const st = await stat(abs).catch(() => null);
   if (st !== null && st.isDirectory()) {
@@ -316,11 +326,16 @@ export async function writeFileInBase(
   await resolveExistingInBase(baseDir, abs);
   const realParent = await resolveExistingInBase(baseDir, dirname(abs));
   await mkdir(realParent, { recursive: true });
-  await writeFile(abs, content, "utf8");
+  if (append) {
+    await appendFile(abs, content, "utf8");
+  } else {
+    await writeFile(abs, content, "utf8");
+  }
   return {
     path: rel,
     bytes: Buffer.byteLength(content, "utf8"),
     created: st === null,
+    appended: append,
   };
 }
 
@@ -413,17 +428,30 @@ export function fileTools(): OpenAiFunctionTool[] {
       function: {
         name: "write_file",
         description:
-          "Create (or overwrite) a plain-text file under the launch directory; " +
-          "parent directories are created as needed. Use it for new files or " +
-          "full rewrites — for targeted changes prefer edit_file. " + note,
+          "Create, overwrite, or append to a plain-text file under the launch " +
+          "directory; parent directories are created as needed. With `append` " +
+          "false (the default) the file is created or fully overwritten — use " +
+          "for new files or full rewrites. With `append` true the text is added " +
+          "to the end of the file (creating it if it does not yet exist) — use " +
+          "this to write a large file in chunks: one `write_file` call per " +
+          "chunk, the first with `append` false and each following chunk with " +
+          "`append` true. For targeted changes to an existing file prefer " +
+          "edit_file. " + note,
         parameters: {
           type: "object",
           properties: {
             path: {
               type: "string",
-              description: "relative path of the file to create or overwrite",
+              description: "relative path of the file to create, overwrite, or append to",
             },
-            content: { type: "string", description: "full file contents" },
+            content: { type: "string", description: "text to write to the file" },
+            append: {
+              type: "boolean",
+              description:
+                "when true, append `content` to the end of the file instead of " +
+                "overwriting it (the file is created if it does not exist). " +
+                "Default: false.",
+            },
           },
           required: ["path", "content"],
         },
@@ -438,12 +466,14 @@ export function fileSystemBlock(): string {
     "\n\nFile access: you have built-in file tools — `read_file` (inspect a " +
     "text file, optionally a byte range via `offset` and `bytes`), `edit_file` " +
     "(atomic search-and-replace), and `write_file` (create or overwrite a file, " +
-    "creating parent directories). They are sandboxed to the directory you were " +
-    "launched in and its subdirectories; any path that would leave it (absolute, " +
-    "`..`, or symlink) is rejected by the client. For large files, read them in " +
-    "byte ranges and continue from the `next offset` the result reports. Use " +
-    "`edit_file` for targeted changes and `write_file` only for new files or full " +
-    "rewrites."
+    "or append to it with `append: true`; parent directories are created as " +
+    "needed). They are sandboxed to the directory you were launched in and its " +
+    "subdirectories; any path that would leave it (absolute, `..`, or symlink) " +
+    "is rejected by the client. To write a large file in chunks, call " +
+    "`write_file` once to start the file (the default overwrite is fine for the " +
+    "first chunk), then send each further chunk with `append: true`. To read a " +
+    "large file, use `read_file` byte ranges and continue from the `next " +
+    "offset` the result reports. Use `edit_file` for targeted changes."
   );
 }
 
@@ -500,8 +530,11 @@ export async function callFileTool(
       break;
     }
     case "write_file": {
-      const r = await writeFileInBase(baseDir, args.path, args.content);
-      text = "wrote " + r.bytes + " bytes to " + r.path + (r.created ? " (new file)" : "");
+      const r = await writeFileInBase(baseDir, args.path, args.content, args.append);
+      text =
+        r.appended
+          ? "appended " + r.bytes + " bytes to " + r.path + (r.created ? " (new file)" : "")
+          : "wrote " + r.bytes + " bytes to " + r.path + (r.created ? " (new file)" : "");
       break;
     }
     default:
