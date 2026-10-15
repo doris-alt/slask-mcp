@@ -493,18 +493,21 @@ export async function startChat({
         return loop();
       }
       if (cmd === "/compact" || cmd === "/summarize") {
+        // Nothing to compact yet: no model call, so no spinner needed.
+        if (history.length < 2) {
+          console.log(color("dim", "  nothing to compact.\n"));
+          return loop();
+        }
+        spinner.start("summarizing…");
         const summary = await summarizeHistory(state, history);
         if (!summary) {
+          spinner.stop();
           console.log(
-            color(
-              "dim",
-              history.length < 2
-                ? "  nothing to compact.\n"
-                : "  could not summarize; history unchanged.\n"
-            )
+            color("dim", "  could not summarize; history unchanged.\n")
           );
           return loop();
         }
+        spinner.stopDown();
         const removed = replaceHistoryWithSummary(history, summary);
         console.log(
           color(
