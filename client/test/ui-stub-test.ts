@@ -21,7 +21,14 @@ import { mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Spinner, printBanner, runOneShot, runTurn } from "../ui.js";
+import {
+  Spinner,
+  printBanner,
+  runOneShot,
+  runTurn,
+  summarizeHistory,
+  replaceHistoryWithSummary,
+} from "../ui.js";
 import type { ChatState } from "../ui.js";
 import { mcpToolsToOpenai } from "../agent.js";
 import { openAiTools } from "../servers.js";
@@ -401,6 +408,98 @@ try {
     assert(idxW >= 0 && idxR > idxW && idxE > idxR, `tool order: ${JSON.stringify(stdout)}`);
     assert(calls.length === 0, `MCP echo calls expected 0, got ${calls.length}`);
     console.log("PASS test6 — file tools: write→read→edit round-trip on disk");
+  }
+
+  // ---- Test 7: /compact — summarizeHistory + history swap --------------------
+  //   (a) a non-empty scripted completion -> summary returned; after
+  //       replaceHistoryWithSummary, history is a single user-role message.
+  //   (b) empty history -> null, unchanged (deterministic no-op).
+  //   (c) a throwing model call -> null, history unchanged (failure never
+  //       destroys history).
+  {
+    const { registry } = makeRegistry([mkTool("echo")]);
+
+    // (a) success: the model's answer becomes a single user-role summary.
+    const stateA = makeState(
+      [],
+      registry,
+      makeFakeModel((n) =>
+        choice(
+          {
+            content:
+              "User wanted a page saved as markdown in tmp/. Open: where to store it.",
+          },
+          "stop"
+        )
+      ) as unknown as FakeOpenAI
+    );
+    const beforeA: ConversationMessage[] = [
+      { role: "user", content: "download a web page as a markdown file" },
+      { role: "assistant", content: "I can write it to a file in tmp/." },
+    ];
+    const summaryA = await summarizeHistory(stateA, beforeA);
+    assert(
+      summaryA === "User wanted a page saved as markdown in tmp/. Open: where to store it.",
+      `summary: ${JSON.stringify(summaryA)}`
+    );
+    const removedA = replaceHistoryWithSummary(beforeA, summaryA);
+    assert(removedA === 2, `removed: ${removedA}`);
+    assert(beforeA.length === 1, `history length after compact: ${beforeA.length}`);
+    assert(beforeA[0].role === "user", `summary role: ${beforeA[0].role}`);
+    assert(
+      beforeA[0].content ===
+        "## Summary of this conversation (generated via /compact)\n\n" + summaryA,
+      `summary content: ${JSON.stringify(beforeA[0].content)}`
+    );
+    console.log(
+      "PASS test7a — summarizeHistory success + history swap to single user message"
+    );
+
+    // (b) empty history: deterministic no-op (null, unchanged, model not consulted).
+    const stateB = makeState(
+      [],
+      registry,
+      makeFakeModel((n) => {
+        throw new Error(`no scripted response for round ${n}`);
+      }) as unknown as FakeOpenAI
+    );
+    const emptyB: ConversationMessage[] = [];
+    const sB = await summarizeHistory(stateB, emptyB);
+    assert(
+      sB === null,
+      `empty history should be null, got ${JSON.stringify(sB)}`
+    );
+    assert(emptyB.length === 0, `empty history unchanged, length ${emptyB.length}`);
+    console.log("PASS test7b — summarizeHistory empty history -> null, unchanged");
+
+    // (c) a throwing model call -> null, history unchanged.
+    const stateC = makeState(
+      [],
+      registry,
+      makeFakeModel((n) => {
+        throw new Error(`no scripted response for round ${n}`);
+      }) as unknown as FakeOpenAI
+    );
+    const beforeC: ConversationMessage[] = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ];
+    const sC = await summarizeHistory(stateC, beforeC);
+    assert(
+      sC === null,
+      `failing model should be null, got ${JSON.stringify(sC)}`
+    );
+    assert(
+      beforeC.length === 2,
+      `failing model leaves history, length ${beforeC.length}`
+    );
+    assert(
+      beforeC[0].content === "hi" && beforeC[1].content === "hello",
+      `history content changed: ${JSON.stringify(beforeC)}`
+    );
+    console.log(
+      "PASS test7c — summarizeHistory model throws -> null, history unchanged"
+    );
   }
 
   console.log("\nALL UI STUB TESTS PASSED");
