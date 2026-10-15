@@ -8,7 +8,7 @@
 // (no TUI lib). `runOneShot` runs a single agent turn for a prompt and exits,
 // used by the `--prompt` flag.
 //
-// REPL commands: /help /h  /tools /t  /skills /s  /reset /clear /c  /quit /exit /q
+// REPL commands: /help /h  /tools /t  /skills /s  /reset /clear /c  /compact /summarize  /quit /exit /q
 
 import { createInterface } from "node:readline";
 import type { Writable } from "node:stream";
@@ -143,6 +143,7 @@ const REPLY_HELP = [
   "  /tools    list all tools (across every connected server)",
   "  /skills   list local skills (./skills/)",
   "  /reset    clear the conversation history",
+  "  /compact  summarize the conversation so far, reclaiming context",
   "  /quit     (or /exit, /q, or Ctrl+C) leave the REPL",
   "",
   "Otherwise, just type a request. Examples:",
@@ -328,6 +329,88 @@ export async function runTurn(
 }
 
 // ---------------------------------------------------------------------------
+// /compact — roll the conversation up into a short summary that replaces the
+// history, reclaiming context. `summarizeHistory` is pure (returns the summary
+// or null); `replaceHistoryWithSummary` does the in-place swap the REPL applies.
+// Failure-safe: empty history, an empty model answer, or a model error all yield
+// null, and the caller leaves `history` untouched in that case.
+// ---------------------------------------------------------------------------
+const SUMMARY_SYSTEM = [
+  "You are turning a past user–agent conversation into a concise summary that",
+  "will be re-injected as the new conversation context. Be factual and brief.",
+  "Cover, in this order, only the parts that are non-empty:",
+  "  1. Goals — what the user is trying to accomplish.",
+  "  2. Decisions & actions — tools called, results, things set up/changed.",
+  "  3. Open items — unresolved questions or work still pending.",
+  "  4. Key context — facts, values, file paths, or constraints the agent must",
+  "     remember to continue coherently.",
+  "Return ONLY the summary text (no preamble; keep any section heading only if",
+  "that section is non-empty). If the conversation is trivial, say so in one line.",
+].join("\n");
+
+export async function summarizeHistory(
+  state: ChatState,
+  history: ConversationMessage[],
+): Promise<string | null> {
+  // Nothing meaningful to compact: a summary needs at least an exchange
+  // (a user message and its answer).
+  if (history.length < 2) {
+    return null;
+  }
+
+  // A plain transcript: "user: …" / "assistant: …" lines. In REPL history each
+  // message carries a non-null string content; null content is skipped
+  // defensively.
+  const transcript = history
+    .flatMap((m) => (m.content == null ? [] : [`${m.role}: ${m.content}`]))
+    .join("\n");
+  if (transcript.trim() === "") {
+    return null;
+  }
+
+  try {
+    const res = await state.openai.chat.completions.create({
+      model: state.model,
+      temperature: 0.5,
+      max_tokens: 1024,
+      messages: [
+        { role: "system", content: SUMMARY_SYSTEM },
+        {
+          role: "user",
+          content:
+            "Summarize the conversation below into concise plain text that can " +
+            "replace it as prior context. Keep only goals, decisions/actions, " +
+            "open items, and key facts.\n\n" +
+            transcript,
+        },
+      ],
+    });
+    const content = res?.choices?.[0]?.message?.content;
+    return content ? content.trim() : null;
+  } catch {
+    // Network / auth / token-limit / malformed response: never mutate the
+    // caller's history on failure.
+    return null;
+  }
+}
+
+// In-place /compact swap: drop the old history and seed a single user-role
+// message holding the summary. Returns how many messages were replaced, so the
+// REPL can print a "compacted N messages" confirmation.
+export function replaceHistoryWithSummary(
+  history: ConversationMessage[],
+  summary: string,
+): number {
+  const removed = history.length;
+  history.length = 0;
+  history.push({
+    role: "user",
+    content: "## Summary of this conversation (generated via /compact)\n\n" + summary,
+  });
+  return removed;
+}
+
+// ---------------------------------------------------------------------------
 // the REPL
 // ---------------------------------------------------------------------------
 // The caller (cli.ts) has already connected the servers (best-effort) and
@@ -407,6 +490,28 @@ export async function startChat({
         process.stdout.write("\n");
         history.length = 0;
         console.log(color("dim", "  history cleared.\n"));
+        return loop();
+      }
+      if (cmd === "/compact" || cmd === "/summarize") {
+        const summary = await summarizeHistory(state, history);
+        if (!summary) {
+          console.log(
+            color(
+              "dim",
+              history.length < 2
+                ? "  nothing to compact.\n"
+                : "  could not summarize; history unchanged.\n"
+            )
+          );
+          return loop();
+        }
+        const removed = replaceHistoryWithSummary(history, summary);
+        console.log(
+          color(
+            "dim",
+            `  compacted ${removed} message(s) -> summary (${summary.length} chars).\n`
+          )
+        );
         return loop();
       }
       if (cmd === "/quit" || cmd === "/exit" || cmd === "/q") {
