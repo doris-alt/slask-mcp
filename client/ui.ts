@@ -536,6 +536,17 @@ export async function startChat({
   rl.on("close", shutdown);
   process.stdin.on("end", shutdown);
 
+  // Job control: on `fg` after Ctrl-Z, readline's own SIGCONT handler restores
+  // raw mode but pauses the input stream and emits `SIGCONT` on the interface,
+  // expecting the app to resume it. Without this, stdin stays paused: the REPL
+  // looks frozen and typed input only surfaces in the shell after a kill. (Must
+  // be `rl.on`, not `process.on`: a process-level listener runs *before*
+  // readline's and gets undone by its pause.)
+  rl.on("SIGCONT", () => {
+    if (exited) return;
+    rl.resume();
+  });
+
   loop();
 }
 
