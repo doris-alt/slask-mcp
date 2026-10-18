@@ -321,6 +321,65 @@ The tools never touch the parent directory, any upstream directory, or
 neighbouring folders — and since this check is in `files.ts`, no prompt
 engineering or model "good behaviour" can weaken it.
 
+## Scheduled jobs
+
+Run prompts on a schedule with a small daemon. `slask-client schedule` keeps
+a long-lived process alive that fires scheduled jobs while it is running. Each
+firing runs the prompt through the client's ordinary one-shot path
+(`--prompt`, with `--quiet` so the startup banner is omitted), so a firing
+behaves exactly like you running `slask-client --prompt "…"` yourself.
+
+Jobs are stored in `.slask-schedule.json` in the directory where the client is
+run (the same cwd convention as `.env` / `mcp.json`):
+
+```bash
+# Add a job: run <prompt> whenever <expr> (standard 5-field cron) matches.
+# The first fire is the *next* occurrence of <expr> after the job is added.
+slask-client schedule add "*/5 * * * *" "summarize the last 5 news items"
+slask-client schedule add "0 9 * * 1" "write a weekly report"
+
+# List jobs (id, expression, prompt, last run / status).
+slask-client schedule list
+
+# Remove a job by full id or a unique id prefix.
+slask-client schedule rm <id>
+```
+
+**Running the daemon.** The daemon runs in the foreground and fires jobs only
+while the process is alive. Ctrl+C stops it cleanly — it lets any in-flight
+run finish (hard-killing after a 10 s grace) and exits 0:
+
+```bash
+# Foreground (Ctrl+C to stop).
+slask-client schedule
+
+# Keep it across terminal restarts / re-attach anytime (tmux).
+tmux new -s sched
+cd <your-dir>            # the directory with your .env / mcp.json
+slask-client schedule
+# detach with Ctrl-b Ctrl-d, reattach with: tmux attach -t sched
+
+# Or background it with logs redirected.
+cd <your-dir>
+nohup slask-client schedule >/var/log/sched.log 2>&1 &
+```
+
+**Notes.**
+
+- **Local time.** Expressions are evaluated in the system's local time zone,
+  and jobs fire only while the daemon process is running. There is no
+  built-in self-start; keep the daemon alive (tmux, systemd, a terminal, …).
+- **Live management.** The jobs file is re-read every 15 s
+  (`SLASK_SCHEDULE_POLL_S`), so a live `add` / `rm` takes effect within one
+  poll — no daemon restart needed.
+- **Serialized runs.** At most one run at a time, queued FIFO, so a slow or
+  hung firing can't starve the others or pile up unbounded.
+- **Per-run timeout.** Each run has a 30 min default timeout
+  (`SLASK_SCHEDULE_TIMEOUT_S`); on timeout the child is SIGTERMeD then
+  SIGKILLEd and recorded as `lastStatus: timeout`. A successful run is
+  recorded `ok`, a failed one `failed`; both set `lastRun`/`lastStatus`,
+  which show in `schedule list`.
+
 ## Options & environment
 
 | Command           | Flag| Env var        | Description                                                                                                 |
