@@ -31,7 +31,7 @@ import {
 } from "../schedule.js";
 import type { ScheduleJob } from "../schedule.js";
 import { parse } from "../cli.js";
-import { runOneShot } from "../ui.js";
+import { parseScheduleCmd, runOneShot } from "../ui.js";
 
 import type { OpenAI } from "openai";
 import type {
@@ -480,6 +480,59 @@ try {
       `server line omitted in quiet mode: ${JSON.stringify(stdout)}`
     );
     console.log("PASS test11 — quiet runOneShot omits the startup banner");
+  }
+
+  // ---- Test 12: REPL /schedule parse (5 cron fields, rest = prompt) --------
+  {
+    // null when the first token isn't exactly "/schedule"
+    assert(parseScheduleCmd("") === null, "empty -> null");
+    assert(parseScheduleCmd("hello world") === null, "non-schedule -> null");
+    assert(parseScheduleCmd("/scheduling") === null, "/scheduling -> null");
+
+    // no subcommand / unknown subcommand -> help
+    assert(parseScheduleCmd("/schedule")?.kind === "help", "no sub -> help");
+    assert(parseScheduleCmd("/schedule help")?.kind === "help", "unknown sub -> help");
+
+    // list
+    assert(parseScheduleCmd("/schedule list")?.kind === "list", "list");
+
+    // rm
+    const rm = parseScheduleCmd("/schedule rm abc123");
+    assert(rm?.kind === "rm", "rm kind");
+    assert(rm?.ref === "abc123", `rm ref: ${rm?.ref}`);
+    assert(parseScheduleCmd("/schedule rm")?.kind === "error", "rm missing id -> error");
+
+    // add: 5 cron fields + prompt, case preserved
+    const add = parseScheduleCmd("/schedule add */5 * * * * say hi there");
+    assert(add?.kind === "add", "add kind");
+    assert(add?.expr === "*/5 * * * *", `add expr: ${add?.expr}`);
+    assert(add?.prompt === "say hi there", `add prompt: ${add?.prompt}`);
+
+    // add: numeric 5-field cron + multi-word prompt
+    const add2 = parseScheduleCmd(
+      "/schedule add 0 9 * * 1 send a daily report to the team"
+    );
+    assert(add2?.kind === "add", "add2 kind");
+    assert(add2?.expr === "0 9 * * 1", `add2 expr: ${add2?.expr}`);
+    assert(add2?.prompt === "send a daily report to the team", "add2 prompt");
+
+    // add: too few cron fields -> error
+    assert(
+      parseScheduleCmd("/schedule add 5 say hi")?.kind === "error",
+      "add too-few fields -> error"
+    );
+    // add: no prompt -> error
+    assert(
+      parseScheduleCmd("/schedule add 5 5 5 5 5")?.kind === "error",
+      "add no prompt -> error"
+    );
+
+    // command/sub case-insensitive; prompt case preserved
+    const add3 = parseScheduleCmd("/Schedule ADD */5 * * * * Mixed Case Prompt");
+    assert(add3?.kind === "add", "add3 kind (case-insensitive)");
+    assert(add3?.prompt === "Mixed Case Prompt", `add3 prompt case: ${add3?.prompt}`);
+
+    console.log("PASS test12 — REPL /schedule parse (5 cron fields, rest = prompt)");
   }
 
   console.log("\nALL SCHEDULE TESTS PASSED");

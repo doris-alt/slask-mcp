@@ -8,7 +8,7 @@
 // (no TUI lib). `runOneShot` runs a single agent turn for a prompt and exits,
 // used by the `--prompt` flag.
 //
-// REPL commands: /help /h  /tools /t  /skills /s  /reset /clear /c  /compact /summarize  /quit /exit /q
+// REPL commands: /help /h  /tools /t  /skills /s  /reset /clear /c  /compact /summarize  /schedule add|list|rm  /quit /exit /q
 
 import { createInterface } from "node:readline";
 import type { Writable } from "node:stream";
@@ -46,6 +46,7 @@ import {
   fileSystemBlock,
   fileTools,
 } from "./files.js";
+import { addJob, listJobs, removeJob } from "./schedule.js";
 
 // ---------------------------------------------------------------------------
 // colors (tiny dependency-free ANSI helper)
@@ -144,6 +145,7 @@ const REPLY_HELP = [
   "  /skills   list local skills (./skills/)",
   "  /reset    clear the conversation history",
   "  /compact  summarize the conversation so far, reclaiming context",
+  "  /schedule manage scheduled jobs (add/list/rm)",
   "  /quit     (or /exit, /q, or Ctrl+C) leave the REPL",
   "",
   "Otherwise, just type a request. Examples:",
@@ -151,6 +153,54 @@ const REPLY_HELP = [
   "  echo the word hello",
   "  which tools can I use?",
 ].join("\n");
+
+// ---------------------------------------------------------------------------
+// /schedule — manage the scheduled-job file (add/list/rm) from the REPL.
+// ---------------------------------------------------------------------------
+const SCHEDULE_HELP = [
+  "  /schedule add <min hour dom month dow> <prompt...>  add a job (5-field cron)",
+  "  /schedule list                                    list jobs (id, expr, prompt, last run/status)",
+  "  /schedule rm <id>                                 remove a job by id or unique prefix",
+].join("\n");
+
+type ScheduleParse =
+  | { kind: "help" }
+  | { kind: "add"; expr: string; prompt: string }
+  | { kind: "list" }
+  | { kind: "rm"; ref: string }
+  | { kind: "error"; message: string };
+
+// Parse a "/schedule" REPL line into a structured command, or null if the first
+// (lower-cased) token is not exactly "/schedule". The cron expression is the
+// first 5 whitespace-separated fields (matching the CLI's 5-field convention);
+// everything after field 5 is the prompt (case preserved). The REPL has no
+// shell tokenization, so the line is parsed here.
+export function parseScheduleCmd(line: string): ScheduleParse | null {
+  const parts = line.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0 || parts[0].toLowerCase() !== "/schedule") return null;
+  if (parts.length === 1) return { kind: "help" };
+  const sub = parts[1].toLowerCase();
+  if (sub === "add") {
+    const expr = parts.slice(2, 7);
+    const prompt = parts.slice(7);
+    if (expr.length !== 5 || prompt.length === 0) {
+      return {
+        kind: "error",
+        message:
+          "usage: /schedule add <min hour dom month dow> <prompt...> (5 cron fields, then the prompt)",
+      };
+    }
+    return { kind: "add", expr: expr.join(" "), prompt: prompt.join(" ") };
+  }
+  if (sub === "list") return { kind: "list" };
+  if (sub === "rm") {
+    if (parts.length < 3) {
+      return { kind: "error", message: "usage: /schedule rm <id> (full id or unique prefix)" };
+    }
+    return { kind: "rm", ref: parts[2] };
+  }
+  return { kind: "help" }; // unknown subcommand -> help
+}
 
 // ---------------------------------------------------------------------------
 // shared chat setup (used by the REPL and by one-shot runs)
@@ -516,6 +566,88 @@ export async function startChat({
           )
         );
         return loop();
+      }
+      // /schedule — manage the scheduled-job file (add/list/rm). The cron
+      // expression is the first 5 whitespace fields; everything after field 5
+      // is the prompt (case preserved). parseScheduleCmd returns null for any
+      // line that isn't a "/schedule" command, so plain prompts fall through
+      // to runTurn below.
+      {
+        const scheduleParsed = parseScheduleCmd(input);
+        if (scheduleParsed !== null) {
+          process.stdout.write("\n");
+          if (scheduleParsed.kind === "add") {
+            try {
+              const job = await addJob(scheduleParsed.expr, scheduleParsed.prompt);
+              console.log(
+                color(
+                  "green",
+                  `  added job ${job.id.slice(0, 6)} — "${job.expr}" ${job.prompt}\n`
+                )
+              );
+            } catch (e) {
+              console.log(
+                color("red", `  ✖ ${e instanceof Error ? e.message : String(e)}\n`)
+              );
+            }
+          } else if (scheduleParsed.kind === "list") {
+            const jobs = await listJobs();
+            if (jobs.length === 0) {
+              console.log(
+                color(
+                  "dim",
+                  "  no scheduled jobs yet — add one with: /schedule add <expr> <prompt>\n"
+                )
+              );
+            } else {
+              console.log(`  ${jobs.length} job(s):\n`);
+              for (const j of jobs) {
+                const last = j.lastRun
+                  ? `last: ${j.lastRun.slice(0, 16)} (${j.lastStatus})`
+                  : "last: none yet";
+                console.log(`  ${j.id.slice(0, 6)}  ${j.expr.padEnd(20)}  ${j.prompt}`);
+                console.log(`${" ".repeat(32)}${last}`);
+              }
+            }
+          } else if (scheduleParsed.kind === "rm") {
+            const jobs = await listJobs();
+            const matches = jobs.filter(
+              (j) => j.id === scheduleParsed.ref || j.id.startsWith(scheduleParsed.ref)
+            );
+            if (matches.length === 0) {
+              console.log(color("dim", `  no such job: ${scheduleParsed.ref}\n`));
+            } else if (matches.length > 1) {
+              console.log(
+                color(
+                  "yellow",
+                  `  ${matches.length} jobs match prefix "${scheduleParsed.ref}" (ambiguous) — use a longer prefix or the full id\n`
+                )
+              );
+            } else {
+              try {
+                await removeJob(matches[0].id);
+                console.log(
+                  color(
+                    "green",
+                    `  removed job ${matches[0].id.slice(0, 6)} — "${matches[0].expr}"\n`
+                  )
+                );
+              } catch (e) {
+                console.log(
+                  color("red", `  ✖ ${e instanceof Error ? e.message : String(e)}\n`)
+                );
+              }
+            }
+          } else if (scheduleParsed.kind === "help") {
+            console.log(color("green", "scheduled jobs:\n"));
+            console.log(SCHEDULE_HELP);
+            console.log();
+          } else {
+            // kind === "error"
+            console.log(color("yellow", `  ${scheduleParsed.message}\n`));
+          }
+          return loop();
+        }
       }
       if (cmd === "/quit" || cmd === "/exit" || cmd === "/q") {
         return shutdown();
