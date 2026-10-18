@@ -561,15 +561,22 @@ export async function runOneShot({
   base,
   prompt,
   openai,
+  quiet,
 }: {
   registry: Registry;
   model: string;
   base?: string | null;
   prompt: string;
   openai?: InstanceType<typeof OpenAI>;
+  // Omit the startup banner (server/model/tools listing). Used by the
+  // scheduler daemon's one-shot children so their logs show just prompt +
+  // answer.
+  quiet?: boolean;
 }): Promise<number> {
   const state = await buildChatState({ registry, model, base, openai });
-  printBanner(state, false);
+  if (!quiet) {
+    printBanner(state, false);
+  }
   console.log(color("dim", "\nprompt: "));
   console.log(color("dim", `  ${prompt}\n`));
   const spinner = new Spinner();

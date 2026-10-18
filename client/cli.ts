@@ -9,6 +9,10 @@
 //   slask-client skill list      list local skills (./skills/)
 //   slask-client skill show <n>  show a skill's body and bundled files
 //   slask-client skill run <n> <script> [args…]  run a skill's bundled script
+//   slask-client schedule               run the scheduler daemon (Ctrl+C to stop)
+//   slask-client schedule add <expr> <p>  add a scheduled one-shot job
+//   slask-client schedule list           list scheduled jobs
+//   slask-client schedule rm <id>        remove a scheduled job
 //   slask-client help
 //
 // The default slask server is configured via --url/--token (or
@@ -30,6 +34,12 @@
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runOneShot, startChat } from "./ui.js";
+import {
+  addJob,
+  listJobs,
+  removeJob,
+  runScheduler,
+} from "./schedule.js";
 import { hintFor, printTools, textFrom } from "./client.js";
 import { loadEnvFile } from "./env.js";
 import {
@@ -73,6 +83,18 @@ Usage:
   slask-client skill run <skill> <script> [args…]
       Execute a script from a skill's \`scripts/\` folder and print its output.
       No MCP connection is made.
+  slask-client schedule
+      Run the scheduler daemon: fires scheduled jobs while this process is
+      alive; Ctrl+C to stop. Jobs are stored in .slask-schedule.json in the
+      current directory (same convention as .env / mcp.json).
+  slask-client schedule add <expr> <prompt>
+      Add a job: run <prompt> via a one-shot client run whenever <expr>
+      (standard 5-field cron) matches. First fire is the next occurrence
+      after scheduling.
+  slask-client schedule list
+      List scheduled jobs: id, expression, prompt, last run / status.
+  slask-client schedule rm <id>
+      Remove a scheduled job by full id or unique id prefix.
   slask-client help
       Show this help (also: --help).
 
@@ -84,6 +106,8 @@ Options:
   -m, --model <model>    OpenAI model (chat mode; default: gpt-4o-mini)
   -p, --prompt <text>    Run one agent turn with this prompt, print the answer,
                          and exit (instead of the interactive REPL).
+  -q, --quiet            Omit the startup banner with --prompt (daemon-fired
+                         one-shot runs show prompt + answer only)
   -b, --base-url <url>   OpenAI-compatible base URL (chat; overrides API_BASE)
   Env vars (a .env file in the current dir is read on startup; shell values
              win): SLASK_MCP_URL, SLASK_MCP_TOKEN (default server);
@@ -134,6 +158,7 @@ interface CliConfig {
   positional: string[];
   args: Record<string, unknown>;
   prompt: string | null;
+  quiet: boolean;
   help: boolean;
 }
 
@@ -220,6 +245,75 @@ async function handleSkillCommand(config: CliConfig): Promise<void> {
   );
 }
 
+// No server connection needed — everything works on the jobs file only.
+async function handleScheduleCommand(config: CliConfig): Promise<void> {
+  const subcmd = config.positional[1];
+
+  if (subcmd === undefined) {
+    // Daemon: run the scheduler in this process until SIGINT/SIGTERM. The
+    // autoHandlers default installs the shutdown handlers that exit cleanly
+    // (exit code 0) on Ctrl+C / SIGTERM.
+    await runScheduler();
+    return;
+  }
+  if (subcmd === "add") {
+    const expr = config.positional[2];
+    const prompt = config.positional[3];
+    if (expr === undefined || prompt === undefined) {
+      fail("usage: schedule add <expr> <prompt> — <expr> is a 5-field cron");
+    }
+    try {
+      const job = await addJob(expr, prompt);
+      console.log(`added job ${job.id.slice(0, 6)} — "${job.expr}" ${job.prompt}`);
+    } catch (e) {
+      fail(e instanceof Error ? e.message : String(e));
+    }
+    return;
+  }
+  if (subcmd === "list") {
+    const jobs = await listJobs();
+    if (jobs.length === 0) {
+      console.log(
+        "no scheduled jobs yet — add one with: slask-client schedule add <expr> <prompt>",
+      );
+      return;
+    }
+    console.log(`${jobs.length} job(s):\n`);
+    for (const j of jobs) {
+      console.log(`  ${j.id.slice(0, 6)}  ${j.expr.padEnd(20)}  ${j.prompt}`);
+      const last = j.lastRun
+        ? `last: ${j.lastRun.slice(0, 16)} (${j.lastStatus})`
+        : "last: none yet";
+      console.log(`${" ".repeat(32)}${last}`);
+    }
+    return;
+  }
+  if (subcmd === "rm") {
+    const ref = config.positional[2];
+    if (ref === undefined) {
+      fail("usage: schedule rm <id> (full id or a unique prefix)");
+    }
+    const jobs = await listJobs();
+    const matches = jobs.filter((j) => j.id === ref || j.id.startsWith(ref));
+    if (matches.length === 0) {
+      fail(`no such job: ${ref}`);
+      return;
+    }
+    if (matches.length > 1) {
+      fail(
+        `${matches.length} jobs match prefix "${ref}" (ambiguous) — ` +
+          "use a longer prefix or the full id",
+      );
+      return;
+    }
+    const job = matches[0];
+    await removeJob(job.id);
+    console.log(`removed job ${job.id.slice(0, 6)} — "${job.expr}"`);
+    return;
+  }
+  fail(`unknown schedule command: ${subcmd} (try "add", "list", "rm")`);
+}
+
 // Hand-rolled flag/positional parsing (no dependencies).
 //
 // Exported so tests can drive it in-process; the module entrypoint below is
@@ -235,6 +329,7 @@ export function parse(argv: string[]): CliConfig {
     positional: [],
     args: {},
     prompt: null,
+    quiet: false,
     help: false,
   };
 
@@ -274,6 +369,8 @@ export function parse(argv: string[]): CliConfig {
       if (++i < argv.length) config.args.query = argv[i];
     } else if (f === "--prompt" || f === "-p") {
       if (++i < argv.length) config.prompt = argv[i];
+    } else if (f === "--quiet" || f === "-q") {
+      config.quiet = true;
     } else {
       config.positional.push(f);
     }
@@ -325,13 +422,25 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `schedule` touches only the jobs file (daemon, add, list, rm) — dispatch
+  // it before touching any server, same pattern as `skill`.
+  if (sub === "schedule") {
+    try {
+      await handleScheduleCommand(config);
+    } catch (e) {
+      fail(e instanceof Error ? e.message : String(e));
+    }
+    return;
+  }
+
   // Fail fast on an unknown command before touching any server.
   if (
     sub !== undefined &&
     sub !== "" &&
     sub !== "chat" &&
     sub !== "list" &&
-    sub !== "call"
+    sub !== "call" &&
+    sub !== "schedule"
   ) {
     fail(`unknown command: ${sub}\n\n${HELP}`);
     return;
@@ -372,6 +481,7 @@ async function main(): Promise<void> {
         model,
         base: config.base,
         prompt: config.prompt,
+        quiet: config.quiet,
       });
       process.exit(code);
     } else {

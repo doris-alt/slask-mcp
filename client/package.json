@@ -21,11 +21,13 @@
     "test:env": "node dist/test/env-test.js",
     "test:ui": "node dist/test/ui-stub-test.js",
     "test:files": "node dist/test/files-stub-test.js",
-    "test:all": "node dist/test/skills-stub-test.js && node dist/test/cli-parse-test.js && node dist/test/servers-test.js && node dist/test/client-helpers-test.js && node dist/test/agent-edges-test.js && node dist/test/env-test.js && node dist/test/ui-stub-test.js && node dist/test/files-stub-test.js",
+    "test:schedule": "node dist/test/schedule-test.js",
+    "test:all": "node dist/test/skills-stub-test.js && node dist/test/cli-parse-test.js && node dist/test/servers-test.js && node dist/test/client-helpers-test.js && node dist/test/agent-edges-test.js && node dist/test/env-test.js && node dist/test/ui-stub-test.js && node dist/test/files-stub-test.js && node dist/test/schedule-test.js",
     "clean": "rm -rf dist"
   },
   "dependencies": {
     "@modelcontextprotocol/client": "^2.2.0",
+    "node-cron": "^4.6.0",
     "openai": "^7.25.0"
   },
   "devDependencies": {
