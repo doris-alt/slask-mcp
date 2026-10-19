@@ -10,7 +10,8 @@
 //   slask-client skill show <n>  show a skill's body and bundled files
 //   slask-client skill run <n> <script> [args…]  run a skill's bundled script
 //   slask-client schedule               run the scheduler daemon (Ctrl+C to stop)
-//   slask-client schedule add <expr> <p>  add a scheduled one-shot job
+//   slask-client schedule add <s> <p>   add a job: <s> = 5-field cron (recurring)
+//                                       or space-free ISO date/time (one-shot)
 //   slask-client schedule list           list scheduled jobs
 //   slask-client schedule rm <id>        remove a scheduled job
 //   slask-client help
@@ -36,6 +37,7 @@ import { pathToFileURL } from "node:url";
 import { runOneShot, startChat } from "./ui.js";
 import {
   addJob,
+  classifyScheduleArg,
   listJobs,
   removeJob,
   runScheduler,
@@ -87,12 +89,15 @@ Usage:
       Run the scheduler daemon: fires scheduled jobs while this process is
       alive; Ctrl+C to stop. Jobs are stored in .slask-schedule.json in the
       current directory (same convention as .env / mcp.json).
-  slask-client schedule add <expr> <prompt>
-      Add a job: run <prompt> via a one-shot client run whenever <expr>
-      (standard 5-field cron) matches. First fire is the next occurrence
-      after scheduling.
+  slask-client schedule add [at] <schedule> <prompt>
+      Add a job. <schedule> is either a 5-field cron expression (recurring:
+      run <prompt> on every match, first fire is the next occurrence) or a
+      space-free ISO date/time (one-shot: run <prompt> exactly once at that
+      time). An optional leading literal \`at\` is ignored before a one-shot
+      date/time for readability (e.g. add at "2026-10-20T09:30:00Z" p).
   slask-client schedule list
-      List scheduled jobs: id, expression, prompt, last run / status.
+      List scheduled jobs: id, schedule (cron expr or one-shot time), prompt,
+      last run / status.
   slask-client schedule rm <id>
       Remove a scheduled job by full id or unique id prefix.
   slask-client help
@@ -245,6 +250,26 @@ async function handleSkillCommand(config: CliConfig): Promise<void> {
   );
 }
 
+/**
+ * Split the positional args that follow `schedule add` into the job's
+ * `scheduleRaw` (a cron expr or one-shot date/time, to be classified) and its
+ * `prompt`. An optional leading literal `at` is a readability keyword that is
+ * ignored — it just shifts the schedule/prompt one slot right:
+ *   add <schedule> <prompt>         -> scheduleRaw=pos[2], prompt=pos[3]
+ *   add at <schedule> <prompt>      -> scheduleRaw=pos[3], prompt=pos[4]
+ * Either slot is `undefined` when the args are missing; the caller reports the
+ * usage error. (`positional[0]` = "schedule", `positional[1]` = "add".)
+ */
+export function parseScheduleAddArgs(
+  positional: string[],
+): { scheduleRaw?: string; prompt?: string } {
+  const atKeyword = positional[2] === "at";
+  return {
+    scheduleRaw: atKeyword ? positional[3] : positional[2],
+    prompt: atKeyword ? positional[4] : positional[3],
+  };
+}
+
 // No server connection needed — everything works on the jobs file only.
 async function handleScheduleCommand(config: CliConfig): Promise<void> {
   const subcmd = config.positional[1];
@@ -257,14 +282,28 @@ async function handleScheduleCommand(config: CliConfig): Promise<void> {
     return;
   }
   if (subcmd === "add") {
-    const expr = config.positional[2];
-    const prompt = config.positional[3];
-    if (expr === undefined || prompt === undefined) {
-      fail("usage: schedule add <expr> <prompt> — <expr> is a 5-field cron");
+    const { scheduleRaw, prompt } = parseScheduleAddArgs(config.positional);
+    if (scheduleRaw === undefined || prompt === undefined) {
+      fail(
+        'usage: schedule add [at] <schedule> <prompt> — <schedule> is a 5-field ' +
+          'cron (e.g. "0 9 * * *") or a space-free ISO date/time (one-shot, ' +
+          'e.g. "2026-10-20T09:30:00Z"); an optional leading `at` is ignored ' +
+          "before a one-shot",
+      );
+    }
+    const cls = classifyScheduleArg(scheduleRaw);
+    if ("error" in cls) {
+      fail(cls.error);
+      return;
     }
     try {
-      const job = await addJob(expr, prompt);
-      console.log(`added job ${job.id.slice(0, 6)} — "${job.expr}" ${job.prompt}`);
+      const job = await addJob({
+        prompt,
+        expr: cls.kind === "cron" ? cls.expr : undefined,
+        at: cls.kind === "once" ? cls.at : undefined,
+      });
+      const when = job.expr ? `cron "${job.expr}"` : `once @ ${job.at}`;
+      console.log(`added job ${job.id.slice(0, 6)} — ${when}: ${job.prompt}`);
     } catch (e) {
       fail(e instanceof Error ? e.message : String(e));
     }
@@ -274,13 +313,16 @@ async function handleScheduleCommand(config: CliConfig): Promise<void> {
     const jobs = await listJobs();
     if (jobs.length === 0) {
       console.log(
-        "no scheduled jobs yet — add one with: slask-client schedule add <expr> <prompt>",
+        "no scheduled jobs yet — add one with: slask-client schedule add " +
+          "[at] <schedule> <prompt> (recurring cron or one-shot ISO date/time)",
       );
       return;
     }
     console.log(`${jobs.length} job(s):\n`);
     for (const j of jobs) {
-      console.log(`  ${j.id.slice(0, 6)}  ${j.expr.padEnd(20)}  ${j.prompt}`);
+      const when =
+        j.expr ? j.expr.padEnd(20) : j.at ? j.at.padEnd(20) : "no schedule".padEnd(20);
+      console.log(`  ${j.id.slice(0, 6)}  ${when}  ${j.prompt}`);
       const last = j.lastRun
         ? `last: ${j.lastRun.slice(0, 16)} (${j.lastStatus})`
         : "last: none yet";
@@ -293,6 +335,7 @@ async function handleScheduleCommand(config: CliConfig): Promise<void> {
     if (ref === undefined) {
       fail("usage: schedule rm <id> (full id or a unique prefix)");
     }
+
     const jobs = await listJobs();
     const matches = jobs.filter((j) => j.id === ref || j.id.startsWith(ref));
     if (matches.length === 0) {
@@ -308,7 +351,8 @@ async function handleScheduleCommand(config: CliConfig): Promise<void> {
     }
     const job = matches[0];
     await removeJob(job.id);
-    console.log(`removed job ${job.id.slice(0, 6)} — "${job.expr}"`);
+    const when = job.expr ? `cron "${job.expr}"` : `once @ ${job.at}`;
+    console.log(`removed job ${job.id.slice(0, 6)} — ${when}`);
     return;
   }
   fail(`unknown schedule command: ${subcmd} (try "add", "list", "rm")`);
