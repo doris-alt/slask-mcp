@@ -46,7 +46,16 @@ import {
   fileSystemBlock,
   fileTools,
 } from "./files.js";
-import { addJob, listJobs, removeJob } from "./schedule.js";
+import {
+  addJob,
+  classifyScheduleArg,
+  listJobs,
+  removeJob,
+  SCHEDULE_TOOL_NAMES,
+  callScheduleTool,
+  scheduleSystemBlock,
+  scheduleTools,
+} from "./schedule.js";
 
 // ---------------------------------------------------------------------------
 // colors (tiny dependency-free ANSI helper)
@@ -158,39 +167,75 @@ const REPLY_HELP = [
 // /schedule — manage the scheduled-job file (add/list/rm) from the REPL.
 // ---------------------------------------------------------------------------
 const SCHEDULE_HELP = [
-  "  /schedule add <min hour dom month dow> <prompt...>  add a job (5-field cron)",
-  "  /schedule list                                    list jobs (id, expr, prompt, last run/status)",
-  "  /schedule rm <id>                                 remove a job by id or unique prefix",
+  "  /schedule add [at] <min hour dom month dow> <prompt...>   add a recurring job (5-field cron)",
+  "  /schedule add [at] <ISO-date/time> <prompt...>            add a one-shot job " +
+  "  (space-free ISO, e.g. 2026-10-20T09:30:00Z; optional leading `at` ignored)",
+  "  /schedule list                                       list jobs (id, schedule, prompt, last run/status)",
+  "  /schedule rm <id>                                    remove a job by id or unique prefix",
 ].join("\n");
 
 type ScheduleParse =
   | { kind: "help" }
-  | { kind: "add"; expr: string; prompt: string }
+  | { kind: "add"; expr?: string; at?: string; prompt: string }
   | { kind: "list" }
   | { kind: "rm"; ref: string }
   | { kind: "error"; message: string };
 
 // Parse a "/schedule" REPL line into a structured command, or null if the first
-// (lower-cased) token is not exactly "/schedule". The cron expression is the
-// first 5 whitespace-separated fields (matching the CLI's 5-field convention);
-// everything after field 5 is the prompt (case preserved). The REPL has no
-// shell tokenization, so the line is parsed here.
+// (lower-cased) token is not exactly "/schedule". For a recurring job the cron
+// expression is the first 5 whitespace-separated fields (matching the CLI's 5-field
+// convention); everything after field 5 is the prompt (case preserved). For a
+// one-shot job the first field after "add" must be a space-free ISO date/time
+// (parsed via classifyScheduleArg); everything after it is the prompt. The REPL
+// has no shell tokenization, so the line is parsed here.
 export function parseScheduleCmd(line: string): ScheduleParse | null {
   const parts = line.trim().split(/\s+/).filter(Boolean);
   if (parts.length === 0 || parts[0].toLowerCase() !== "/schedule") return null;
   if (parts.length === 1) return { kind: "help" };
   const sub = parts[1].toLowerCase();
   if (sub === "add") {
-    const expr = parts.slice(2, 7);
-    const prompt = parts.slice(7);
-    if (expr.length !== 5 || prompt.length === 0) {
+    const rest = parts.slice(2);
+    const usage =
+      "usage: /schedule add [at] <min hour dom month dow> <prompt...> (5 cron " +
+      "fields, then the prompt) — or add [at] <ISO-date/time> <prompt...> for a " +
+      "one-shot job (space-free, e.g. 2026-10-20T09:30:00Z; optional leading " +
+      "`at` is ignored)";
+    if (rest.length === 0) {
+      return { kind: "error", message: usage };
+    }
+    // An optional literal `at` is a readability keyword before a one-shot:
+    // it is ignored and just shifts the schedule/prompt one slot right.
+    const atKeyword = rest[0].toLowerCase() === "at";
+    const scheduleIdx = atKeyword ? 1 : 0;
+    const promptIdx = atKeyword ? 2 : 1;
+    // One-shot: the schedule token is a single space-free ISO date/time —
+    // classifyScheduleArg returns kind:"once" only for genuine hyphenated
+    // ISO dates. Everything after it is the prompt (case preserved).
+    if (rest[scheduleIdx] !== undefined) {
+      const first = classifyScheduleArg(rest[scheduleIdx]);
+      if (first.kind === "once" && rest.length >= promptIdx + 1) {
+        return {
+          kind: "add",
+          at: first.at,
+          prompt: rest.slice(promptIdx).join(" "),
+        };
+      }
+    }
+    // Recurring: the first 5 tokens must be a 5-field cron; the rest is the prompt.
+    if (rest.length < 6) {
+      return { kind: "error", message: usage };
+    }
+    const exprCls = classifyScheduleArg(rest.slice(0, 5).join(" "));
+    if (exprCls.kind !== "cron") {
       return {
         kind: "error",
         message:
-          "usage: /schedule add <min hour dom month dow> <prompt...> (5 cron fields, then the prompt)",
+          `${exprCls.kind === "error" ? exprCls.error : "unrecognized schedule"} ` +
+          "— use a 5-field cron expression (e.g. 0 9 * * *) or a space-free ISO " +
+          "date/time for a one-shot job",
       };
     }
-    return { kind: "add", expr: expr.join(" "), prompt: prompt.join(" ") };
+    return { kind: "add", expr: exprCls.expr, prompt: rest.slice(5).join(" ") };
   }
   if (sub === "list") return { kind: "list" };
   if (sub === "rm") {
@@ -285,6 +330,7 @@ export function printBanner(state: ChatState, interactive: boolean): void {
   const allToolNames = [
     ...state.openaiTools.map((t) => t.function.name),
     ...FILE_TOOL_NAMES,
+    ...SCHEDULE_TOOL_NAMES,
     ...state.skills.map((s) => s.name),
   ];
   console.log(
@@ -324,18 +370,23 @@ export async function runTurn(
   spinner: Spinner,
 ): Promise<string | null> {
   const { openai, openaiTools, skills, model, baseDir } = state;
-  const systemPrompt = SYSTEM_PROMPT + skillSystemBlock(skills) + fileSystemBlock();
+  const systemPrompt =
+    SYSTEM_PROMPT + skillSystemBlock(skills) + fileSystemBlock() + scheduleSystemBlock();
   const tools = [
     ...openaiTools,
     ...fileTools(),
+    ...scheduleTools(),
     ...(skills.length > 0 ? [skillTool(skills), runScriptTool(skills)] : []),
   ];
   const callTool: (name: string, args: Record<string, unknown>) => Promise<CallToolResult> =
     (name, args) => {
-    // Synthetic local tools (file + skill); every other name routes to the
-    // originating MCP server.
+    // Synthetic local tools (file, schedule, skill); every other name routes to
+    // the originating MCP server.
     if (FILE_TOOL_NAMES.includes(name)) {
       return callFileTool(baseDir, name, args);
+    }
+    if (SCHEDULE_TOOL_NAMES.includes(name)) {
+      return callScheduleTool(name, args);
     }
     if (name === "invoke_skill") {
       return invokeSkill(skills, String(args.name), args.file).then(
@@ -567,22 +618,28 @@ export async function startChat({
         );
         return loop();
       }
-      // /schedule — manage the scheduled-job file (add/list/rm). The cron
-      // expression is the first 5 whitespace fields; everything after field 5
-      // is the prompt (case preserved). parseScheduleCmd returns null for any
-      // line that isn't a "/schedule" command, so plain prompts fall through
-      // to runTurn below.
+      // /schedule — manage the scheduled-job file (add/list/rm). For a recurring
+      // job the cron expression is the first 5 whitespace fields; everything after
+      // field 5 is the prompt (case preserved). For a one-shot job the first field
+      // is a space-free ISO date/time and everything after it is the prompt.
+      // parseScheduleCmd returns null for any line that isn't a "/schedule"
+      // command, so plain prompts fall through to runTurn below.
       {
         const scheduleParsed = parseScheduleCmd(input);
         if (scheduleParsed !== null) {
           process.stdout.write("\n");
           if (scheduleParsed.kind === "add") {
             try {
-              const job = await addJob(scheduleParsed.expr, scheduleParsed.prompt);
+              const job = await addJob({
+                prompt: scheduleParsed.prompt,
+                expr: scheduleParsed.expr,
+                at: scheduleParsed.at,
+              });
+              const when = job.expr ? `cron "${job.expr}"` : `once @ ${job.at}`;
               console.log(
                 color(
                   "green",
-                  `  added job ${job.id.slice(0, 6)} — "${job.expr}" ${job.prompt}\n`
+                  `  added job ${job.id.slice(0, 6)} — ${when}: ${job.prompt}\n`
                 )
               );
             } catch (e) {
@@ -605,7 +662,13 @@ export async function startChat({
                 const last = j.lastRun
                   ? `last: ${j.lastRun.slice(0, 16)} (${j.lastStatus})`
                   : "last: none yet";
-                console.log(`  ${j.id.slice(0, 6)}  ${j.expr.padEnd(20)}  ${j.prompt}`);
+                const when =
+                  j.expr
+                    ? j.expr.padEnd(20)
+                    : j.at
+                    ? j.at.padEnd(20)
+                    : "no schedule".padEnd(20);
+                console.log(`  ${j.id.slice(0, 6)}  ${when}  ${j.prompt}`);
                 console.log(`${" ".repeat(32)}${last}`);
               }
             }
@@ -626,10 +689,14 @@ export async function startChat({
             } else {
               try {
                 await removeJob(matches[0].id);
+                const when =
+                  matches[0].expr
+                    ? `cron "${matches[0].expr}"`
+                    : `once @ ${matches[0].at}`;
                 console.log(
                   color(
                     "green",
-                    `  removed job ${matches[0].id.slice(0, 6)} — "${matches[0].expr}"\n`
+                    `  removed job ${matches[0].id.slice(0, 6)} — ${when}\n`
                   )
                 );
               } catch (e) {

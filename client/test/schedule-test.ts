@@ -8,13 +8,23 @@
 // fresh empty working dir (no ./skills/) keeps `discoverSkills` empty.
 //
 // Covers:
-//   * storage: load on missing file -> []; add persists (id/expr/prompt) + file
-//     is valid JSON; remove works; removing a nonexistent id -> "no such job";
-//     invalid cron expr rejected with no file written.
-//   * CLI parse: schedule / add / list / rm arg shapes land in `positionals`.
+//   * storage: load on missing file -> []; add persists (id/expr/prompt + one-shot
+//     at) + file is valid JSON; remove works; removing a nonexistent id -> "no
+//     such job"; invalid cron expr rejected; past one-shot at / both-or-neither
+//     expr+at rejected with no file written.
+//   * classification: classifyScheduleArg (5-field cron vs one-shot ISO date/time
+//     vs invalid; bare cron minute fields are *not* treated as dates).
+//   * CLI parse: schedule / add (cron + one-shot) / list / rm arg shapes land in
+//     `positionals`.
 //   * daemon: injected cron engine records scheduled exprs; slow runs
 //     serialize FIFO (no overlap); a fired job records lastStatus=ok + lastRun;
-//     live-sync (fast pollMs) adds a job -> scheduled, removes a job -> stopped.
+//     a one-shot job fires via its setTimeout and records lastStatus; live-sync
+//     (fast pollMs) adds a job -> scheduled, removes a job -> stopped.
+//   * update: updateJob (expr/at/prompt, cron<->one-shot switches, missing-field,
+//     unknown-id, bad-cron/bad-at guards); schedule tools (list/add/update/remove,
+//     incl. at param) return CallToolResult text with full ids; the daemon
+//     reschedules on an expr change and fires with the fresh (re-read) prompt.
+//   * REPL parse: /schedule add (5-field cron + one-shot) / list / rm.
 //   * quiet: runOneShot({quiet: true}) omits the startup banner.
 
 import assert from "node:assert/strict";
@@ -24,14 +34,20 @@ import { join } from "node:path";
 
 import {
   addJob,
+  callScheduleTool,
+  classifyScheduleArg,
   loadJobs,
   listJobs,
   removeJob,
   runScheduler,
+  scheduleSystemBlock,
+  scheduleTools,
+  updateJob,
 } from "../schedule.js";
 import type { ScheduleJob } from "../schedule.js";
-import { parse } from "../cli.js";
+import { parse, parseScheduleAddArgs } from "../cli.js";
 import { parseScheduleCmd, runOneShot } from "../ui.js";
+import { textFrom } from "../client.js";
 
 import type { OpenAI } from "openai";
 import type {
@@ -237,7 +253,7 @@ try {
   // ---- Test 2: addJob persists id/expr/prompt; file is valid JSON ----------
   {
     const file = join(workDir, "add.json");
-    const job = await addJob("*/5 * * * *", "say hi", file);
+    const job = await addJob({ expr: "*/5 * * * *", prompt: "say hi" }, file);
     assert(job.id.length > 0, `id non-empty: ${JSON.stringify(job.id)}`);
     assert(job.expr === "*/5 * * * *", `expr: ${JSON.stringify(job.expr)}`);
     assert(job.prompt === "say hi", `prompt: ${JSON.stringify(job.prompt)}`);
@@ -258,7 +274,7 @@ try {
   // ---- Test 3: removeJob removes the job -----------------------------------
   {
     const file = join(workDir, "rm.json");
-    const job = await addJob("* * * * *", "boom", file);
+    const job = await addJob({ expr: "* * * * *", prompt: "boom" }, file);
     const before = await listJobs(file);
     assert(before.length === 1, `before remove: 1, got ${before.length}`);
     await removeJob(job.id, file);
@@ -270,7 +286,7 @@ try {
   // ---- Test 4: removeJob nonexistent id -> "no such job", file unchanged ---
   {
     const file = join(workDir, "rmnope.json");
-    await addJob("* * * * *", "boom", file);
+    await addJob({ expr: "* * * * *", prompt: "boom" }, file);
     let err = "";
     try {
       await removeJob("definitely-not-a-real-id", file);
@@ -288,7 +304,7 @@ try {
     const file = join(workDir, "invalid.json");
     let err = "";
     try {
-      await addJob("not-a-cron-expr!!!", "hi", file);
+      await addJob({ expr: "not-a-cron-expr!!!", prompt: "hi" }, file);
     } catch (e) {
       err = e instanceof Error ? e.message : String(e);
     }
@@ -305,6 +321,57 @@ try {
     }
     assert(!exists, `no file written for an invalid cron expr`);
     console.log("PASS test5 — addJob rejects invalid cron expr, no file written");
+  }
+
+  // ---- test5b: addJob one-shot — at valid/normalized, past & both rejected ----
+  {
+    // a future one-shot is stored as a UTC-normalized `at`, with no `expr`
+    const fileOnce = join(workDir, "once.json");
+    const jobOnce = await addJob({ at: "2026-12-01T09:30:00Z", prompt: "run the report" }, fileOnce);
+    assert(jobOnce.at === "2026-12-01T09:30:00.000Z", `at normalized: ${jobOnce.at}`);
+    assert(jobOnce.expr === undefined, `one-shot has no expr: ${jobOnce.expr}`);
+    assert(jobOnce.prompt === "run the report", `prompt: ${jobOnce.prompt}`);
+    const loadedOnce = await listJobs(fileOnce);
+    assert(loadedOnce[0].at === "2026-12-01T09:30:00.000Z", `persisted at: ${JSON.stringify(loadedOnce[0].at)}`);
+    assert(loadedOnce[0].expr === undefined, `persisted no expr`);
+
+    // a past one-shot is rejected and writes no file
+    const filePast = join(workDir, "past.json");
+    {
+      let err = "";
+      try {
+        const pastIso = new Date(Date.now() - 86400000).toISOString();
+        await addJob({ at: pastIso, prompt: "too late" }, filePast);
+      } catch (e) {
+        err = e instanceof Error ? e.message : String(e);
+      }
+      assert(err.includes("in the past"), `past one-shot rejected: ${err}`);
+    }
+    {
+      let exists = true;
+      try {
+        await readFile(filePast, "utf8");
+      } catch {
+        exists = false;
+      }
+      assert(!exists, `no file written for a past one-shot`);
+    }
+
+    // both expr and at are rejected
+    {
+      let err = "";
+      try {
+        await addJob({ expr: "0 9 * * *", at: "2026-12-01T09:30:00Z", prompt: "both" }, join(workDir, "both.json"));
+      } catch (e) {
+        err = e instanceof Error ? e.message : String(e);
+      }
+      assert(
+        err.includes("not both") && err.includes("one-shot"),
+        `both rejected: ${err}`
+      );
+    }
+
+    console.log("PASS test5b — addJob one-shot: `at` valid/normalized, past & both rejected");
   }
 
   // ---- Test 6: CLI parse — schedule / add / list / rm arg shapes ----------
@@ -325,17 +392,62 @@ try {
     assert(c4.positional[1] === "rm", `rm pos1`);
     assert(c4.positional[2] === "abc123", `rm id: ${JSON.stringify(c4.positional[2])}`);
 
-    console.log("PASS test6 — schedule CLI parse shapes (schedule/add/list/rm)");
+    // One-shot add: space-free ISO date/time in the expr slot (classified at
+    // run time, not by parse() — this just fixes the positional shape).
+    const c5 = parse(["schedule", "add", "2026-12-01T09:30:00Z", "say hi"]);
+    assert(c5.positional[2] === "2026-12-01T09:30:00Z", `addOnce at: ${JSON.stringify(c5.positional[2])}`);
+    assert(c5.positional[3] === "say hi", `addOnce prompt: ${JSON.stringify(c5.positional[3])}`);
+
+    // One-shot add with the optional leading `at` keyword: the date/time and
+    // prompt shift one slot right; parseScheduleAddArgs collapses the keyword
+    // away to the same (scheduleRaw, prompt) pair.
+    const c6 = parse(["schedule", "add", "at", "2026-12-01T09:30:00Z", "say hi"]);
+    const addAt = parseScheduleAddArgs(c6.positional);
+    assert(addAt.scheduleRaw === "2026-12-01T09:30:00Z", `atKeyword scheduleRaw: ${JSON.stringify(addAt.scheduleRaw)}`);
+    assert(addAt.prompt === "say hi", `atKeyword prompt: ${JSON.stringify(addAt.prompt)}`);
+
+    // The same two args without the keyword give the identical pair.
+    const c7 = parse(["schedule", "add", "2026-12-01T09:30:00Z", "say hi"]);
+    const addNoAt = parseScheduleAddArgs(c7.positional);
+    assert(addNoAt.scheduleRaw === "2026-12-01T09:30:00Z", `no-at scheduleRaw: ${JSON.stringify(addNoAt.scheduleRaw)}`);
+    assert(addNoAt.prompt === "say hi", `no-at prompt: ${JSON.stringify(addNoAt.prompt)}`);
+
+    // `at` present but the date or prompt missing -> the missing slot is
+    // undefined (the command handler reports the usage error).
+    const c8 = parse(["schedule", "add", "at", "2026-12-01T09:30:00Z"]);
+    assert(parseScheduleAddArgs(c8.positional).prompt === undefined, `at missing prompt -> prompt undefined`);
+    assert(parseScheduleAddArgs(parse(["schedule", "add", "at"]).positional).scheduleRaw === undefined, `at only -> scheduleRaw undefined`);
+
+    console.log("PASS test6 — schedule CLI parse shapes (schedule/add/list/rm, one-shot + optional `at` keyword)");
   }
 
   // ---- Test 7: slow runs serialize FIFO (no overlap) ----------------------
   {
     const file = join(workDir, "serial.json");
-    const jobA = await addJob("59 * * * *", "jobA prompt", file);
-    const jobB = await addJob("58 * * * *", "jobB prompt", file);
+    const jobA = await addJob({ expr: "59 * * * *", prompt: "jobA prompt" }, file);
+    const jobB = await addJob({ expr: "58 * * * *", prompt: "jobB prompt" }, file);
     const cron = makeFakeCron();
-    const rec: { ran: string[]; overlapped: boolean } = { ran: [], overlapped: false };
-    const slowFn = makeRunJobFn(rec, 150);
+    const rec: { ran: string[]; overlapped: boolean; started: string[] } = {
+      ran: [],
+      overlapped: false,
+      started: [],
+    };
+    let active = 0;
+    let jobAStarted = false;
+    // runJobFn that records run starts and flags overlapping runs (returns exit code).
+    const slowFn = (job: ScheduleJob) => {
+      active += 1;
+      rec.overlapped = rec.overlapped || active > 1;
+      rec.started.push(job.id.slice(0, 6));
+      if (job.id === jobA.id) jobAStarted = true;
+      return new Promise<number>((r) =>
+        setTimeout(() => {
+          active -= 1;
+          rec.ran.push(job.id.slice(0, 6));
+          r(0);
+        }, 150)
+      );
+    };
     const handle = await runScheduler({
       file,
       pollMs: 5000,
@@ -348,6 +460,9 @@ try {
     const jobAid = jobA.id.slice(0, 6);
     const jobBid = jobB.id.slice(0, 6);
     await cron.fire("59 * * * *"); // fire jobA first
+    // Wait until jobA's run has actually started, so the re-read/queue
+    // races cannot reverse the order; then fire jobB (which must queue).
+    await waitFor(() => jobAStarted, 500);
     await cron.fire("58 * * * *"); // fire jobB second (should queue)
     await waitFor(() => rec.ran.length === 2, 3000);
     assert(rec.overlapped === false, "two runs overlapped (serialization broken)");
@@ -360,7 +475,7 @@ try {
   // ---- Test 8: a fired job records lastStatus=ok + lastRun in the file ----
   {
     const file = join(workDir, "status.json");
-    const job = await addJob("1 * * * *", "status prompt", file);
+    const job = await addJob({ expr: "1 * * * *", prompt: "status prompt" }, file);
     const cron = makeFakeCron();
     const handle = await runScheduler({
       file,
@@ -391,7 +506,7 @@ try {
   // ---- Test 9: a failing run records lastStatus=failed --------------------
   {
     const file = join(workDir, "fail.json");
-    const job = await addJob("1 * * * *", "fail prompt", file);
+    const job = await addJob({ expr: "1 * * * *", prompt: "fail prompt" }, file);
     const cron = makeFakeCron();
     const handle = await runScheduler({
       file,
@@ -422,7 +537,7 @@ try {
     const cron = makeFakeCron();
     const file = join(workDir, "sync.json");
     // Start the daemon with jobA already present.
-    await addJob("1 * * * *", "jobA", file);
+    await addJob({ expr: "1 * * * *", prompt: "jobA" }, file);
     const handle = await runScheduler({
       file,
       pollMs: 100, // fast polling for the test
@@ -434,7 +549,7 @@ try {
     await waitFor(() => cron.exprs.includes("1 * * * *"), 1000);
 
     // Add jobB while the daemon runs (simulating `schedule add`).
-    const jobB = await addJob("2 * * * *", "jobB", file);
+    const jobB = await addJob({ expr: "2 * * * *", prompt: "jobB" }, file);
     await waitFor(() => cron.exprs.includes("2 * * * *"), 1000);
     assert(cron.exprs.includes("2 * * * *"), "jobB scheduled within a poll");
 
@@ -532,7 +647,557 @@ try {
     assert(add3?.kind === "add", "add3 kind (case-insensitive)");
     assert(add3?.prompt === "Mixed Case Prompt", `add3 prompt case: ${add3?.prompt}`);
 
-    console.log("PASS test12 — REPL /schedule parse (5 cron fields, rest = prompt)");
+    // add: one-shot — first token is a space-free ISO date/time; rest is the prompt
+    const addOnce = parseScheduleCmd("/schedule add 2026-12-01T09:30:00Z run the report");
+    assert(addOnce?.kind === "add", "addOnce kind");
+    assert(addOnce?.at === "2026-12-01T09:30:00.000Z", `addOnce at: ${addOnce?.at}`);
+    assert(addOnce?.expr === undefined, `addOnce expr undefined: ${addOnce?.expr}`);
+    assert(addOnce?.prompt === "run the report", `addOnce prompt: ${addOnce?.prompt}`);
+
+    // add: one-shot, no prompt -> error
+    assert(
+      parseScheduleCmd("/schedule add 2026-12-01T09:30:00Z")?.kind === "error",
+      "one-shot add missing prompt -> error",
+    );
+
+    // add: a numeric-minute cron still parses as a cron — a bare numeric minute
+    // field must NOT be misclassified as a one-shot date (Date.parse is lenient
+    // with bare numbers, so the hyphen gate in classifyScheduleArg matters).
+    const addNum = parseScheduleCmd("/schedule add 0 9 * * 1 send a report");
+    assert(addNum?.kind === "add", "addNum kind");
+    assert(addNum?.expr === "0 9 * * 1", `addNum expr: ${addNum?.expr}`);
+    assert(addNum?.at === undefined, `addNum not one-shot: ${addNum?.at}`);
+    assert(addNum?.prompt === "send a report", `addNum prompt: ${addNum?.prompt}`);
+
+    // add: one-shot with the optional leading `at` keyword (case-insensitive,
+    // like the command itself) — ignored; the date/time and prompt shift one
+    // slot right.
+    const addAt = parseScheduleCmd("/schedule add at 2026-12-01T09:30:00Z run the report");
+    assert(addAt?.kind === "add", "addAt kind");
+    assert(addAt?.at === "2026-12-01T09:30:00.000Z", `addAt at: ${addAt?.at}`);
+    assert(addAt?.expr === undefined, `addAt expr undefined: ${addAt?.expr}`);
+    assert(addAt?.prompt === "run the report", `addAt prompt: ${addAt?.prompt}`);
+
+    const addAtUpper = parseScheduleCmd("/Schedule ADD At 2026-12-01T09:30:00Z run it");
+    assert(addAtUpper?.kind === "add", "addAt case-insensitive kind");
+    assert(addAtUpper?.at === "2026-12-01T09:30:00.000Z", `addAt case-insensitive: ${addAtUpper?.at}`);
+
+    // one-shot with `at` but no prompt -> error
+    assert(
+      parseScheduleCmd("/schedule add at 2026-12-01T09:30:00Z")?.kind === "error",
+      "at one-shot missing prompt -> error",
+    );
+
+    console.log(
+      "PASS test12 — REPL /schedule parse (5 cron fields + one-shot + optional `at` keyword, rest = prompt)",
+    );
+  }
+
+  // ---- test12b: classifyScheduleArg — cron vs one-shot vs invalid --------------
+  {
+    // a 5-field cron
+    const c1 = classifyScheduleArg("0 9 * * *");
+    assert(c1.kind === "cron", `c1 should be cron: ${JSON.stringify(c1)}`);
+    assert((c1 as { expr?: string }).expr === "0 9 * * *", `c1 expr: ${JSON.stringify(c1)}`);
+
+    // a space-free ISO one-shot (normalized to UTC)
+    const c2 = classifyScheduleArg("2026-12-01T09:30:00Z");
+    assert(c2.kind === "once", `c2 should be once: ${JSON.stringify(c2)}`);
+    assert((c2 as { at?: string }).at === "2026-12-01T09:30:00.000Z", `c2 at: ${JSON.stringify(c2)}`);
+
+    // date-only ISO is also accepted (normalized to UTC midnight)
+    const c3 = classifyScheduleArg("2026-12-01");
+    assert(c3.kind === "once", `c3 date-only once: ${JSON.stringify(c3)}`);
+
+    // bare cron fields (no hyphen) are NOT one-shot, even though Date.parse is
+    // lenient with bare numbers — the hyphen gate keeps them "unrecognized"
+    for (const t of ["0", "9", "59", "23", "*/5"]) {
+      const r = classifyScheduleArg(t);
+      assert(
+        "error" in r,
+        `bare cron field "${t}" must not classify as one-shot: ${JSON.stringify(r)}`
+      );
+    }
+
+    // a hyphenated string that is not a date is still rejected
+    assert(
+      "error" in classifyScheduleArg("not-a-date"),
+      "non-date hyphenated string rejected: 'not-a-date'"
+    );
+
+    // empty string rejected
+    assert("error" in classifyScheduleArg(""), "empty string rejected");
+
+    console.log("PASS test12b — classifyScheduleArg: cron / one-shot / bare-minute / invalid");
+  }
+
+  // ---- Tests 13-18: updateJob (the "change" behind schedule_update) --------
+  {
+    const file = join(workDir, "updx.json");
+    const job = await addJob({ expr: "1 * * * *", prompt: "old prompt" }, file);
+    const updated = await updateJob(job.id, { expr: "15 * * * *" }, file);
+    assert(updated.expr === "15 * * * *", `expr updated: ${JSON.stringify(updated.expr)}`);
+    assert(updated.prompt === "old prompt", `prompt unchanged: ${JSON.stringify(updated.prompt)}`);
+    const loaded = await listJobs(file);
+    assert(loaded[0].id === job.id && loaded[0].expr === "15 * * * *", `persisted: ${JSON.stringify(loaded)}`);
+    console.log("PASS test13 — updateJob expr only");
+  }
+
+  {
+    const file = join(workDir, "upprompt.json");
+    const job = await addJob({ expr: "* * * * *", prompt: "old prompt" }, file);
+    const updated = await updateJob(job.id, { prompt: "new prompt" }, file);
+    assert(updated.expr === "* * * * *", `expr unchanged: ${JSON.stringify(updated.expr)}`);
+    assert(updated.prompt === "new prompt", `prompt updated: ${JSON.stringify(updated.prompt)}`);
+    const loaded = await listJobs(file);
+    assert(loaded[0].prompt === "new prompt", `persisted prompt: ${JSON.stringify(loaded)}`);
+    console.log("PASS test14 — updateJob prompt only");
+  }
+
+  {
+    const file = join(workDir, "upboth.json");
+    const job = await addJob({ expr: "1 * * * *", prompt: "old" }, file);
+    const updated = await updateJob(job.id, { expr: "2 * * * *", prompt: "both new" }, file);
+    assert(updated.expr === "2 * * * *", `expr: ${JSON.stringify(updated.expr)}`);
+    assert(updated.prompt === "both new", `prompt: ${JSON.stringify(updated.prompt)}`);
+    const loaded = await listJobs(file);
+    assert(loaded[0].expr === "2 * * * *" && loaded[0].prompt === "both new", `persisted: ${JSON.stringify(loaded)}`);
+    console.log("PASS test15 — updateJob both expr and prompt");
+  }
+
+  {
+    const file = join(workDir, "upnone.json");
+    const job = await addJob({ expr: "* * * * *", prompt: "x" }, file);
+    let err1 = "";
+    try {
+      await updateJob(job.id, {}, file);
+    } catch (e) {
+      err1 = e instanceof Error ? e.message : String(e);
+    }
+    assert(err1.includes("at least one of"), `neither field error: ${JSON.stringify(err1)}`);
+    let err2 = "";
+    try {
+      await updateJob(job.id, { prompt: "   " }, file);
+    } catch (e) {
+      err2 = e instanceof Error ? e.message : String(e);
+    }
+    assert(err2.includes("prompt must not be empty"), `empty prompt error: ${JSON.stringify(err2)}`);
+    console.log("PASS test16 — updateJob neither/blank prompt -> throws");
+  }
+
+  {
+    const file = join(workDir, "upmiss.json");
+    const job = await addJob({ expr: "* * * * *", prompt: "x" }, file);
+    let err = "";
+    try {
+      await updateJob("not-a-real-id", { prompt: "new" }, file);
+    } catch (e) {
+      err = e instanceof Error ? e.message : String(e);
+    }
+    assert(err.includes("no job with id"), `unknown id error: ${JSON.stringify(err)}`);
+    assert(err.includes(job.id), `lists available full id: ${JSON.stringify(err)}`);
+    console.log("PASS test17 — updateJob unknown id -> lists available full ids");
+  }
+
+  {
+    const file = join(workDir, "upinvalid.json");
+    const job = await addJob({ expr: "* * * * *", prompt: "x" }, file);
+    let err = "";
+    try {
+      await updateJob(job.id, { expr: "not-a-cron!!!", prompt: "y" }, file);
+    } catch (e) {
+      err = e instanceof Error ? e.message : String(e);
+    }
+    assert(err.includes("invalid cron expression"), `bad cron error: ${JSON.stringify(err)}`);
+    assert(err.includes("5 fields"), `bad cron mentions 5 fields: ${JSON.stringify(err)}`);
+    const after = await listJobs(file);
+    assert(after.length === 1 && after[0].expr === "* * * * *", `file unchanged: ${JSON.stringify(after)}`);
+    console.log("PASS test18 — updateJob invalid cron -> throws, file unchanged");
+  }
+
+  // ---- test18b: updateJob one-shot — cron↔one-shot switch, `at` normalize/validate
+  {
+    const file = join(workDir, "upswitch.json");
+
+    // cron -> one-shot: replace expr with a future `at`; expr cleared, at normalized
+    const jobCron = await addJob({ expr: "1 * * * *", prompt: "start cron" }, file);
+    const toOne = await updateJob(jobCron.id, { at: "2026-12-01T09:30:00Z" }, file);
+    assert(toOne.at === "2026-12-01T09:30:00.000Z", `toOne at: ${toOne.at}`);
+    assert(toOne.expr === undefined, `expr cleared on one-shot: ${toOne.expr}`);
+    assert(toOne.prompt === "start cron", `prompt unchanged: ${toOne.prompt}`);
+
+    // one-shot -> cron: replace at with a 5-field expr; at cleared, expr validated
+    const backToCron = await updateJob(toOne.id, { expr: "30 10 * * *" }, file);
+    assert(backToCron.expr === "30 10 * * *", `backToCron expr: ${JSON.stringify(backToCron.expr)}`);
+    assert(backToCron.at === undefined, `at cleared on cron: ${backToCron.at}`);
+
+    // re-set a different one-shot time on the (now cron) job
+    const toTwo = await updateJob(backToCron.id, { at: "2026-12-02T10:00:00Z" }, file);
+    assert(toTwo.at === "2026-12-02T10:00:00.000Z", `toTwo at: ${toTwo.at}`);
+    assert(toTwo.expr === undefined, `toTwo no expr: ${toTwo.expr}`);
+
+    // persisted state reflects the latest switch
+    const last = (await listJobs(file))[0];
+    assert(last.at === "2026-12-02T10:00:00.000Z" && last.expr === undefined, `persisted: ${JSON.stringify(last)}`);
+
+    // invalid one-shot (unparsable) is rejected and the file is unchanged
+    {
+      let err = "";
+      try {
+        await updateJob(last.id, { at: "not a date" }, file);
+      } catch (e) {
+        err = e instanceof Error ? e.message : String(e);
+      }
+      assert(err.includes("invalid date/time"), `invalid at rejected: ${err}`);
+      const unchanged = (await listJobs(file))[0];
+      assert(unchanged.at === "2026-12-02T10:00:00.000Z", `at unchanged after invalid update: ${JSON.stringify(unchanged.at)}`);
+    }
+
+    console.log("PASS test18b — updateJob one-shot: cron↔one-shot switch, `at` normalized/validated");
+  }
+
+  // ---- Tests 19-27: schedule tools (agent-invocable, default file, isolated)
+  {
+    const toolDir = join(workDir, "tool-dir");
+    await mkdir(toolDir, { recursive: true });
+    process.chdir(toolDir);
+    try {
+      {
+        const out = await callScheduleTool("schedule_list", {});
+        assert(out.isError === false, `list not an error: ${JSON.stringify(out)}`);
+        assert(
+          textFrom(out.content).includes("no scheduled jobs"),
+          `empty list: ${JSON.stringify(textFrom(out.content))}`
+        );
+        assert(textFrom(out.content).includes("schedule_add"), `mentions schedule_add: ${JSON.stringify(textFrom(out.content))}`);
+        console.log("PASS test19 — schedule_list with no jobs -> 'no scheduled jobs'");
+      }
+
+      {
+        const addOut = await callScheduleTool("schedule_add", { expr: "0 9 * * *", prompt: "check the deploy log" });
+        assert(addOut.isError === false, `add not an error: ${JSON.stringify(addOut)}`);
+        const jobs = await listJobs();
+        assert(jobs.length === 1, `exactly one job after add: ${JSON.stringify(jobs)}`);
+        const job = jobs[0];
+        assert(textFrom(addOut.content).includes("added job"), `add text: ${textFrom(addOut.content)}`);
+        assert(textFrom(addOut.content).includes(job.id), `add text includes full id: ${textFrom(addOut.content)}`);
+        assert(job.prompt === "check the deploy log", `prompt persisted: ${JSON.stringify(job.prompt)}`);
+        assert(job.expr === "0 9 * * *", `expr persisted: ${JSON.stringify(job.expr)}`);
+        console.log("PASS test20 — schedule_add creates a job; text shows the full id");
+      }
+
+      {
+        const job = (await listJobs())[0];
+        const expr = job.expr;
+        if (expr === undefined) {
+          throw new Error("expected test20's cron job to have an `expr`");
+        }
+        const out = await callScheduleTool("schedule_list", {});
+        const t = textFrom(out.content);
+        assert(t.includes(job.id), `list includes full id: ${t}`);
+        assert(t.includes(expr), `list includes expr: ${t}`);
+        assert(t.includes(job.prompt), `list includes prompt: ${t}`);
+        assert(t.includes("1 job(s)"), `lists the count: ${t}`);
+        console.log("PASS test21 — schedule_list with a job -> full id + expr + prompt");
+      }
+
+      {
+        const job = (await listJobs())[0];
+        const out = await callScheduleTool("schedule_update", { id: job.id, expr: "0 10 * * *" });
+        assert(out.isError === false, `update not an error: ${JSON.stringify(out)}`);
+        const afterUp = (await listJobs()).find((j) => j.id === job.id);
+        assert(afterUp?.expr === "0 10 * * *", `expr updated: ${JSON.stringify(afterUp?.expr)}`);
+        assert(afterUp?.prompt === "check the deploy log", `prompt unchanged: ${JSON.stringify(afterUp?.prompt)}`);
+        assert(textFrom(out.content).includes("updated job"), `update text: ${textFrom(out.content)}`);
+        assert(textFrom(out.content).includes(job.id), `update text includes full id`);
+        console.log("PASS test22 — schedule_update changes expr, leaves prompt");
+      }
+
+      {
+        const job = (await listJobs())[0];
+        const out = await callScheduleTool("schedule_update", { id: job.id, expr: "1 9 * * *", prompt: "   " });
+        assert(out.isError === false, `update2 not an error: ${JSON.stringify(out)}`);
+        const afterUp2 = (await listJobs()).find((j) => j.id === job.id);
+        assert(afterUp2?.prompt === "check the deploy log", `blank prompt ignored: ${JSON.stringify(afterUp2?.prompt)}`);
+        assert(afterUp2?.expr === "1 9 * * *", `expr still updated: ${JSON.stringify(afterUp2?.expr)}`);
+        console.log("PASS test23 — schedule_update ignores blank expr/prompt fields");
+      }
+
+      {
+        const job = (await listJobs())[0];
+        let err = "";
+        try {
+          await callScheduleTool("schedule_remove", { id: "not-a-real-id" });
+        } catch (e) {
+          err = e instanceof Error ? e.message : String(e);
+        }
+        assert(err.includes("no job with id"), `remove miss error: ${JSON.stringify(err)}`);
+        assert(err.includes(job.id), `remove miss lists available id: ${JSON.stringify(err)}`);
+        console.log("PASS test24 — schedule_remove unknown id -> throws, lists available");
+      }
+
+      {
+        const job = (await listJobs())[0];
+        const out = await callScheduleTool("schedule_remove", { id: job.id });
+        assert(out.isError === false, `remove not an error: ${JSON.stringify(out)}`);
+        assert(textFrom(out.content).includes("removed job"), `remove text: ${textFrom(out.content)}`);
+        assert(textFrom(out.content).includes(job.id), `remove text includes full id`);
+        assert((await listJobs()).length === 0, `job gone: ${JSON.stringify(await listJobs())}`);
+        console.log("PASS test25 — schedule_remove deletes the job");
+      }
+
+      {
+        // neither expr nor at -> the addJob "neither" error
+        let err = "";
+        try {
+          await callScheduleTool("schedule_add", { prompt: "missing expr" });
+        } catch (e) {
+          err = e instanceof Error ? e.message : String(e);
+        }
+        assert(
+          err.includes("provide a cron expression") && err.includes("for the job"),
+          `add neither-error: ${JSON.stringify(err)}`
+        );
+        console.log("PASS test26 — schedule_add with neither expr nor at -> throws");
+
+        // both expr and at -> the addJob "both" error
+        let errBoth = "";
+        try {
+          await callScheduleTool("schedule_add", {
+            expr: "0 9 * * *",
+            at: "2026-12-01T09:30:00Z",
+            prompt: "both",
+          });
+        } catch (e) {
+          errBoth = e instanceof Error ? e.message : String(e);
+        }
+        assert(
+          errBoth.includes("not both") &&
+            errBoth.includes("either a cron `expr`"),
+          `add both-error: ${JSON.stringify(errBoth)}`
+        );
+        console.log("PASS test26b — schedule_add with both expr and at -> throws");
+      }
+
+      {
+        let err = "";
+        try {
+          await callScheduleTool("schedule_bop", {});
+        } catch (e) {
+          err = e instanceof Error ? e.message : String(e);
+        }
+        assert(err.includes("unknown schedule tool"), `unknown name: ${JSON.stringify(err)}`);
+        console.log("PASS test27 — callScheduleTool unknown name -> throws");
+      }
+
+      // (job count is 0 here — test25 removed the only job, and tests 26–27
+      //  throw without writing — so these can seed fresh jobs safely)
+
+      {
+        // schedule_add with an `at` param -> a one-shot job (no expr)
+        const futureAt = new Date(Date.now() + 3600000).toISOString(); // 1h out
+        const addOut = await callScheduleTool("schedule_add", {
+          at: futureAt,
+          prompt: "one-shot tool job",
+        });
+        assert(addOut.isError === false, `add-at not an error: ${JSON.stringify(addOut)}`);
+        const jobs = await listJobs();
+        assert(jobs.length === 1, `exactly one job after add-at: ${JSON.stringify(jobs)}`);
+        const job = jobs[0];
+        assert(job.at === futureAt, `at persisted: ${JSON.stringify(job.at)}`);
+        assert(job.expr === undefined, `one-shot has no expr: ${job.expr}`);
+        const t = textFrom(addOut.content);
+        assert(t.includes("added job"), `add-at text: ${t}`);
+        assert(t.includes(job.id), `add-at includes full id`);
+        assert(t.includes("runs exactly once"), `add-at advertises one-shot: ${t}`);
+        console.log("PASS test27b — schedule_add with `at` creates a one-shot job");
+      }
+
+      {
+        // schedule_update with `at` — switch a cron job to a one-shot, and back
+        const futureAt = new Date(Date.now() + 3600000).toISOString();
+        const seedOut = await callScheduleTool("schedule_add", {
+          expr: "0 8 * * *",
+          prompt: "switch-me",
+        });
+        const seedText = textFrom(seedOut.content);
+        const seeded = (await listJobs()).find((j) => seedText.includes(j.id));
+        assert(seeded !== undefined, `seeded job found by id in list`);
+
+        // cron -> one-shot
+        const upOut = await callScheduleTool("schedule_update", { id: seeded.id, at: futureAt });
+        const afterUp = (await listJobs()).find((j) => j.id === seeded.id);
+        assert(afterUp?.at === futureAt, `switched to at: ${JSON.stringify(afterUp?.at)}`);
+        assert(afterUp?.expr === undefined, `expr cleared on one-shot: ${afterUp?.expr}`);
+        assert(afterUp?.prompt === "switch-me", `prompt unchanged: ${afterUp?.prompt}`);
+        assert(textFrom(upOut.content).includes("updated job"), `update text: ${JSON.stringify(textFrom(upOut.content))}`);
+
+        // one-shot -> cron
+        const backOut = await callScheduleTool("schedule_update", { id: afterUp.id, expr: "15 8 * * *" });
+        const afterBack = (await listJobs()).find((j) => j.id === seeded.id);
+        assert(afterBack?.expr === "15 8 * * *", `back to cron: ${JSON.stringify(afterBack?.expr)}`);
+        assert(afterBack?.at === undefined, `at cleared back: ${afterBack?.at}`);
+        assert(textFrom(backOut.content).includes("updated job"), `update-back text`);
+
+        console.log("PASS test27c — schedule_update with `at` switches cron↔one-shot");
+      }
+    } finally {
+      process.chdir(workDir);
+    }
+  }
+
+  // ---- Tests 28-29: tool definitions & system-prompt block -----------------
+  {
+    const block = scheduleSystemBlock();
+    for (const n of ["schedule_list", "schedule_add", "schedule_update", "schedule_remove"]) {
+      assert(block.includes(n), `system block mentions ${n}`);
+    }
+    console.log("PASS test28 — scheduleSystemBlock advertises all four tools");
+  }
+  {
+    const names = scheduleTools().map((t) => t.function.name);
+    assert(names.length === 4, `4 tools: ${JSON.stringify(names)}`);
+    for (const n of ["schedule_list", "schedule_add", "schedule_update", "schedule_remove"]) {
+      assert(names.includes(n), `scheduleTools includes ${n}: ${JSON.stringify(names)}`);
+    }
+    console.log("PASS test29 — scheduleTools() returns the four named tool definitions");
+  }
+
+  // ---- Test 30: daemon reschedules when a job's expr changes --------------
+  {
+    const cron = makeFakeCron();
+    const file = join(workDir, "resch.json");
+    await addJob({ expr: "1 * * * *", prompt: "jobA" }, file);
+    const job = (await listJobs(file))[0];
+    const handle = await runScheduler({
+      file,
+      pollMs: 50,
+      scheduleFn: cron.scheduleFn,
+      runJobFn: async () => 0,
+      log: () => {},
+      autoHandlers: false,
+    });
+    await waitFor(() => cron.exprs.includes("1 * * * *"), 1000);
+    await updateJob(job.id, { expr: "2 * * * *" }, file); // change expr while daemon runs
+    await waitFor(() => cron.exprs.includes("2 * * * *"), 1000);
+    assert(cron.exprs.includes("2 * * * *"), `new expr scheduled: [${cron.exprs.join(", ")}]`);
+    assert(!cron.exprs.includes("1 * * * *"), `old expr no longer scheduled: [${cron.exprs.join(", ")}]`);
+    assert(cron.stopped.includes("1 * * * *"), `old expr task stop() was called: [${cron.stopped.join(", ")}]`);
+    await handle.stop();
+    console.log("PASS test30 — daemon reschedules on expr change (old stopped, new scheduled)");
+  }
+
+  // ---- Test 31: daemon fires the fresh prompt (re-read at fire time) -----
+  {
+    const cron = makeFakeCron();
+    const file = join(workDir, "fresh.json");
+    await addJob({ expr: "3 * * * *", prompt: "old prompt" }, file);
+    const job = (await listJobs(file))[0];
+    const rec = { prompt: "" as string };
+    const handle = await runScheduler({
+      file,
+      pollMs: 50,
+      scheduleFn: cron.scheduleFn,
+      runJobFn: (j) => {
+        rec.prompt = j.prompt;
+        return Promise.resolve(0);
+      },
+      log: () => {},
+      autoHandlers: false,
+    });
+    await waitFor(() => cron.exprs.includes("3 * * * *"), 1000);
+    await updateJob(job.id, { prompt: "fresh prompt" }, file); // change prompt while daemon runs
+    cron.fire("3 * * * *");
+    await waitFor(() => rec.prompt === "fresh prompt", 1000);
+    assert(rec.prompt === "fresh prompt", `fired with fresh prompt, got "${rec.prompt}"`);
+    await handle.stop();
+    console.log("PASS test31 — daemon fire uses the fresh prompt (re-read at fire time)");
+  }
+
+  // ---- Test 32: daemon fires a one-shot job via its own setTimeout --------
+  {
+    const cron = makeFakeCron();
+    const file = join(workDir, "once-fire.json");
+
+    // a one-shot ~1.2s out; the daemon arms a real setTimeout at that instant
+    const atIso = new Date(Date.now() + 1200).toISOString();
+    await addJob({ at: atIso, prompt: "one-shot prompt" }, file);
+    const job = (await listJobs(file))[0];
+    const rec = { fired: false, prompt: "" as string };
+    const handle = await runScheduler({
+      file,
+      pollMs: 50,
+      scheduleFn: cron.scheduleFn, // not used for one-shot; kept for the seam
+      runJobFn: (j) => {
+        rec.fired = true;
+        rec.prompt = j.prompt;
+        return Promise.resolve(0);
+      },
+      log: () => {},
+      autoHandlers: false,
+    });
+    // Wait for the armed setTimeout to fire, the run to complete, and the run
+    // bookkeeping (lastStatus/lastRun) to be persisted. The rec.* flags are set
+    // the instant runJobFn is called — before recordRun() has saved — so wait on
+    // the persisted `lastStatus` (with the prompt check) rather than the flag alone.
+    await waitFor(
+      async () => {
+        const jobs = await listJobs(file);
+        const j = jobs.find((x) => x.id === job.id);
+        return (
+          j !== undefined &&
+          j.lastStatus === "ok" &&
+          rec.fired &&
+          rec.prompt === "one-shot prompt"
+        );
+      },
+      4000,
+    );
+    // Firing records lastStatus=ok + lastRun; the job is NOT deleted (stays listed).
+    const afterFire = (await listJobs(file)).find((j) => j.id === job.id);
+    assert(afterFire !== undefined, "one-shot job remains in the list after firing");
+    assert(afterFire.lastStatus === "ok", `one-shot recorded lastStatus=ok: ${JSON.stringify(afterFire)}`);
+    assert(afterFire.lastRun !== undefined, `one-shot recorded lastRun: ${JSON.stringify(afterFire.lastRun)}`);
+    await handle.stop();
+    console.log("PASS test32 — daemon fires a one-shot job via its own setTimeout (records run, keeps the job)");
+  }
+
+  // ---- Test 33: a missed one-shot (past `at`) is skipped, never fired ------
+  {
+    const cron = makeFakeCron();
+    const file = join(workDir, "missed.json");
+
+    // Seed a valid (future) one-shot, then flip its `at` to the past via updateJob
+    // (updateJob's `at` check is NaN-based only, so a past time is allowed).
+    const futureIso = new Date(Date.now() + 3600000).toISOString();
+    await addJob({ at: futureIso, prompt: "missed prompt" }, file);
+    const job = (await listJobs(file))[0];
+    await updateJob(job.id, { at: new Date(Date.now() - 60000).toISOString() }, file);
+
+    const rec = { fired: false, prompt: "" as string };
+    const handle = await runScheduler({
+      file,
+      pollMs: 50,
+      scheduleFn: cron.scheduleFn,
+      runJobFn: (j) => {
+        rec.fired = true;
+        rec.prompt = j.prompt;
+        return Promise.resolve(0);
+      },
+      log: () => {},
+      autoHandlers: false,
+    });
+    // Let the daemon run a handful of polls; the sync would have fired it if it
+    // were due — but a missed one-shot must not fire.
+    await sleep(1200);
+    assert(!rec.fired, "a missed one-shot must never fire");
+    const after = (await listJobs(file)).find((j) => j.id === job.id);
+    assert(
+      after !== undefined && after.lastRun === undefined,
+      `missed job has no lastRun (no fire): ${JSON.stringify(after)}`
+    );
+    await handle.stop();
+    console.log("PASS test33 — a missed one-shot (past `at`) is skipped, never fired");
   }
 
   console.log("\nALL SCHEDULE TESTS PASSED");

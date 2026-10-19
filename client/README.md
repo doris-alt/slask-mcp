@@ -326,21 +326,29 @@ engineering or model "good behaviour" can weaken it.
 ## Scheduled jobs
 
 Run prompts on a schedule with a small daemon. `slask-client schedule` keeps
-a long-lived process alive that fires scheduled jobs while it is running. Each
-firing runs the prompt through the client's ordinary one-shot path
-(`--prompt`, with `--quiet` so the startup banner is omitted), so a firing
-behaves exactly like you running `slask-client --prompt "…"` yourself.
+a long-lived process alive that fires scheduled jobs while it is running. Jobs
+come in two mutually exclusive forms: a *recurring* job (a 5-field cron
+expression, fired on every match) and a *one-shot* job (an ISO-8601 date/time,
+fired exactly once). Each firing runs the prompt through the client's ordinary
+one-shot path (`--prompt`, with `--quiet` so the startup banner is omitted), so
+a firing behaves exactly like you running `slask-client --prompt "…"` yourself.
 
 Jobs are stored in `.slask-schedule.json` in the directory where the client is
 run (the same cwd convention as `.env` / `mcp.json`):
 
 ```bash
-# Add a job: run <prompt> whenever <expr> (standard 5-field cron) matches.
+# Recurring: run <prompt> whenever <expr> (standard 5-field cron) matches.
 # The first fire is the *next* occurrence of <expr> after the job is added.
 slask-client schedule add "*/5 * * * *" "summarize the last 5 news items"
 slask-client schedule add "0 9 * * 1" "write a weekly report"
 
-# List jobs (id, expression, prompt, last run / status).
+# One-shot: run <prompt> exactly once at an ISO-8601 date/time (UTC).
+# An optional leading literal `at` is ignored before the date/time, shifting the
+# date/time and prompt one slot right (purely for readability):
+slask-client schedule add "2026-10-20T09:30:00Z" "check the deploy log"
+slask-client schedule add at "2026-10-20T09:30:00Z" "check the deploy log"
+
+# List jobs (id, schedule, prompt, last run / status).
 slask-client schedule list
 
 # Remove a job by full id or a unique id prefix.
@@ -348,10 +356,31 @@ slask-client schedule rm <id>
 ```
 
 You can also manage jobs from the interactive REPL — type `/schedule add
-<expr> <prompt>`, `/schedule list`, or `/schedule rm <id>` at the `slask-agent
->` prompt. Because the REPL has no shell quoting, the cron expression is the
-first 5 whitespace-separated fields and everything after field 5 is the
-prompt (case preserved).
+<sched> <prompt>` (a one-shot `<sched>` may be preceded by the optional,
+case-insensitive `at` keyword, which is simply ignored), `/schedule list`, or
+`/schedule rm <id>` at the `slask-agent` prompt. `<sched>` is either a 5-field
+cron (recurring: the first 5 whitespace-separated fields, and the prompt is
+everything after field 5) or a space-free ISO date/time (one-shot).
+
+**The model can manage schedules too.** Beyond the CLI and REPL, the agent can
+create, change, list, and delete scheduled jobs directly through four always
+available tools, so you can just ask in plain language:
+
+- `schedule_list` — lists all jobs with their full UUID ids, schedule (cron
+  expr or one-shot time), prompt, and last run / status. Use the id the tool
+  gives you to reference a job unambiguously.
+- `schedule_add` — creates a job: a 5-field cron `expr` plus a `prompt`
+  (recurring, e.g. "remind me to check the deploy log every morning at 9")
+  or an ISO date/time `at` plus a `prompt` (one-shot, e.g. "remind me once
+  at 9:30 tomorrow").
+- `schedule_update` — changes an existing job by id, taking a new cron `expr`,
+  a new one-shot `at`, and/or a new prompt (exactly one of `expr`/`at` per
+  call; e.g. "change that to 10am", "run that once at 5pm tomorrow").
+- `schedule_remove` — deletes a job by id.
+
+The model references jobs by their **full UUID** (exactly as `schedule_list`
+prints it), not a short prefix. Note that the REPL's `/schedule` supports only
+`add` / `list` / `rm`; editing a job goes through `schedule_update`.
 
 **Running the daemon.** The daemon runs in the foreground and fires jobs only
 while the process is alive. Ctrl+C stops it cleanly — it lets any in-flight
@@ -374,12 +403,22 @@ nohup slask-client schedule >/var/log/sched.log 2>&1 &
 
 **Notes.**
 
-- **Local time.** Expressions are evaluated in the system's local time zone,
-  and jobs fire only while the daemon process is running. There is no
-  built-in self-start; keep the daemon alive (tmux, systemd, a terminal, …).
+- **Local time.** Cron expressions are evaluated in the system's local time
+  zone. One-shot `at` times are stored in UTC (any ISO-8601 you pass is
+  normalized to UTC), so they fire regardless of the machine's time zone.
+  Jobs fire only while the daemon process is running. There is no built-in
+  self-start; keep the daemon alive (tmux, systemd, a terminal, …).
+- **One-shot behavior.** A one-shot fires exactly once at its `at` instant and
+  is *not* removed afterwards — it stays in `schedule list`, now showing its
+  `last` run/status (`ok`, `failed`, or `timeout`). `schedule_update` can also
+  switch a job's kind (recurring ↔ one-shot) by providing exactly one of
+  `expr`/`at`. If a one-shot's time passed while the daemon was down, it is
+  skipped — never back-fired.
 - **Live management.** The jobs file is re-read every 15 s
-  (`SLASK_SCHEDULE_POLL_S`), so a live `add` / `rm` takes effect within one
-  poll — no daemon restart needed.
+  (`SLASK_SCHEDULE_POLL_S`), so a live `add` / `rm` / `update` takes effect
+  within one poll — no daemon restart needed. Changing a running job's cron
+  expression reschedules it immediately; a changed prompt is picked up on the
+  next firing.
 - **Serialized runs.** At most one run at a time, queued FIFO, so a slow or
   hung firing can't starve the others or pile up unbounded.
 - **Per-run timeout.** Each run has a 30 min default timeout
