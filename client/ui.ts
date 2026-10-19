@@ -46,7 +46,15 @@ import {
   fileSystemBlock,
   fileTools,
 } from "./files.js";
-import { addJob, listJobs, removeJob } from "./schedule.js";
+import {
+  addJob,
+  listJobs,
+  removeJob,
+  SCHEDULE_TOOL_NAMES,
+  callScheduleTool,
+  scheduleSystemBlock,
+  scheduleTools,
+} from "./schedule.js";
 
 // ---------------------------------------------------------------------------
 // colors (tiny dependency-free ANSI helper)
@@ -285,6 +293,7 @@ export function printBanner(state: ChatState, interactive: boolean): void {
   const allToolNames = [
     ...state.openaiTools.map((t) => t.function.name),
     ...FILE_TOOL_NAMES,
+    ...SCHEDULE_TOOL_NAMES,
     ...state.skills.map((s) => s.name),
   ];
   console.log(
@@ -324,18 +333,23 @@ export async function runTurn(
   spinner: Spinner,
 ): Promise<string | null> {
   const { openai, openaiTools, skills, model, baseDir } = state;
-  const systemPrompt = SYSTEM_PROMPT + skillSystemBlock(skills) + fileSystemBlock();
+  const systemPrompt =
+    SYSTEM_PROMPT + skillSystemBlock(skills) + fileSystemBlock() + scheduleSystemBlock();
   const tools = [
     ...openaiTools,
     ...fileTools(),
+    ...scheduleTools(),
     ...(skills.length > 0 ? [skillTool(skills), runScriptTool(skills)] : []),
   ];
   const callTool: (name: string, args: Record<string, unknown>) => Promise<CallToolResult> =
     (name, args) => {
-    // Synthetic local tools (file + skill); every other name routes to the
-    // originating MCP server.
+    // Synthetic local tools (file, schedule, skill); every other name routes to
+    // the originating MCP server.
     if (FILE_TOOL_NAMES.includes(name)) {
       return callFileTool(baseDir, name, args);
+    }
+    if (SCHEDULE_TOOL_NAMES.includes(name)) {
+      return callScheduleTool(name, args);
     }
     if (name === "invoke_skill") {
       return invokeSkill(skills, String(args.name), args.file).then(

@@ -34,6 +34,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import cron from "node-cron";
 import { dirname, join } from "node:path";
+import type { CallToolResult, OpenAiFunctionTool } from "./types.js";
 
 type ChildProcess = ReturnType<typeof spawn>;
 
@@ -55,6 +56,19 @@ interface ScheduleFile {
 }
 
 const SCHEDULE_FILE_NAME = ".slask-schedule.json";
+
+/**
+ * The agent-invocable schedule tool names (mirrors `FILE_TOOL_NAMES`). These are
+ * always available in the REPL and one-shot runs and route to the handlers in
+ * `callScheduleTool`. The model references jobs by their *full* UUID id, so the
+ * tool text always prints full ids (unlike the compact REPL display).
+ */
+export const SCHEDULE_TOOL_NAMES: string[] = [
+  "schedule_list",
+  "schedule_add",
+  "schedule_update",
+  "schedule_remove",
+];
 
 function defaultFile(): string {
   return join(process.cwd(), SCHEDULE_FILE_NAME);
@@ -132,6 +146,63 @@ export async function removeJob(id: string, file: string = defaultFile()): Promi
   await saveJobs(jobs, file);
 }
 
+/** Fields a `schedule_update` call may change. At least one must be present. */
+export interface JobUpdate {
+  /** New 5-field cron expression (replaces the job's current expr). */
+  expr?: string;
+  /** New prompt text (replaces the job's current prompt). */
+  prompt?: string;
+}
+
+/**
+ * Change one or more fields of an existing job — the "change" behind
+ * `schedule_update`. At least one of `expr` / `prompt` must be provided.
+ * `expr` is validated as a cron expression (same rule as `addJob`); `prompt`
+ * must be non-empty. An unknown id throws with the available full ids so the
+ * caller (the model) can self-correct. Returns the updated job.
+ */
+export async function updateJob(
+  id: string,
+  update: JobUpdate,
+  file: string = defaultFile(),
+): Promise<ScheduleJob> {
+  if (update.expr === undefined && update.prompt === undefined) {
+    throw new Error(
+      "at least one of `expr` (new cron expression) or `prompt` (new text) is required",
+    );
+  }
+  if (update.expr !== undefined) {
+    if (!cron.validate(update.expr)) {
+      throw new Error(
+        `invalid cron expression: "${update.expr}" (standard 5 fields: minute hour day-of-month month day-of-week)`,
+      );
+    }
+  }
+  if (update.prompt !== undefined) {
+    const p = String(update.prompt).trim();
+    if (p === "") {
+      throw new Error("prompt must not be empty");
+    }
+  }
+  const jobs = await loadJobs(file);
+  const idx = jobs.findIndex((j) => j.id === id);
+  if (idx === -1) {
+    const avail = jobs.map((j) => j.id).join(", ");
+    throw new Error(
+      `no job with id ${id} (available: ${avail ? avail : "none"})`,
+    );
+  }
+  const job = jobs[idx];
+  if (update.expr !== undefined) {
+    job.expr = update.expr.trim();
+  }
+  if (update.prompt !== undefined) {
+    job.prompt = String(update.prompt).trim();
+  }
+  await saveJobs(jobs, file);
+  return job;
+}
+
 export async function listJobs(file: string = defaultFile()): Promise<ScheduleJob[]> {
   return loadJobs(file);
 }
@@ -203,7 +274,7 @@ export async function runScheduler(options: RunSchedulerOptions = {}): Promise<S
 
   // -- state -----------------------------------------------------------------
   const queue: ScheduleJob[] = [];
-  const cronTasks = new Map<string, { stop: () => void | Promise<void> }>();
+  const cronTasks = new Map<string, { expr: string; stop: () => void | Promise<void> }>();
   let busy = false;
   let shuttingDown = false;
   let busyDone: Promise<void> | null = null;
@@ -306,7 +377,13 @@ export async function runScheduler(options: RunSchedulerOptions = {}): Promise<S
     }
   }
 
-  function fireJob(job: ScheduleJob): void {
+  // Fire by id: re-read the current job from the file so the prompt (and expr)
+  // are always up-to-date, even if the job was `schedule_update`d since the cron
+  // task was scheduled. Returns early if the job was removed in the meantime.
+  async function fireJobById(id: string): Promise<void> {
+    const jobs = await loadJobs(file);
+    const job = jobs.find((j) => j.id === id);
+    if (job === undefined) return;
     queue.push(job);
     void pump();
   }
@@ -339,13 +416,28 @@ export async function runScheduler(options: RunSchedulerOptions = {}): Promise<S
       }
       log(`scheduler: stopped job ${id.slice(0, 6)} (no longer in ${file})`);
     }
-    // start tasks for jobs that are new in the file
+    // sync each live job: keep its task unless it is new or its cron expr changed
+    // (an expr change means the running cron is on the old schedule, so reschedule).
     for (const job of jobs) {
-      if (cronTasks.has(job.id)) continue;
+      const existing = cronTasks.get(job.id);
+      const exprChanged = existing !== undefined && existing.expr !== job.expr;
+      if (existing !== undefined && !exprChanged) continue;
+      if (existing !== undefined) {
+        // expr changed: stop the stale task before rescheduling.
+        cronTasks.delete(job.id);
+        try {
+          await existing.stop();
+        } catch {
+          // ignore
+        }
+      }
       try {
-        const task = scheduleFn(job.expr, () => fireJob(job));
-        cronTasks.set(job.id, task);
-        log(`scheduler: started job ${job.id.slice(0, 6)} — ${job.expr}`);
+        const task = scheduleFn(job.expr, () => void fireJobById(job.id));
+        cronTasks.set(job.id, { expr: job.expr, stop: () => task.stop() });
+        log(
+          `scheduler: ${existing === undefined ? "started" : "rescheduled"} job ` +
+            `${job.id.slice(0, 6)} — ${job.expr}`,
+        );
       } catch (e) {
         log(
           `scheduler: skipping job ${job.id.slice(0, 6)} (${job.expr}): ${
@@ -414,4 +506,186 @@ export async function runScheduler(options: RunSchedulerOptions = {}): Promise<S
   }
 
   return { stop: shutdown };
+}
+
+// ---------------------------------------------------------------------------
+// schedule tools (agent-invocable): list / add / update / remove
+//
+// Mirrors the file/skill local-tool pattern: `scheduleTools()` yields the
+// `OpenAiFunctionTool[]` merged into `runTurn`'s tool array; `callScheduleTool`
+// routes a named call to its handler and returns an MCP `CallToolResult`;
+// `scheduleSystemBlock()` is appended to the agent's system prompt. The model
+// references jobs by their *full* UUID id.
+// ---------------------------------------------------------------------------
+
+/** One line per job in `schedule_list`'s output. Full id (unambiguous). */
+function scheduleListText(jobs: ScheduleJob[]): string {
+  if (jobs.length === 0) {
+    return (
+      "no scheduled jobs yet. Use `schedule_add` with a 5-field cron `expr` and a " +
+      "`prompt` to create one."
+    );
+  }
+  const lines = jobs.map((j) => {
+    const last = j.lastRun
+      ? `last: ${j.lastRun.slice(0, 16)} (${j.lastStatus})`
+      : "last: none yet";
+    return `  - id=${j.id}\n    expr="${j.expr}" prompt="${j.prompt}" ${last}`;
+  });
+  return `${jobs.length} job(s):\n${lines.join("\n")}`;
+}
+
+/** The OpenAI function-calling definitions for the schedule tools. */
+export function scheduleTools(): OpenAiFunctionTool[] {
+  const cron =
+    "a standard 5-field cron expression: minute hour day-of-month month day-of-week " +
+    "(e.g. `0 9 * * *` = daily at 9:00, `*/5 * * * *` = every 5 minutes)";
+  return [
+    {
+      type: "function",
+      function: {
+        name: "schedule_list",
+        description:
+          "List all scheduled jobs with their full UUID id, cron expression, prompt, " +
+          "and last-run/status. Returns 'no scheduled jobs yet' when there are none. " +
+          "Use when the user asks what is scheduled. The full id shown here is needed " +
+          "by `schedule_update` and `schedule_remove`.",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "schedule_add",
+        description:
+          "Create a new scheduled job. Each match of the cron expression fires the " +
+          "prompt through the agent exactly like a manual `slask-client --prompt` one-shot " +
+          "run. Use when the user asks to set up a recurring task or reminder. Returns " +
+          "the new job's full id.",
+        parameters: {
+          type: "object",
+          properties: {
+            expr: { type: "string", description: cron },
+            prompt: { type: "string", description: "the prompt text to run on each firing" },
+          },
+          required: ["expr", "prompt"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "schedule_update",
+        description:
+          "Change an existing scheduled job by its full UUID id (as shown by `schedule_list`). " +
+          "Provide the new cron `expr` and/or the new `prompt`; at least one is required. " +
+          "Returns the updated job.",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "the full job UUID id from `schedule_list`" },
+            expr: { type: "string", description: "new 5-field cron expression" },
+            prompt: { type: "string", description: "new prompt text" },
+          },
+          required: ["id"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "schedule_remove",
+        description:
+          "Delete a scheduled job by its full UUID id (as shown by `schedule_list`). " +
+          "Returns a confirmation.",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "the full job UUID id to remove" },
+          },
+          required: ["id"],
+        },
+      },
+    },
+  ];
+}
+
+/**
+ * Router used by the agent loop: dispatches a named schedule tool to its handler
+ * and wraps the outcome in MCP's `CallToolResult` shape. Unknown names, invalid cron
+ * expressions, empty/unknown ids, and fs errors throw — `runAgentTurn` feeds any
+ * throw back to the model as `ERROR calling <name>: <message>`, so a bad cron or
+ * unknown id is a recoverable step, not a crash.
+ */
+export async function callScheduleTool(
+  name: string,
+  args: Record<string, unknown>,
+): Promise<CallToolResult> {
+  switch (name) {
+    case "schedule_list": {
+      const text = scheduleListText(await listJobs());
+      return { isError: false, content: [{ type: "text", text }] };
+    }
+    case "schedule_add": {
+      const expr = String(args.expr ?? "").trim();
+      const prompt = String(args.prompt ?? "").trim();
+      if (expr === "" || prompt === "") {
+        throw new Error("`expr` (cron) and `prompt` are both required");
+      }
+      const job = await addJob(expr, prompt);
+      const text =
+        `added job ${job.id} — expr="${job.expr}": ${job.prompt} (fires each match ` +
+        "of the cron expression while the `slask-client schedule` daemon is running)";
+      return { isError: false, content: [{ type: "text", text }] };
+    }
+    case "schedule_update": {
+      const id = String(args.id ?? "").trim();
+      if (id === "") {
+        throw new Error("`id` is required (see `schedule_list`)");
+      }
+      const exprOpt =
+        typeof args.expr === "string" && args.expr.trim() !== ""
+          ? args.expr.trim()
+          : undefined;
+      const promptOpt =
+        typeof args.prompt === "string" && args.prompt.trim() !== ""
+          ? args.prompt.trim()
+          : undefined;
+      const job = await updateJob(id, { expr: exprOpt, prompt: promptOpt });
+      const text = `updated job ${job.id} — expr="${job.expr}": ${job.prompt}`;
+      return { isError: false, content: [{ type: "text", text }] };
+    }
+    case "schedule_remove": {
+      const id = String(args.id ?? "").trim();
+      if (id === "") {
+        throw new Error("`id` is required (see `schedule_list`)");
+      }
+      const jobs = await listJobs();
+      const match = jobs.find((j) => j.id === id);
+      if (match === undefined) {
+        const avail = jobs.map((j) => j.id).join(", ");
+        throw new Error(`no job with id ${id} (available: ${avail ? avail : "none"})`);
+      }
+      await removeJob(match.id);
+      const text = `removed job ${match.id} (expr="${match.expr}")`;
+      return { isError: false, content: [{ type: "text", text }] };
+    }
+    default:
+      throw new Error("unknown schedule tool " + JSON.stringify(name));
+  }
+}
+
+/** The system-prompt paragraph advertising the schedule tools (always available). */
+export function scheduleSystemBlock(): string {
+  return (
+    "\n\nSchedule management: you have built-in schedule tools — `schedule_list` " +
+    "(list jobs, with each job's full UUID id), `schedule_add` (create a job: a 5-field " +
+    "cron expression plus a prompt), `schedule_update` (change a job by its full id, " +
+    "providing the new expr and/or prompt), and `schedule_remove` (delete a job by id). " +
+    "Each cron match fires the prompt through the agent exactly like a manual " +
+    "`slask-client --prompt` one-shot run. Jobs only fire while the `slask-client schedule` " +
+    "daemon is running; changes to a job take effect within ~15 s without a restart. " +
+    "When the user asks for a reminder or recurring task, convert the requested time " +
+    "into a standard 5-field cron expression (e.g. '9am daily' -> `0 9 * * *`)."
+  );
 }

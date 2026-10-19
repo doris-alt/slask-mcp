@@ -353,6 +353,22 @@ You can also manage jobs from the interactive REPL — type `/schedule add
 first 5 whitespace-separated fields and everything after field 5 is the
 prompt (case preserved).
 
+**The model can manage schedules too.** Beyond the CLI and REPL, the agent can
+create, change, list, and delete scheduled jobs directly through four always
+available tools, so you can just ask in plain language:
+
+- `schedule_list` — lists all jobs with their full UUID ids, cron expr, and
+  prompt. Use the id the tool gives you to reference a job unambiguously.
+- `schedule_add` — creates a job from a 5-field cron expr and a prompt
+  (e.g. "remind me to check the deploy log every morning at 9").
+- `schedule_update` — changes an existing job by id, taking a new expr and/or
+  a new prompt (e.g. "change that to 10am").
+- `schedule_remove` — deletes a job by id.
+
+The model references jobs by their **full UUID** (exactly as `schedule_list`
+prints it), not a short prefix. Note that the REPL's `/schedule` supports only
+`add` / `list` / `rm`; editing a job goes through `schedule_update`.
+
 **Running the daemon.** The daemon runs in the foreground and fires jobs only
 while the process is alive. Ctrl+C stops it cleanly — it lets any in-flight
 run finish (hard-killing after a 10 s grace) and exits 0:
@@ -378,8 +394,10 @@ nohup slask-client schedule >/var/log/sched.log 2>&1 &
   and jobs fire only while the daemon process is running. There is no
   built-in self-start; keep the daemon alive (tmux, systemd, a terminal, …).
 - **Live management.** The jobs file is re-read every 15 s
-  (`SLASK_SCHEDULE_POLL_S`), so a live `add` / `rm` takes effect within one
-  poll — no daemon restart needed.
+  (`SLASK_SCHEDULE_POLL_S`), so a live `add` / `rm` / `update` takes effect
+  within one poll — no daemon restart needed. Changing a running job's cron
+  expression reschedules it immediately; a changed prompt is picked up on the
+  next firing.
 - **Serialized runs.** At most one run at a time, queued FIFO, so a slow or
   hung firing can't starve the others or pile up unbounded.
 - **Per-run timeout.** Each run has a 30 min default timeout
