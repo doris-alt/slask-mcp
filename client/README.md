@@ -167,13 +167,15 @@ slask-agent >
 
 ### REPL commands
 
-| Command| What it does                                  |
-|--------|-----------------------------------------------|
-| /help  | show REPL help                                |
-| /tools | list all tools (across every connected server)|
-| /skills | list local skills (./skills/)                 |
-| /reset | clear the conversation history                |
-| /quit  | exit the REPL (or /exit, /q, Ctrl+C)          |
+| Command   | What it does                                  |
+|-----------|-----------------------------------------------|
+| /help     | show REPL help                                |
+| /tools    | list all tools (across every connected server)|
+| /skills   | list local skills (./skills/)                 |
+| /reset    | clear the conversation history                |
+| /compact  | summarize the conversation, reclaiming context|
+| /schedule | manage scheduled jobs (`add` / `list` / `rm`) |
+| /quit     | exit the REPL (or /exit, /q, Ctrl+C)          |
 
 ### One-shot prompts
 
@@ -344,6 +346,12 @@ slask-client schedule list
 # Remove a job by full id or a unique id prefix.
 slask-client schedule rm <id>
 ```
+
+You can also manage jobs from the interactive REPL — type `/schedule add
+<expr> <prompt>`, `/schedule list`, or `/schedule rm <id>` at the `slask-agent
+>` prompt. Because the REPL has no shell quoting, the cron expression is the
+first 5 whitespace-separated fields and everything after field 5 is the
+prompt (case preserved).
 
 **Running the daemon.** The daemon runs in the foreground and fires jobs only
 while the process is alive. Ctrl+C stops it cleanly — it lets any in-flight
