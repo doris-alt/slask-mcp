@@ -343,17 +343,22 @@ or `slask-client -C ~/proj ralph run …`. Prefer this when the run must start r
 ## 11. Quick reference
 
 ```text
-slask-client [-C <dir>] ralph init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>] [--max N]
+slask-client [-C <dir>] ralph init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>] [--max N] [--context <tokens>] [--tool-budget <n>]
 slask-client [-C <dir>] ralph spec <name> <file>        replace the project description
-slask-client [-C <dir>] ralph add <name> <title> [--criteria "a;b;c"]
+slask-client [-C <dir>] ralph add <name> <title> [--criteria "a;b;c"]     (warns if the task looks too coarse)
+slask-client [-C <dir>] ralph split <name> <task-id>    have the model replace a too-big task with 2-4 smaller ones
 slask-client [-C <dir>] ralph run <name> [--max N]      foreground
 slask-client [-C <dir>] ralph start|stop <name>         background
 slask-client [-C <dir>] ralph status [name] | list
 chat:   /ralph list | status <n> | init <n> [mode] [spec-file] | spec <n> <file> | check <n> <cmd...>
                 | plan <n> [mode] [goal...] | add <n> <title...> | start <n> | stop <n>      (positional; flags are CLI-only)
 tools:  ralph_list ralph_status ralph_create ralph_add_task ralph_configure ralph_note ralph_start ralph_stop   (chat)
-        ralph_note ralph_complete_task run_command                                    (worker iterations)
-        ralph_verdict                                                                 (research checker)
-env:    SLASK_MAX_TOOL_ITERATIONS (40 in runs)  SLASK_MAX_TOKENS (4096 in runs)  SLASK_RUN_COMMAND_TIMEOUT_S (300)
-        SLASK_SCHEDULE_TIMEOUT_S (1800)  SLASK_SCHEDULE_POLL_S (15)
+        ralph_status ralph_add_task ralph_note ralph_complete_task ralph_split_task run_command                  (worker iterations)
+        ralph_status ralph_verdict                                                                              (research checker)
+        ralph_status ralph_split_task                                                                           (splitter pass)
+        (ralph_add_task / ralph_create / ralph_split_task reject tasks that are too coarse)
+config: .slask-ralph/<name>/config.json: check commit maxIterations timeoutS maxFailures allow outputDir contextTokens toolBudget
+env:    SLASK_MAX_TOOL_ITERATIONS, SLASK_MAX_TOKENS, SLASK_CONTEXT_CHARS, SLASK_MAX_TOOL_RESULT_CHARS
+          (in runs: derived from toolBudget/contextTokens, 25 calls / ~32000 tokens by default; env overrides)
+        SLASK_RUN_COMMAND_TIMEOUT_S (300)  SLASK_SCHEDULE_TIMEOUT_S (1800)  SLASK_SCHEDULE_POLL_S (15)
 ```
