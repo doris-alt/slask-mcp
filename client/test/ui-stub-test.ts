@@ -28,6 +28,7 @@ import {
   runTurn,
   summarizeHistory,
   replaceHistoryWithSummary,
+  slashCompletions,
 } from "../ui.js";
 import type { ChatState } from "../ui.js";
 import { mcpToolsToOpenai } from "../agent.js";
@@ -500,6 +501,85 @@ try {
     console.log(
       "PASS test7c — summarizeHistory model throws -> null, history unchanged"
     );
+  }
+
+  // ---- Test 8: slashCompletions — the readline tab-completer for the REPL --
+  //   Pure function, no TTY needed. Expected values mirror readline's
+  //   first-Tab (insert the common-prefix extension) / second-Tab (print
+  //   the list) algorithm, where the 2nd array entry is the text the
+  //   algorithm replaces/extends.
+  {
+    const assertPairs = (
+      line: string,
+      expected: [string[], string],
+      label: string,
+    ): void => {
+      const [cand, completeOn] = slashCompletions(line);
+      assert(
+        JSON.stringify(cand) === JSON.stringify(expected[0]),
+        `${label}: candidates ${JSON.stringify(cand)}`
+      );
+      assert(completeOn === expected[1], `${label}: completeOn ${JSON.stringify(completeOn)}`);
+    };
+
+    const allTop = [
+      "help", "tools", "skills", "reset", "clear",
+      "compact", "summarize", "schedule", "ralph",
+      "quit", "exit",
+    ];
+    const scheduleSubs = ["add", "list", "rm"];
+    const ralphSubs = [
+      "add", "init", "list", "plan", "start", "status", "stop",
+    ];
+
+    // No hint for plain text or an empty line.
+    assertPairs("what time is it?", [[], ""], "plain text");
+    assertPairs("", [[], ""], "empty");
+    assertPairs("   ", [[], ""], "whitespace");
+
+    // Bare "/" → full top-level list, empty completeOn (second Tab prints it).
+    assertPairs("/", [allTop, ""], "bare /");
+
+    // Single-token top-level: unique prefix auto-completes; aliases resolve
+    // to full names.
+    assertPairs("/sch", [["schedule"], "sch"], "/sch");
+    assertPairs("/h", [["help"], "h"], "/h");
+    assertPairs("/qu", [["quit"], "qu"], "/qu");
+    assertPairs("/t", [["tools"], "t"], "/t");
+    // Ambiguous prefix: both "reset" and "ralph" start with "r" -> no auto-insert,
+    // second Tab lists both.
+    assertPairs("/r", [allTop.filter((c) => c.startsWith("r")), "r"], "/r ambiguous");
+    assertPairs("/s", [allTop.filter((c) => c.startsWith("s")), "s"], "/s ambiguous");
+    assertPairs("/HEL", [["help"], "HEL"], "/HEL uppercase");
+    assertPairs("/unknown", [allTop, "unknown"], "/unknown no-hit fallback");
+
+    // /schedule subcommand completion.
+    assertPairs("/schedule a", [["add"], "a"], "/schedule a");
+    assertPairs("/schedule l", [["list"], "l"], "/schedule l");
+    assertPairs("/schedule rm", [["rm"], "rm"], "/schedule rm");
+    // Single token -> top-level path: filter all 11 by the typed word, so the
+    // fully-typed command yields just itself (already complete).
+    assertPairs("/schedule", [["schedule"], "schedule"], "/schedule alone -> self");
+    assertPairs("/schedule xyz", [scheduleSubs, "xyz"], "/schedule xyz no-hit fallback");
+    assertPairs("/SCHEDULE a", [["add"], "a"], "/SCHEDULE a case-insensitive first token");
+
+    // /ralph subcommand completion.
+    // "st" matches start/status/stop (three) -> no unique extension; second Tab
+    // lists all three in array order.
+    assertPairs(
+      "/ralph st",
+      [ralphSubs.filter((c) => c.startsWith("st")), "st"],
+      "/ralph st ambiguous",
+    );
+    assertPairs("/ralph li", [["list"], "li"], "/ralph li");
+    assertPairs("/ralph", [["ralph"], "ralph"], "/ralph alone -> self");
+    assertPairs("/ralph xyz", [ralphSubs, "xyz"], "/ralph xyz no-hit fallback");
+
+    // Unknown second token → no hint.
+    assertPairs("/foo bar", [[], ""], "/foo bar");
+    assertPairs("/schedule add", [["add"], "add"], "/schedule add exact");
+
+    console.log("PASS test8 — slashCompletions top-level + /schedule + /ralph");
   }
 
   console.log("\nALL UI STUB TESTS PASSED");

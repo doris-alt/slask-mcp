@@ -166,6 +166,9 @@ const REPLY_HELP = [
   "  /ralph    plan/run autonomous Ralph loops (coding or research); /ralph alone for help",
   "  /quit     (or /exit, /q, or Ctrl+C) leave the REPL",
   "",
+  "Tip: while typing a slash command, press Tab to auto-complete;",
+  "press Tab again for the full list of available commands.",
+  "",
   "Otherwise, just type a request. Examples:",
   "  what time is it?",
   "  echo the word hello",
@@ -254,6 +257,57 @@ export function parseScheduleCmd(line: string): ScheduleParse | null {
     return { kind: "rm", ref: parts[2] };
   }
   return { kind: "help" }; // unknown subcommand -> help
+}
+
+// ---------------------------------------------------------------------------
+// slash-command hints — readline's `completer` option (Tab-driven).
+//
+// node:readline has no live on-keystroke hint display; its completer is the
+// only supported mechanism (and the only one without a TUI dependency). It
+// runs on each Tab: if all candidates share a prefix that extends the typed
+// word, the rest is inserted; otherwise a second Tab prints the full list.
+// The completer must always return a 2-element array.
+// ---------------------------------------------------------------------------
+const SLASH_COMMANDS = [
+  "help", "tools", "skills", "reset", "clear",
+  "compact", "summarize", "schedule", "ralph",
+  "quit", "exit",
+];
+// Kept in sync with parseScheduleCmd (below) and the /schedule help text.
+const SCHEDULE_SUBCOMMANDS = ["add", "list", "rm"];
+// Kept in sync with parseRalphCmd in ralph.ts.
+const RALPH_SUBCOMMANDS = [
+  "add", "init", "list", "plan", "start", "status", "stop",
+];
+
+export function slashCompletions(line: string): [string[], string] {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("/")) return [[], ""];
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  const first = parts[0];
+  const last = parts[parts.length - 1];
+
+  let candidates: string[];
+  let completeOn: string;
+  if (parts.length === 1) {
+    candidates = SLASH_COMMANDS;
+    // Strip the slash from completeOn so readline's replace branch never
+    // rewrites the leading `/` of the line.
+    completeOn = first.replace(/^\//, "");
+  } else if (first.toLowerCase() === "/schedule") {
+    candidates = SCHEDULE_SUBCOMMANDS;
+    completeOn = last;
+  } else if (first.toLowerCase() === "/ralph") {
+    candidates = RALPH_SUBCOMMANDS;
+    completeOn = last;
+  } else {
+    return [[], ""];
+  }
+
+  const q = completeOn.toLowerCase();
+  const hits = candidates.filter((c) => c.startsWith(q));
+  // No hit → fall back to the full set so a second Tab still shows a hint.
+  return [hits.length ? hits : candidates, completeOn];
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +413,11 @@ export function printBanner(state: ChatState, interactive: boolean): void {
   }
   if (interactive) {
     console.log(
-      color("dim", "\nType a request (e.g. 'what time is it?'), or /help for commands.\n")
+      color(
+        "dim",
+        "\nType a request (e.g. 'what time is it?') or /help for commands. " +
+        "Press Tab while typing a slash command for hints.\n"
+      )
     );
   }
 }
@@ -540,7 +598,13 @@ export async function startChat({
   openai?: InstanceType<typeof OpenAI>;
 }): Promise<void> {
   const state = await buildChatState({ registry, model, base, openai });
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    // Tab hints for slash commands (top-level and /schedule + /ralph
+    // subcommands); see slashCompletions for the readline contract.
+    completer: slashCompletions,
+  });
   const spinner = new Spinner();
   const history: ConversationMessage[] = [];
   let exited = false;
