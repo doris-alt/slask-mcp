@@ -138,8 +138,10 @@ server it came from. The model sees only the namespaced names, so there is no am
 
 **Best-effort connect.** Each server is connected independently. A server that fails to
 connect (bad URL, token, command not found, timeout) is reported on stderr with a hint
-and then skipped; the other servers keep working. The CLI exits with code 1 only when
-**no** servers could be reached.
+and then skipped; the other servers keep working. No reachable — or even absent — server
+is *not* fatal: with zero reachable MCP servers the client still starts and offers its
+built-in file/schedule tools and local skills, so it always launches. Per-server
+warnings are printed once on stderr, before the command runs.
 
 ## Interactive agent chat
 
@@ -462,7 +464,13 @@ not crash.
 
 Errors go to stderr; the process exits non-zero. Common ones:
 
-- `no MCP servers could be reached` — every server failed to connect (all best-effort
-  warnings were shown first).
-- `tool not found` — the named tool is not exposed by any connected server (run `list`).
+- `tool not found` — the named tool is not exposed by any connected server (run
+  `list`). This is also what you see from `call` when no MCP servers are configured
+  (the built-in file/schedule/skill tools are the only options, so a missing MCP
+  tool name is a genuine not-found).
+- `config error: …` — the `mcp.json`/`--config` file is missing (when explicitly named),
+  has invalid JSON, or a server entry is malformed.
+
+Unreachable servers are never fatal; they are reported as warnings (shown above) and the
+client continues with whatever servers did connect plus the built-in tools.
 
