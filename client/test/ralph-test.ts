@@ -14,6 +14,12 @@ import { join } from "node:path";
 
 import {
   addTask,
+  lastLine,
+  limitsOf,
+  lintTask,
+  planPrompt,
+  ralphChildEnv,
+  splitTask,
   callRalphTool,
   checkerPrompt,
   createRun,
@@ -39,6 +45,10 @@ import {
 } from "../ralph.js";
 import type { AgentRunArgs, ExecResult } from "../ralph.js";
 import { parse } from "../cli.js";
+import { Writable } from "node:stream";
+import { capText, pruneMessages } from "../agent.js";
+import { Spinner } from "../ui.js";
+import type { ConversationMessage } from "../types.js";
 
 const ENV_KEYS = [
   "SLASK_RALPH_DIR", "SLASK_RALPH_NAME", "SLASK_RALPH_ROLE", "SLASK_RALPH_TASK", "SLASK_RALPH_ALLOW",
@@ -52,7 +62,8 @@ async function tmp(): Promise<string> {
 
 // Run `fn` with the child's env applied to this process (the ralph tools read it).
 async function asChild<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<T> {
-  const saved = ENV_KEYS.map((k) => [k, process.env[k]] as const);
+  const keys = [...new Set([...ENV_KEYS, ...Object.keys(env)])];
+  const saved = keys.map((k) => [k, process.env[k]] as const);
   Object.assign(process.env, env);
   try {
     return await fn();
@@ -401,7 +412,7 @@ async function main(): Promise<void> {
     const planFn = async (name: string, prompt: string): Promise<number> => {
       seen = prompt;
       await asChild({ SLASK_RALPH_NAME: name }, async () => {
-        await callRalphTool(base, "ralph_add_task", { title: "cart model", acceptanceCriteria: ["npm test passes"] });
+        await callRalphTool(base, "ralph_add_task", { title: "cart model", acceptanceCriteria: ["npm test passes", "model file exists"] });
       });
       return 0;
     };
@@ -418,6 +429,173 @@ async function main(): Promise<void> {
     assert.equal(await handleRalphCli({ positional: ["ralph", "spec", "auto", "prd2.md"] }, base), 0);
     assert.equal(await readFile(join(base, ".slask-ralph/auto/spec.md"), "utf8"), "# Shop v2\n");
     console.log("PASS test13 — /ralph init/spec/check/plan (positional), init --spec --plan (headless CLI), spec replace");
+    await rm(base, { recursive: true, force: true });
+  }
+
+  // -- test14: agent context control: result cap + history pruning; quiet spinner ---
+  {
+    assert.equal(capText("abc", 0), "abc");
+    assert.equal(capText("abc", 10), "abc");
+    const c = capText("x".repeat(100), 10);
+    assert.ok(c.startsWith("x".repeat(10)) && c.includes("truncated 90 of 100 chars"));
+    const call = (id: string): ConversationMessage => ({
+      role: "assistant", content: null,
+      tool_calls: [{ id, type: "function", function: { name: "f", arguments: "{}" } }],
+    });
+    const msgs: ConversationMessage[] = [
+      { role: "system", content: "s" }, { role: "user", content: "u" },
+      call("1"), { role: "tool", tool_call_id: "1", content: "A".repeat(1000) },
+      call("2"), { role: "tool", tool_call_id: "2", content: "B".repeat(1000) },
+      call("3"), { role: "tool", tool_call_id: "3", content: "C".repeat(1000) },
+      call("4"), { role: "tool", tool_call_id: "4", content: "D".repeat(1000) },
+    ];
+    assert.equal(pruneMessages(msgs, 0), msgs, "budget 0 = off");
+    assert.equal(pruneMessages(msgs, 100000), msgs, "under budget = untouched");
+    const pr = pruneMessages(msgs, 2500);
+    const tool = (i: number) => (pr[i] as { content: string }).content;
+    assert.ok(tool(3).includes("removed") && tool(5).includes("removed"), "oldest tool outputs pruned");
+    assert.equal(tool(7), "C".repeat(1000), "last two tool outputs kept");
+    assert.equal(tool(9), "D".repeat(1000));
+    assert.equal(pr.length, msgs.length, "transcript structure preserved");
+    assert.equal((msgs[3] as { content: string }).content.length, 1000, "input not mutated");
+    // spinner stays silent when stdout is not a TTY (keeps ralph logs clean)
+    const chunks: string[] = [];
+    const out = new Writable({ write(b, _e, cb) { chunks.push(String(b)); cb(); } });
+    const sp = new Spinner(out);
+    sp.start("thinking…");
+    sp.stopDown();
+    assert.equal(chunks.join(""), "", "no spinner output off-TTY");
+    console.log("PASS test14 — tool-result cap, history pruning, quiet non-TTY spinner");
+  }
+
+  // -- test15: granularity lint, split tool, limits, plan prompt ----------------------
+  {
+    const coarse = { title: "Collect sources", description: "Save to findings/sources.md and findings/T1.md", acceptanceCriteria: ["lists at least 5 distinct source URLs", "covers 2025"] };
+    const ok2 = { title: "Find 2 sources on Mac mini", description: "short", acceptanceCriteria: ["findings/T1.md exists", "2 sources with dates"] };
+    assert.deepEqual(lintTask("research", ok2), []);
+    const probs = lintTask("research", coarse).join(" | ");
+    assert.match(probs, /output files/);
+    assert.match(probs, /5\+ items/);
+    assert.ok(lintTask("code", { title: "x", acceptanceCriteria: ["a"] }).some((p) => /at least 2/.test(p)));
+    assert.ok(lintTask("code", { title: "x", acceptanceCriteria: ["a", "b", "c", "d", "e"] }).some((p) => /max 4/.test(p)));
+    assert.ok(lintTask("code", { title: "x", description: "y".repeat(601), acceptanceCriteria: ["a", "b"] }).some((p) => /max 600/.test(p)));
+    assert.ok(lintTask("code", { title: "x", acceptanceCriteria: ["10+ endpoints", "b"] }).length > 0);
+    assert.deepEqual(lintTask("code", { title: "x", acceptanceCriteria: ["at least 3 tests", "b"] }), []);
+
+    const base = await tmp();
+    await createRun(base, { name: "g", mode: "research", tasks: [] });
+    delete process.env.SLASK_RALPH_DIR;
+    await assert.rejects(callRalphTool(base, "ralph_add_task", { run: "g", ...coarse }), /too coarse for one iteration[\s\S]*Split these/);
+    assert.equal((await loadPrd(base, "g")).tasks.length, 0, "coarse task rejected, nothing added");
+    await callRalphTool(base, "ralph_add_task", { run: "g", ...ok2 });
+    await assert.rejects(callRalphTool(base, "ralph_create", { name: "g2", mode: "research", tasks: [coarse] }), /too coarse/);
+
+    // split: replaces the task, ids/priorities, depth cap, validation
+    await createRun(base, { name: "sp2", mode: "research", tasks: [{ title: "a" }, { title: "big" }, { title: "c" }] });
+    const subs = [ok2, { ...ok2, title: "Find 2 sources on NVIDIA" }];
+    const ids = await splitTask(base, "sp2", "T2", subs);
+    assert.deepEqual(ids, ["T2.1", "T2.2"]);
+    const after = await loadPrd(base, "sp2");
+    assert.deepEqual(after.tasks.map((x) => x.id), ["T1", "T2.1", "T2.2", "T3"]);
+    assert.equal(pickNext({ ...after, tasks: after.tasks.filter((x) => x.id !== "T1") })?.id, "T2.1");
+    assert.match(await readFile(join(base, ".slask-ralph/sp2/progress.txt"), "utf8"), /T2 big: SPLIT into T2\.1/);
+    await splitTask(base, "sp2", "T2.1", subs);
+    await assert.rejects(splitTask(base, "sp2", "T2.1.1", subs), /cannot be split further/);
+    await assert.rejects(splitTask(base, "sp2", "T3", [ok2]), /2 to 6/);
+    await assert.rejects(splitTask(base, "sp2", "T3", [coarse, ok2]), /too coarse/);
+    await assert.rejects(splitTask(base, "sp2", "nope", subs), /no task/);
+    // tool: only the current task, in worker role
+    await asChild({ SLASK_RALPH_DIR: "/x", SLASK_RALPH_ROLE: "worker", SLASK_RALPH_TASK: "T3" }, async () => {
+      await callRalphTool(base, "ralph_split_task", { run: "sp2", tasks: subs });
+    });
+    assert.ok((await loadPrd(base, "sp2")).tasks.some((x) => x.id === "T3.2"));
+    await asChild({ SLASK_RALPH_DIR: "/x", SLASK_RALPH_ROLE: "checker" }, async () => {
+      await assert.rejects(callRalphTool(base, "ralph_split_task", { tasks: subs }), /not available/);
+    });
+
+    // limits + env + configure + status + plan prompt
+    assert.deepEqual(limitsOf({}), { contextTokens: 32000, toolBudget: 25, contextChars: 80000, resultChars: 8000, maxTokens: 4096 });
+    assert.equal(limitsOf({ contextTokens: 8000 }).maxTokens, 2000);
+    const cfg = await loadConfig(base, "sp2");
+    assert.equal(cfg.contextTokens, 32000);
+    const env = ralphChildEnv("/d", "sp2", cfg, "worker", "T1");
+    assert.equal(env.SLASK_CONTEXT_CHARS, "80000");
+    assert.equal(env.SLASK_MAX_TOOL_RESULT_CHARS, "8000");
+    assert.equal(env.SLASK_MAX_TOOL_ITERATIONS, "25");
+    await callRalphTool(base, "ralph_configure", { run: "sp2", contextTokens: 16000, toolBudget: 12 });
+    const cfg2 = await loadConfig(base, "sp2");
+    assert.equal(cfg2.contextTokens, 16000);
+    assert.equal(ralphChildEnv("/d", "sp2", cfg2, "worker", "T1").SLASK_MAX_TOOL_ITERATIONS, "12");
+    await assert.rejects(callRalphTool(base, "ralph_configure", { run: "sp2", contextTokens: 10 }), /contextTokens/);
+    assert.match(await formatStatus(base, "sp2"), /limits: ~16000 tokens of context, 12 tool calls/);
+    const pp = planPrompt(await loadPrd(base, "sp2"), false, false, ".slask-ralph/sp2", cfg2);
+    assert.ok(pp.includes("~16000 tokens") && pp.includes("12 tool calls") && pp.includes("10-25 small tasks") && pp.includes("REJECTED"));
+    assert.ok(workerPrompt(await loadPrd(base, "sp2"), cfg2, after.tasks[0], ".slask-ralph/sp2", "ralph-sp2").includes("ralph_split_task"));
+    assert.equal(lastLine("a\n\u001b[31m  boom happened  \u001b[0m\n\n"), "boom happened");
+    console.log("PASS test15 — task lint, ralph_split_task, limits/env/configure, plan prompt sizing");
+    await rm(base, { recursive: true, force: true });
+  }
+
+  // -- test16: loop: out-of-budget worker -> automatic split (not a failure); real error in reason
+  {
+    const base = await tmp();
+    await createRun(base, { name: "as", mode: "research", maxFailures: 2, maxIterations: 6, tasks: [{ title: "big", acceptanceCriteria: ["a", "b"] }] });
+    const roles: string[] = [];
+    const small = (t: string) => ({ title: t, description: "d", acceptanceCriteria: ["x.md exists", "cites"] });
+    let n = 0;
+    const runAgentFn = async (a: AgentRunArgs): Promise<ExecResult> => {
+      const role = a.env.SLASK_RALPH_ROLE;
+      roles.push(`${role}:${a.env.SLASK_RALPH_TASK}`);
+      await asChild(a.env, async () => {
+        if (role === "splitter") {
+          await callRalphTool(base, "ralph_split_task", { tasks: [small("first half"), small("second half")] });
+        } else if (role === "checker") {
+          await callRalphTool(base, "ralph_verdict", { pass: true, reason: "ok" });
+        } else if (a.env.SLASK_RALPH_TASK === "T1") {
+          n++;
+        } else if (a.env.SLASK_RALPH_TASK) {
+          await callRalphTool(base, "ralph_complete_task", { summary: "done" });
+        }
+      });
+      if (role === "worker" && a.env.SLASK_RALPH_TASK === "T1") {
+        return { code: 1, output: "\u001b[31m  the response was cut off by the token limit — try a shorter prompt\u001b[0m\n" };
+      }
+      return ok();
+    };
+    const out = await runRalph({ base, name: "as", execFn: async () => ok(), runAgentFn, log: quiet, autoHandlers: false });
+    assert.equal(out.state, "done");
+    assert.deepEqual(roles.slice(0, 2), ["worker:T1", "splitter:T1"]);
+    const prd = await loadPrd(base, "as");
+    assert.deepEqual(prd.tasks.map((x) => [x.id, x.passes, x.failures ?? 0]), [["T1.1", true, 0], ["T1.2", true, 0]]);
+    assert.equal(n, 1, "the oversized task was attempted once, then split");
+
+    // a plain failure keeps the child's last output line in the reason
+    await createRun(base, { name: "pf", mode: "code", maxFailures: 1, tasks: [{ title: "t" }] });
+    const bad = async (): Promise<ExecResult> => ({ code: 2, output: "some\n  database exploded\n" });
+    const o2 = await runRalph({ base, name: "pf", execFn: async () => ok(), runAgentFn: bad, log: quiet, autoHandlers: false });
+    assert.equal(o2.state, "stuck");
+    assert.match((await loadPrd(base, "pf")).tasks[0].lastFailure ?? "", /last output: database exploded/);
+
+    // a failed automatic split falls back to a normal failure
+    await createRun(base, { name: "nf", mode: "code", maxFailures: 1, tasks: [{ title: "t" }] });
+    const tooBig = async (): Promise<ExecResult> => ({ code: 1, output: "stopped after 25 tool calls in one turn (safety cap)" });
+    const o3 = await runRalph({ base, name: "nf", execFn: async () => ok(), runAgentFn: tooBig, log: quiet, autoHandlers: false });
+    assert.equal(o3.state, "stuck");
+    assert.match((await loadPrd(base, "nf")).tasks[0].lastFailure ?? "", /automatic split failed/);
+
+    // manual `ralph split` through the CLI handler
+    await createRun(base, { name: "ms", mode: "code", tasks: [{ title: "huge" }] });
+    const agentFn = async (a: AgentRunArgs): Promise<ExecResult> => {
+      assert.equal(a.env.SLASK_RALPH_ROLE, "splitter");
+      assert.ok(a.prompt.includes("SPLITTER"));
+      await asChild(a.env, () => callRalphTool(base, "ralph_split_task", { tasks: [small("p1"), small("p2")] }));
+      return ok();
+    };
+    assert.equal(await handleRalphCli({ positional: ["ralph", "split", "ms", "T1"] }, base, { agentFn }), 0);
+    assert.deepEqual((await loadPrd(base, "ms")).tasks.map((x) => x.id), ["T1.1", "T1.2"]);
+    assert.equal(await handleRalphCli({ positional: ["ralph", "split", "ms", "T1.1"] }, base, { agentFn: async () => ok() }), 1);
+    assert.equal(parse(["ralph", "init", "x", "--context", "16000", "--tool-budget", "12"]).ralph.context, "16000");
+    console.log("PASS test16 — auto-split on out-of-budget iterations, real error in failure reason, ralph split CLI");
     await rm(base, { recursive: true, force: true });
   }
 

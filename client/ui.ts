@@ -114,6 +114,9 @@ export class Spinner {
   }
 
   start(label: string = "thinking…") {
+    // No animation when output is not a terminal (logs, pipes, scheduler and
+    // Ralph children): the repainted frames would bloat and garble the log.
+    if (!(this.out as { isTTY?: boolean }).isTTY) return;
     if (this.timer) return;
     this.label = label;
     this.i = 0;
@@ -129,6 +132,8 @@ export class Spinner {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    } else if (!(this.out as { isTTY?: boolean }).isTTY) {
+      return;
     }
     this.out.write(`\r${" ".repeat(this.padWidth() + 4)}\r`);
   }
@@ -138,6 +143,8 @@ export class Spinner {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    } else if (!(this.out as { isTTY?: boolean }).isTTY) {
+      return;
     }
     this.out.write(`\r${" ".repeat(this.padWidth() + 4)}\r\n`);
   }

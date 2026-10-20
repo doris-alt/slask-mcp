@@ -82,6 +82,11 @@ export interface RalphConfig {
    * workspace. Absent on runs created before this field: they used the hidden
    * run dir. */
   outputDir?: string;
+  /** The model's context window in tokens (default 32000). Sizes tool-output caps
+   * and history pruning for iterations, and tells planners how small tasks must be. */
+  contextTokens?: number;
+  /** Max tool calls per iteration (default 25). Exceeding it ends the iteration. */
+  toolBudget?: number;
 }
 
 export type RalphState = "running" | "done" | "stuck" | "max-iterations" | "stopped";
@@ -94,6 +99,29 @@ export interface RalphStatus {
 }
 
 export const STATE_DIR = ".slask-ralph";
+export const DEFAULT_CONTEXT_TOKENS = 32000;
+export const DEFAULT_TOOL_BUDGET = 25;
+export const MAX_SPLIT_DEPTH = 2; // T2 -> T2.1 -> T2.1.1, no further
+
+/** Per-iteration limits derived from a run's config (defaults for old configs). */
+export function limitsOf(cfg: Partial<RalphConfig>): {
+  contextTokens: number;
+  toolBudget: number;
+  contextChars: number;
+  resultChars: number;
+  maxTokens: number;
+} {
+  const contextTokens = cfg.contextTokens ?? DEFAULT_CONTEXT_TOKENS;
+  const toolBudget = cfg.toolBudget ?? DEFAULT_TOOL_BUDGET;
+  const contextChars = Math.floor(contextTokens * 2.5); // conservative chars/token (HTML/JSON-heavy output)
+  return {
+    contextTokens,
+    toolBudget,
+    contextChars,
+    resultChars: Math.max(2000, Math.floor(contextChars / 10)),
+    maxTokens: Math.min(4096, Math.max(512, Math.floor(contextTokens / 4))),
+  };
+}
 export const DEFAULT_ALLOW = [
   "git", "npm", "pnpm", "npx", "node", "tsc", "cargo", "python3", "make", "ls", "cat",
 ];
@@ -219,6 +247,8 @@ export interface ConfigureInput {
   description?: string;
   branchName?: string;
   maxIterations?: number;
+  contextTokens?: number;
+  toolBudget?: number;
 }
 
 /** Update a run's verifier/goal/branch/iteration cap (use while the run is stopped). */
@@ -243,7 +273,13 @@ export async function configureRun(base: string, name: string, c: ConfigureInput
     cfg.maxIterations = c.maxIterations;
     changed.push("maxIterations");
   }
-  if (changed.length === 0) throw new Error("nothing to change: give check, description, branchName and/or maxIterations");
+  for (const [k, v, min] of [["contextTokens", c.contextTokens, 2000], ["toolBudget", c.toolBudget, 3]] as const) {
+    if (v === undefined) continue;
+    if (!Number.isInteger(v) || v < min) throw new Error(`${k} must be an integer >= ${min}`);
+    cfg[k] = v;
+    changed.push(k);
+  }
+  if (changed.length === 0) throw new Error("nothing to change: give check, description, branchName, maxIterations, contextTokens and/or toolBudget");
   await saveConfig(base, name, cfg);
   await savePrd(base, prd);
   return changed;
@@ -314,6 +350,8 @@ export interface CreateRunInput {
   allow?: string[];
   /** Visible deliverables folder (default `ralph-<name>`). */
   outputDir?: string;
+  contextTokens?: number;
+  toolBudget?: number;
   /** Project description text; stored as spec.md in the run dir. */
   spec?: string;
   tasks?: NewTask[];
@@ -346,7 +384,12 @@ export async function createRun(base: string, input: CreateRunInput): Promise<Ra
     maxFailures: input.maxFailures ?? 3,
     allow: input.allow ?? DEFAULT_ALLOW,
     outputDir: validateOutputDir(input.outputDir ?? `ralph-${name}`),
+    contextTokens: input.contextTokens ?? DEFAULT_CONTEXT_TOKENS,
+    toolBudget: input.toolBudget ?? DEFAULT_TOOL_BUDGET,
   };
+  for (const [k, v, min] of [["contextTokens", config.contextTokens, 2000], ["toolBudget", config.toolBudget, 3]] as const) {
+    if (v === undefined || !Number.isInteger(v) || v < min) throw new Error(`${k} must be an integer >= ${min}`);
+  }
   await mkdir(join(dir, "iterations"), { recursive: true });
   await atomicWrite(join(dir, "config.json"), JSON.stringify(config, null, 2) + "\n");
   await savePrd(base, prd);
@@ -393,6 +436,66 @@ export async function listRuns(base: string): Promise<string[]> {
   } catch {
     return [];
   }
+}
+
+// -- task granularity ---------------------------------------------------------
+
+interface TaskLike {
+  title?: string;
+  description?: string;
+  acceptanceCriteria?: string[];
+}
+
+/**
+ * Problems that make a task too coarse for ONE small-context iteration
+ * (empty = fine). Heuristics, applied to model-authored tasks.
+ */
+export function lintTask(mode: RalphMode, t: TaskLike): string[] {
+  const probs: string[] = [];
+  const crit = (t.acceptanceCriteria ?? []).map((c) => String(c).trim()).filter(Boolean);
+  const desc = t.description ?? "";
+  if (crit.length < 2) probs.push("needs at least 2 concrete acceptance criteria");
+  if (crit.length > 4) probs.push(`has ${crit.length} acceptance criteria (max 4) — split the task`);
+  if (desc.length > 600) probs.push(`description is ${desc.length} chars (max 600) — it covers too much; split the task`);
+  const text = [t.title ?? "", desc, ...crit].join("\n");
+  if (mode === "research") {
+    const files = new Set((text.match(/[\w.\-/]+\.(?:md|txt|csv|json)\b/gi) ?? []).map((f) => f.toLowerCase()));
+    if (files.size > 1) probs.push(`names ${files.size} output files (${[...files].join(", ")}) — one task = one output file`);
+  }
+  const nums = [...text.matchAll(/\b(?:at least|minimum(?: of)?|min\.?|≥|>=)\s*(\d+)\b|\b(\d+)\s*\+|\b(\d+)\s+(?:distinct|different|separate|independent)\b/gi)]
+    .map((m) => Number(m[1] ?? m[2] ?? m[3]))
+    .filter((n) => n >= 4);
+  if (nums.length) probs.push(`asks for ${Math.max(...nums)}+ items — at most 3 per task; split by item/topic/source`);
+  return probs;
+}
+
+/** Throw (so the planning model sees it and retries) when any task is too coarse. */
+export function assertGranular(mode: RalphMode, tasks: TaskLike[], cfg: Partial<RalphConfig> = {}): void {
+  const lines = tasks.flatMap((t, i) => lintTask(mode, t).map((p) => `- task ${i + 1} "${t.title ?? ""}": ${p}`));
+  if (lines.length === 0) return;
+  const lim = limitsOf(cfg);
+  throw new Error(
+    `too coarse for one iteration (each gets ~${lim.contextTokens} tokens of context and ${lim.toolBudget} tool calls):\n` +
+      lines.join("\n") +
+      "\nSplit these into smaller tasks (one deliverable, 2-4 criteria, at most ~3 sources/files each) and call again.",
+  );
+}
+
+/** Replace task `id` with 2-6 smaller tasks (T2 -> T2.1, T2.2, ...); returns the new ids. */
+export async function splitTask(base: string, name: string, id: string, subs: NewTask[]): Promise<string[]> {
+  const prd = await loadPrd(base, name);
+  const i = prd.tasks.findIndex((t) => t.id === id);
+  if (i < 0) throw new Error(`no task ${id} in run "${name}"`);
+  const depth = id.split(".").length - 1;
+  if (depth >= MAX_SPLIT_DEPTH) throw new Error(`${id} was already split ${depth} times — it cannot be split further`);
+  if (subs.length < 2 || subs.length > 6) throw new Error("split into 2 to 6 smaller tasks");
+  assertGranular(prd.mode, subs, await loadConfig(base, name).catch(() => ({})));
+  const orig = prd.tasks[i];
+  const made = subs.map((s, k) => toTask({ ...s, id: `${id}.${k + 1}`, priority: orig.priority + (k + 1) / 100 }, k));
+  prd.tasks.splice(i, 1, ...made);
+  await savePrd(base, prd);
+  await appendProgress(base, name, `\n## ${new Date().toISOString()} — ${id} ${orig.title}: SPLIT into ${made.map((m) => `${m.id} ${m.title}`).join("; ")}`);
+  return made.map((m) => m.id);
 }
 
 // -- pid file / detached runs ------------------------------------------------
@@ -460,6 +563,10 @@ export async function formatStatus(base: string, name: string): Promise<string> 
   const sz = await specSize(base, name);
   if (sz !== null) lines.push(`  spec: ${STATE_DIR}/${name}/${SPEC_FILE} (${Math.max(1, Math.round(sz / 1024))} KB)`);
   if (cfg && prd.mode === "research") lines.push(`  output: ${outputDirOf(name, cfg)}/ (findings/, report.md)`);
+  if (cfg) {
+    const lim = limitsOf(cfg);
+    lines.push(`  limits: ~${lim.contextTokens} tokens of context, ${lim.toolBudget} tool calls per iteration`);
+  }
   if (cfg) lines.push(`  verifier: ${prd.mode === "code" ? cfg.check ?? "(none — trusts the worker's claim)" : "checker pass"}; max ${cfg.maxIterations} iterations`);
   if (st?.message) lines.push(`  note: ${st.message}`);
   for (const t of [...prd.tasks].sort((a, b) => a.priority - b.priority)) {
@@ -489,6 +596,7 @@ export function workerPrompt(prd: RalphPrd, cfg: RalphConfig, task: RalphTask, r
     `Run directory: ${relDir}/  (relative to the current directory)`,
     `Overall goal: ${prd.description || prd.name}`,
     specLine(relDir, hasSpec),
+    `Budget: this iteration has about ${limitsOf(cfg).toolBudget} tool calls and a ~${limitsOf(cfg).contextTokens}-token context. Tool outputs are truncated and old ones are dropped, so read only what you need, in small slices, and finish early.`,
     `Your task: ${task.id} — ${task.title}`,
     task.description ?? "",
     "Acceptance criteria:",
@@ -510,11 +618,13 @@ export function workerPrompt(prd: RalphPrd, cfg: RalphConfig, task: RalphTask, r
           "5. When — and only when — the work is done, call ralph_complete_task with a short summary. Do NOT edit prd.json and do NOT commit: the loop verifies and commits.",
         ]
       : [
-          `2. Research ONLY this task using the tools available to you. Write your findings to ${outDir}/findings/${task.id}.md (create the file with write_file): concrete facts, with source/provenance for each claim, organised to address every acceptance criterion explicitly. State uncertainty honestly; do not invent sources.`,
+          `2. Research ONLY this task using the tools available to you (read only the earlier findings you need from ${outDir}/findings/). Write your findings to ${outDir}/findings/${task.id}.md (create the file with write_file): concrete facts, with source/provenance for each claim, organised to address every acceptance criterion explicitly. State uncertainty honestly; do not invent sources.`,
           "3. Record reusable learnings (good sources, dead ends, terminology) with ralph_note.",
           "4. When — and only when — every criterion is addressed, call ralph_complete_task with a short summary. A separate checker will judge the findings file against the criteria. Do NOT edit prd.json.",
         ];
-  return [...head, ...body, ...retry].filter((l) => l !== "").join("\n");
+  const split =
+    "If you realise this task cannot be finished within the budget, do NOT push on: call ralph_split_task with 2-4 smaller tasks that together cover the whole task, then stop.";
+  return [...head, ...body, split, ...retry].filter((l) => l !== "").join("\n");
 }
 
 export function checkerPrompt(prd: RalphPrd, task: RalphTask, outDir: string, relDir = "", hasSpec = false): string {
@@ -540,14 +650,29 @@ export function synthesisPrompt(prd: RalphPrd, relDir: string, outDir: string, h
   ].filter((l) => l !== "").join("\n");
 }
 
+export function splitterPrompt(prd: RalphPrd, cfg: RalphConfig, task: RalphTask, relDir: string, outDir: string, hasSpec: boolean, why: string): string {
+  const lim = limitsOf(cfg);
+  return [
+    "You are the SPLITTER in a Ralph loop, with a fresh context. Do not do the task yourself.",
+    `Task ${task.id} — ${task.title} did not fit in one iteration (${why}). An iteration has only ~${lim.contextTokens} tokens of context and ${lim.toolBudget} tool calls.`,
+    task.description ?? "",
+    "Its acceptance criteria:",
+    criteriaText(task),
+    specLine(relDir, hasSpec),
+    prd.mode === "research" ? `Partial findings may exist in ${outDir}/findings/ (read_file) — do not redo work already there.` : "",
+    "Call ralph_split_task ONCE with 2-4 smaller tasks that together cover everything the original required. Each: one deliverable, 2-4 verifiable criteria, at most ~3 sources/files to consume, and a description (<600 chars) naming exactly what to do. Then stop.",
+  ].filter((l) => l !== "").join("\n");
+}
+
 /**
  * Prompt that makes the model draft a run's task list (PRD-style). Built in —
  * not a skill — because skills load from the workspace's ./skills/ and may be
  * absent. `interactive` (chat) lets it ask clarifying questions first;
  * headless (`ralph init --plan`) must decide alone and log its assumptions.
  */
-export function planPrompt(prd: RalphPrd, hasSpec: boolean, interactive: boolean, relDir: string): string {
+export function planPrompt(prd: RalphPrd, hasSpec: boolean, interactive: boolean, relDir: string, cfg: Partial<RalphConfig> = {}): string {
   const name = prd.name;
+  const lim = limitsOf(cfg);
   return [
     `Plan the tasks for the existing Ralph run "${name}" (mode: ${prd.mode}). Goal: ${prd.description || "(see the spec)"}`,
     hasSpec
@@ -557,8 +682,10 @@ export function planPrompt(prd: RalphPrd, hasSpec: boolean, interactive: boolean
       ? "If the problem, scope, success criteria or technical constraints are unclear, FIRST ask me 3-5 short clarifying questions, each with lettered options (A, B, C, D) so I can answer like '1A, 2C', and wait for my answers before adding tasks. If everything is already clear, skip the questions."
       : `You cannot ask questions in this mode: make reasonable assumptions and record each one with ralph_note (run "${name}"), prefixed "Assumption:".`,
     "Task rules:",
-    "- Each task must be completable in ONE fresh-context iteration; if it takes more than a couple of sentences to describe, split it. Order by dependency (schema -> backend -> UI; survey -> compare).",
-    "- Give each task 2-5 acceptance criteria that can be verified by running a command or inspecting a file — never 'works correctly'.",
+    `- SIZE: every iteration runs in a fresh context of only ~${lim.contextTokens} tokens with at most ${lim.toolBudget} tool calls (tool outputs are truncated), so it can read just a few pages/files. A task must fit comfortably: ONE deliverable (one output file), 2-4 acceptance criteria, at most ~3 sources/pages/files to consume. If a topic needs more, make several tasks (one per source, topic, option, model class, module...). Tasks that are too coarse are REJECTED by ralph_add_task and ralph_create (more than 4 criteria, '5+' / 'at least 4' of anything, several output files, a description over 600 chars).`,
+    "- COUNT: a goal with several questions normally becomes 10-25 small tasks, not 4-6. Split per question AND per option/source group; give each comparison table or summary its own task that reads earlier findings. When in doubt, split further.",
+    "- Example (research): instead of 'Collect 5+ sources on hardware' make 'Find 2 recent sources on Mac mini LLM speed', 'Find 2 recent sources on NVIDIA 4090/5090 LLM speed', 'Find 2 sources on AMD/other options', then 'Table: bandwidth and tokens/sec per option, from the earlier findings'.",
+    "- Order by dependency (schema -> backend -> UI; survey -> compare). Criteria must be verifiable by running a command or inspecting a file — never 'works correctly'.",
     hasSpec
       ? "- In each task's description, name the spec section(s)/requirements it implements and the files or areas involved, so the iteration reads only what it needs."
       : "",
@@ -640,6 +767,37 @@ const defaultExec = (cmd: string, cwd: string, timeoutMs: number): Promise<ExecR
     });
   });
 
+/** Env for an iteration child: role/task identity + context-window limits. */
+export function ralphChildEnv(
+  dir: string,
+  name: string,
+  cfg: RalphConfig,
+  role: "worker" | "checker" | "splitter",
+  taskId: string,
+): Record<string, string> {
+  const lim = limitsOf(cfg);
+  return {
+    SLASK_RALPH_DIR: dir,
+    SLASK_RALPH_NAME: name,
+    SLASK_RALPH_ROLE: role,
+    SLASK_RALPH_TASK: taskId,
+    SLASK_RALPH_ALLOW: cfg.allow.join(","),
+    SLASK_MAX_TOOL_ITERATIONS: process.env.SLASK_MAX_TOOL_ITERATIONS ?? String(lim.toolBudget),
+    SLASK_MAX_TOKENS: process.env.SLASK_MAX_TOKENS ?? String(lim.maxTokens),
+    SLASK_CONTEXT_CHARS: process.env.SLASK_CONTEXT_CHARS ?? String(lim.contextChars),
+    SLASK_MAX_TOOL_RESULT_CHARS: process.env.SLASK_MAX_TOOL_RESULT_CHARS ?? String(lim.resultChars),
+  };
+}
+
+/** Last non-empty line of a child's output, ANSI-stripped (the real error, if any). */
+export function lastLine(out: string): string {
+  const lines = out.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const l = lines[lines.length - 1] ?? "";
+  return l.length > 300 ? l.slice(0, 297) + "..." : l;
+}
+
+const TOO_BIG_RE = /token limit|safety cap|stopped after \d+ tool calls|context (?:window|length)|maximum context|exceed.*context/i;
+
 export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
   const base = opts.base ?? process.cwd();
   const name = validateName(opts.name);
@@ -686,15 +844,8 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
         },
       }));
 
-  const childEnv = (role: "worker" | "checker", task?: RalphTask): Record<string, string> => ({
-    SLASK_RALPH_DIR: dir,
-    SLASK_RALPH_NAME: name,
-    SLASK_RALPH_ROLE: role,
-    SLASK_RALPH_TASK: task?.id ?? "",
-    SLASK_RALPH_ALLOW: cfg.allow.join(","),
-    SLASK_MAX_TOOL_ITERATIONS: process.env.SLASK_MAX_TOOL_ITERATIONS ?? "40",
-    SLASK_MAX_TOKENS: process.env.SLASK_MAX_TOKENS ?? "4096",
-  });
+  const childEnv = (role: "worker" | "checker" | "splitter", task?: RalphTask): Record<string, string> =>
+    ralphChildEnv(dir, name, cfg, role, task?.id ?? "");
 
   let iteration = 0;
   const finish = async (state: RalphState, message?: string): Promise<RalphOutcome> => {
@@ -752,14 +903,34 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
       const after = await loadPrd(base, name);
       const t = after.tasks.find((x) => x.id === task.id);
       if (t === undefined) {
-        await appendProgress(base, name, `\n## ${new Date().toISOString()} — ${task.id} removed during iteration`);
+        await appendProgress(base, name, `\n## ${new Date().toISOString()} — ${task.id} was split or removed during the iteration`);
+        log(`  ↳ ${task.id} was split into smaller tasks`);
         continue;
       }
 
       let ok = false;
       let reason = "";
       if (t.claimed !== true) {
-        reason = `worker ended (exit ${w.code}) without calling ralph_complete_task`;
+        const tooBig = w.code === -1 || TOO_BIG_RE.test(w.output);
+        reason = `worker ended (exit ${w.code}) without calling ralph_complete_task${lastLine(w.output) ? ` — last output: ${lastLine(w.output)}` : ""}`;
+        // Ran out of context / tool budget / time: have a splitter break the task up.
+        if (tooBig && t.id.split(".").length - 1 < MAX_SPLIT_DEPTH) {
+          log(`  ⚠ ${t.id} did not fit in one iteration (${lastLine(w.output) || `exit ${w.code}`}) — splitting it`);
+          await runAgent({
+            prompt: splitterPrompt(after, cfg, t, relDir, outDir, hasSpec, lastLine(w.output) || `exit ${w.code}`),
+            env: childEnv("splitter", t),
+            timeoutMs: cfg.timeoutS * 1000,
+            logFile: join(dir, "iterations", `${nn}-split.log`),
+          });
+          current = null;
+          if (aborted) return await finish("stopped", "interrupted");
+          const reloaded = await loadPrd(base, name);
+          if (!reloaded.tasks.some((x) => x.id === t.id)) {
+            log(`  ↳ ${t.id} split into smaller tasks`);
+            continue;
+          }
+          reason += " (automatic split failed)";
+        }
       } else if (after.mode === "code") {
         if (cfg.check) {
           log(`  verifying: ${cfg.check}`);
@@ -942,22 +1113,24 @@ async function runCommand(base: string, command: string): Promise<string> {
 // tools (agent-invocable) — same pattern as schedule.ts
 // ---------------------------------------------------------------------------
 
-type Role = "chat" | "worker" | "checker";
+type Role = "chat" | "worker" | "checker" | "splitter";
 
 export function ralphRole(): Role {
   if (!process.env.SLASK_RALPH_DIR) return "chat";
-  return process.env.SLASK_RALPH_ROLE === "checker" ? "checker" : "worker";
+  const r = process.env.SLASK_RALPH_ROLE;
+  return r === "checker" || r === "splitter" ? r : "worker";
 }
 
 const ROLE_TOOLS: Record<Role, string[]> = {
   chat: ["ralph_list", "ralph_status", "ralph_create", "ralph_add_task", "ralph_configure", "ralph_note", "ralph_start", "ralph_stop"],
-  worker: ["ralph_status", "ralph_add_task", "ralph_note", "ralph_complete_task", "run_command"],
+  worker: ["ralph_status", "ralph_add_task", "ralph_note", "ralph_complete_task", "ralph_split_task", "run_command"],
   checker: ["ralph_status", "ralph_verdict"],
+  splitter: ["ralph_status", "ralph_split_task"],
 };
 
 export const RALPH_TOOL_NAMES = [
   "ralph_list", "ralph_status", "ralph_create", "ralph_add_task", "ralph_configure", "ralph_start", "ralph_stop",
-  "ralph_note", "ralph_complete_task", "ralph_verdict", "run_command",
+  "ralph_note", "ralph_complete_task", "ralph_split_task", "ralph_verdict", "run_command",
 ];
 
 const RUN_PROP = {
@@ -1011,6 +1184,8 @@ export function ralphTools(): OpenAiFunctionTool[] {
         description: { type: "string" },
         branchName: { type: "string" },
         maxIterations: { type: "number" },
+        contextTokens: { type: "number", description: "the model's context window in tokens (sizes tool-output caps and how small tasks must be)" },
+        toolBudget: { type: "number", description: "max tool calls per iteration" },
       },
       ["run"],
     ),
@@ -1022,6 +1197,12 @@ export function ralphTools(): OpenAiFunctionTool[] {
       "Claim that the current task is finished. The loop then verifies it (check command / checker); you cannot mark it passing yourself.",
       { summary: { type: "string", description: "what you did / where the results are" } },
       ["summary"],
+    ),
+    fn(
+      "ralph_split_task",
+      "Replace the CURRENT task with 2-6 smaller tasks that together cover it (use when it cannot be finished within the iteration budget). Then stop working.",
+      { run: RUN_PROP, tasks: { type: "array", items: taskSchema, description: "the smaller replacement tasks, in order" } },
+      ["tasks"],
     ),
     fn(
       "ralph_verdict",
@@ -1068,6 +1249,8 @@ export async function callRalphTool(
     case "ralph_status":
       return text(await formatStatus(base, resolveRun(args)));
     case "ralph_create": {
+      const newTasks = Array.isArray(args.tasks) ? (args.tasks as NewTask[]) : [];
+      assertGranular(((str(args.mode) || "code") as RalphMode), newTasks, {});
       const prd = await createRun(base, {
         name: str(args.name),
         mode: (str(args.mode) || "code") as RalphMode,
@@ -1082,11 +1265,14 @@ export async function callRalphTool(
       return text(`created ralph run "${prd.name}" [${prd.mode}] with ${prd.tasks.length} task(s). Start it with ralph_start (or \`slask-client ralph run ${prd.name}\`).`);
     }
     case "ralph_add_task": {
-      const t = await addTask(base, resolveRun(args), {
+      const run = resolveRun(args);
+      const nt: NewTask = {
         title: str(args.title),
         description: str(args.description) || undefined,
         acceptanceCriteria: Array.isArray(args.acceptanceCriteria) ? (args.acceptanceCriteria as string[]) : [],
-      });
+      };
+      assertGranular((await loadPrd(base, run)).mode, [nt], await loadConfig(base, run).catch(() => ({})));
+      const t = await addTask(base, run, nt);
       return text(`added ${t.id}: ${t.title}`);
     }
     case "ralph_configure": {
@@ -1096,6 +1282,8 @@ export async function callRalphTool(
         description: str(args.description) || undefined,
         branchName: str(args.branchName) || undefined,
         maxIterations: typeof args.maxIterations === "number" ? args.maxIterations : undefined,
+        contextTokens: typeof args.contextTokens === "number" ? args.contextTokens : undefined,
+        toolBudget: typeof args.toolBudget === "number" ? args.toolBudget : undefined,
       });
       return text(`updated ${run}: ${changed.join(", ")}`);
     }
@@ -1127,6 +1315,13 @@ export async function callRalphTool(
       t.notes = str(args.summary);
       await savePrd(base, prd);
       return text(`${id} claimed — the loop will verify it now; stop working.`);
+    }
+    case "ralph_split_task": {
+      const run = resolveRun(args);
+      const id = process.env.SLASK_RALPH_TASK ?? "";
+      if (id === "") throw new Error("no current task to split");
+      const ids = await splitTask(base, run, id, Array.isArray(args.tasks) ? (args.tasks as NewTask[]) : []);
+      return text(`${id} replaced by ${ids.join(", ")} — the loop will work on them next; stop now.`);
     }
     case "ralph_verdict": {
       const run = resolveRun(args);
@@ -1313,7 +1508,8 @@ export async function runRalphRepl(
         else if (p.goal && !(await loadPrd(base, p.name)).description) await configureRun(base, p.name, { description: p.goal });
         const prd = await loadPrd(base, p.name);
         const relDir = relative(base, runDir(base, p.name));
-        return { prompt: planPrompt(prd, (await specSize(base, p.name)) !== null, true, relDir) };
+        const cfg = await loadConfig(base, p.name).catch(() => ({}));
+        return { prompt: planPrompt(prd, (await specSize(base, p.name)) !== null, true, relDir, cfg) };
       }
     }
   } catch (e) {
@@ -1331,15 +1527,19 @@ export interface RalphCliArgs {
   out?: string;
   spec?: string;
   plan?: boolean;
+  context?: string;
+  toolBudget?: string;
 }
 
 const CLI_USAGE =
   "usage: slask-client ralph <init|add|run|start|stop|status|list> [name] — " +
-  "init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>]; spec <name> <file>; add <name> <title> [--criteria \"a;b\"]; " +
+  "init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>] [--context <tokens>] [--tool-budget <n>]; spec <name> <file>; split <name> <task-id>; add <name> <title> [--criteria \"a;b\"]; " +
   "run <name> [--max N]; start|stop <name>; status [name]; list";
 
 /** The `slask-client ralph …` subcommand. Returns the process exit code. */
 export interface RalphCliDeps {
+  /** Run a child agent (splitter) — default spawns this CLI. */
+  agentFn?: (a: AgentRunArgs) => Promise<ExecResult>;
   /** Run the headless planning prompt for `name`; resolves with an exit code. */
   planFn?: (name: string, prompt: string) => Promise<number>;
 }
@@ -1351,6 +1551,16 @@ const defaultPlanFn = async (name: string, prompt: string): Promise<number> =>
       env: { SLASK_RALPH_NAME: name },
     })
   ).code;
+
+const defaultAgentFn = async (a: AgentRunArgs): Promise<ExecResult> => {
+  await mkdir(join(a.env.SLASK_RALPH_DIR, "iterations"), { recursive: true });
+  return runCliChild(["--prompt", a.prompt, "--quiet", ...forwardArgs], {
+    timeoutMs: a.timeoutMs,
+    env: a.env,
+    capture: true,
+    onOutput: (c) => void appendFile(a.logFile, c).catch(() => {}),
+  });
+};
 
 export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd(), deps: RalphCliDeps = {}): Promise<number> {
   const [, sub, name] = a.positional;
@@ -1392,11 +1602,16 @@ export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd
         branchName,
         tasks,
         maxIterations: a.max ? Number.parseInt(a.max, 10) : undefined,
+        contextTokens: a.context ? Number.parseInt(a.context, 10) : undefined,
+        toolBudget: a.toolBudget ? Number.parseInt(a.toolBudget, 10) : undefined,
       });
+      if (a.from) {
+        for (const t of prd.tasks) for (const p of lintTask(prd.mode, t)) log(`⚠ ${t.id} "${t.title}": ${p}`);
+      }
       log(`created run "${prd.name}" [${prd.mode}] with ${prd.tasks.length} task(s) in ${STATE_DIR}/${prd.name}/${spec ? " (spec copied to spec.md)" : ""}`);
       if (a.plan) {
         log("planning tasks from the description (non-interactive)…");
-        const prompt = planPrompt(prd, spec !== undefined, false, relative(base, runDir(base, name)));
+        const prompt = planPrompt(prd, spec !== undefined, false, relative(base, runDir(base, name)), await loadConfig(base, name));
         const code = await (deps.planFn ?? defaultPlanFn)(name, prompt);
         log(await formatStatus(base, name));
         if (code !== 0) log(`⚠ planning exited with code ${code} — review the task list, or add tasks with \`ralph add\``);
@@ -1419,7 +1634,27 @@ export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd
         acceptanceCriteria: a.criteria ? a.criteria.split(";").map((s) => s.trim()).filter(Boolean) : [],
       });
       log(`added ${t.id}: ${t.title}`);
+      for (const p of lintTask((await loadPrd(base, name)).mode, t)) log(`⚠ ${t.id}: ${p}`);
       return 0;
+    }
+    case "split": {
+      const id = a.positional[3];
+      if (name === undefined || id === undefined) throw new Error(CLI_USAGE);
+      const prd = await loadPrd(base, name);
+      const task = prd.tasks.find((x) => x.id === id);
+      if (task === undefined) throw new Error(`no task ${id} in run "${name}"`);
+      const cfg = await loadConfig(base, name);
+      const dir = runDir(base, name);
+      const prompt = splitterPrompt(
+        prd, cfg, task, relative(base, dir), outputDirOf(name, cfg), (await specSize(base, name)) !== null,
+        task.lastFailure ?? "manual split requested",
+      );
+      const env = ralphChildEnv(dir, name, cfg, "splitter", id);
+      const r = await (deps.agentFn ?? defaultAgentFn)({ prompt, env, timeoutMs: cfg.timeoutS * 1000, logFile: join(dir, "iterations", `split-${id}.log`) });
+      const after = await loadPrd(base, name);
+      const done = !after.tasks.some((x) => x.id === id);
+      log(done ? `split ${id}:\n${await formatStatus(base, name)}` : `${id} was not split (exit ${r.code}); see ${STATE_DIR}/${name}/iterations/split-${id}.log`);
+      return done ? 0 : 1;
     }
     case "run": {
       if (name === undefined) throw new Error(CLI_USAGE);

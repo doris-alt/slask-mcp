@@ -115,6 +115,12 @@ Usage:
       --plan to have the model draft the task list from it (non-interactive).
   slask-client ralph spec <name> <file>
       Replace a run's project description.
+  slask-client ralph split <name> <task-id>
+      Have the model replace a task that is too big with 2-4 smaller ones.
+      (Also automatic when an iteration runs out of context/tool budget.)
+      init takes --context <tokens> (the model's context window, default
+      32000) and --tool-budget <n> (tool calls per iteration, default 25);
+      iterations are sized and truncated to fit them.
   slask-client ralph add <name> <title> [--criteria "a;b;c"]
       Append a task.
   slask-client ralph run <name> [--max N]
@@ -191,7 +197,7 @@ interface CliConfig {
   quiet: boolean;
   help: boolean;
   dir: string | null;
-  ralph: { mode?: string; check?: string; max?: string; from?: string; criteria?: string; out?: string; spec?: string; plan?: boolean };
+  ralph: { mode?: string; check?: string; max?: string; from?: string; criteria?: string; out?: string; spec?: string; plan?: boolean; context?: string; toolBudget?: string };
 }
 
 function fail(msg: string): never {
@@ -458,6 +464,10 @@ export function parse(argv: string[]): CliConfig {
       if (++i < argv.length) config.ralph.out = argv[i];
     } else if (f === "--spec") {
       if (++i < argv.length) config.ralph.spec = argv[i];
+    } else if (f === "--context") {
+      if (++i < argv.length) config.ralph.context = argv[i];
+    } else if (f === "--tool-budget") {
+      if (++i < argv.length) config.ralph.toolBudget = argv[i];
     } else if (f === "--plan") {
       config.ralph.plan = true;
     } else if (f === "--criteria") {

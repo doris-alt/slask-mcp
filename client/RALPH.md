@@ -76,7 +76,9 @@ MODEL=gpt-4o            # a stronger model than the default is recommended
   "timeoutS": 1800,
   "maxFailures": 3,
   "allow": ["git", "npm", "pnpm", "npx", "node", "tsc", "cargo", "python3", "make", "ls", "cat"],
-  "outputDir": "ralph-<name>"
+  "outputDir": "ralph-<name>",
+  "contextTokens": 32000,
+  "toolBudget": 25
 }
 ```
 
@@ -90,6 +92,34 @@ MODEL=gpt-4o            # a stronger model than the default is recommended
   Remove `node`/`npx`/`python3` if you want it tighter; add what your project needs (`go`, `pytest`, …).
 - `outputDir` (research): visible folder for findings and report; must be relative, no `..`,
   not under `.slask-ralph/`.
+- `contextTokens`: **the model's context window in tokens** (default 32000; set it to what
+  your server really allows, e.g. `ralph init x --context 16000`, or `ralph_configure`).
+  It sizes the per-iteration caps (see "Small tasks and the context window" below).
+- `toolBudget`: max tool calls per iteration (default 25).
+
+### Small tasks and the context window
+
+Every iteration starts with an empty context of only `contextTokens`, so a task has to be
+small enough to finish inside it. Four mechanisms enforce that:
+
+1. **Sizing rules in the planner.** `/ralph plan` and `--plan` tell the model the actual
+   limits and require tasks with one deliverable, 2-4 criteria and at most ~3 sources/files,
+   and expect 10-25 tasks for a multi-question goal, not 4-6.
+2. **Lint on model-authored tasks.** `ralph_add_task` / `ralph_create` / `ralph_split_task`
+   *reject* tasks with more than 4 criteria, fewer than 2, "at least 4"/"5+" of anything,
+   several output files (research), or a description over 600 chars. The rejection text goes
+   back to the model, which must split and retry. (`ralph add` and `--from` only warn.)
+3. **Context control inside iterations.** Each tool result is truncated to ~`contextTokens`/4
+   chars and, when the transcript nears the window, the oldest tool outputs are replaced by a
+   stub. A worker that realises it can't finish calls `ralph_split_task` itself.
+4. **Automatic split.** If an iteration ends without claiming the task because it ran out of
+   context, tool calls or time, the loop runs a splitter pass that replaces the task with 2-4
+   smaller ones (`T2` -> `T2.1`, `T2.2`; up to two levels). That is not counted as a failure.
+   You can also trigger it by hand: `slask-client ralph split <name> <task-id>`.
+
+If your model keeps dying with "cut off by the token limit", lower `contextTokens` (and/or
+`toolBudget`) rather than raising anything: smaller budgets mean smaller tasks and shorter
+tool output.
 
 ### `prd.json` shape
 
@@ -224,9 +254,11 @@ Only one loop per run is allowed (a pid lock); starting a second reports the pid
 
 Detached runs and iteration children inherit `--model`, `--base-url`, `--config`
 (and `--no-default`) from the command that launched them, and the workspace
-directory. Per-iteration limits default to 40 tool rounds and 4096 tokens per reply
-(`SLASK_MAX_TOOL_ITERATIONS`, `SLASK_MAX_TOKENS`); `run_command` times out after
-300 s (`SLASK_RUN_COMMAND_TIMEOUT_S`).
+directory. Per-iteration limits come from `config.json` (`toolBudget`, `contextTokens`;
+see above). The env vars `SLASK_MAX_TOOL_ITERATIONS`, `SLASK_MAX_TOKENS`,
+`SLASK_CONTEXT_CHARS` and `SLASK_MAX_TOOL_RESULT_CHARS` override them (they also work for
+normal chat, where they are off by default); `run_command` times out after 300 s
+(`SLASK_RUN_COMMAND_TIMEOUT_S`).
 
 ## 7. Watch it
 
@@ -296,7 +328,9 @@ or `slask-client -C ~/proj ralph run …`. Prefer this when the run must start r
 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
-| every iteration: "worker ended without calling ralph_complete_task" | model too weak, or hit the 40-round limit; use a better model (`MODEL`), raise `SLASK_MAX_TOOL_ITERATIONS`, or split the task |
+| every iteration: "worker ended … without calling ralph_complete_task — last output: …" | the reason now ends with the child's last output line. Usually the task is too big: it is split automatically, or run `ralph split <name> <id>`; set `contextTokens` to your model's real window; otherwise the model is too weak |
+| "the response was cut off by the token limit" | the context window filled up (or one reply hit max_tokens): lower `contextTokens`/`toolBudget`, and make tasks smaller |
+| planner keeps getting "too coarse for one iteration" | working as intended: it must split the task; if it loops, plan with a stronger model or add tasks by hand (`ralph add`, which only warns) |
 | `check … failed` repeatedly | the check really fails or needs tooling the machine lacks; run it by hand in the workspace |
 | `command "x" is not allowed` | add the program to `allow` in `config.json` |
 | `there is no shell` | the model tried `&&`/`|`; it must issue one command per `run_command` call (the loop's own `check` is run through a shell and may chain) |
