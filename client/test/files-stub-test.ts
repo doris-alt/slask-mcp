@@ -292,13 +292,13 @@ const disk = async (p: string): Promise<string> => readFile(p, "utf8");
 }
 
 // ---------------------------------------------------------------------------
-// 6. fileTools(): 3 tools, names, required arrays, non-empty descriptions ----
+// 6. fileTools(): 4 tools, names, required arrays, non-empty descriptions ----
 // ---------------------------------------------------------------------------
 {
   const tools = fileTools();
-  assert(tools.length === 3, String(tools.length));
+  assert(tools.length === 4, String(tools.length));
   const byName = new Map(tools.map((t) => [t.function.name, t]));
-  for (const n of ["read_file", "edit_file", "write_file"]) {
+  for (const n of ["read_file", "grep_file", "edit_file", "write_file"]) {
     assert(byName.has(n), n);
   }
   const req = (t: any) => JSON.stringify(t.function.parameters.required);
@@ -461,6 +461,32 @@ const disk = async (p: string): Promise<string> => readFile(p, "utf8");
   assert(/nothing to return/.test(textOf(rEmpty)), textOf(rEmpty));
 
   console.log("PASS test8 — range reads (substring, cap, remaining, empty, invalid, binary)");
+}
+
+// ---------------------------------------------------------------------------
+// 9. grep_file: matching lines only, context, caps, sandbox ------------------
+// ---------------------------------------------------------------------------
+{
+  const lines = Array.from({ length: 200 }, (_, i) => `line ${i + 1} ${i % 50 === 0 ? "NEEDLE here" : "filler"}`);
+  await writeFile(join(root, "big.txt"), lines.join("\n"));
+  const r = textOf(await callFileTool(root, "grep_file", { path: "big.txt", pattern: "needle" }));
+  assert(/big\.txt: 4 matching lines of 200/.test(r), r);
+  assert(r.includes("L1: line 1 NEEDLE here") && r.includes("L51: ") && !r.includes("filler"), r);
+  const c = textOf(await callFileTool(root, "grep_file", { path: "big.txt", pattern: "NEEDLE", context: 1, max_matches: 2 }));
+  assert(/showing the first 2/.test(c), c);
+  assert(c.includes("L2- line 2 filler") && c.includes("\n--\nL50- "), c);
+  const cs = textOf(await callFileTool(root, "grep_file", { path: "big.txt", pattern: "needle", ignore_case: false }));
+  assert(/0 matching lines/.test(cs), cs);
+  const lit = textOf(await callFileTool(root, "grep_file", { path: "big.txt", pattern: "line 1 (" }));
+  assert(/0 matching lines/.test(lit), "an invalid regex is searched literally: " + lit);
+  await writeFile(join(root, "wide.txt"), "x".repeat(2000) + " hit");
+  assert(textOf(await callFileTool(root, "grep_file", { path: "wide.txt", pattern: "hit" })).length < 500, "long lines are clipped");
+  assert(/must not be empty/.test(await thrown(() => callFileTool(root, "grep_file", { path: "big.txt", pattern: "" }))));
+  assert(/no such file/.test(await thrown(() => callFileTool(root, "grep_file", { path: "nope.txt", pattern: "a" }))));
+  assert(/escapes the launch directory/.test(await thrown(() => callFileTool(root, "grep_file", { path: "../x", pattern: "a" }))));
+  await writeFile(join(root, "bin.dat"), Buffer.from([65, 0, 66]));
+  assert(/binary/.test(await thrown(() => callFileTool(root, "grep_file", { path: "bin.dat", pattern: "A" }))));
+  console.log("PASS test9 — grep_file (matches, context, caps, literal fallback, sandbox, binary)");
 }
 
 await rm(root, { recursive: true, force: true });

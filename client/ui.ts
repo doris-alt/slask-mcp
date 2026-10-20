@@ -59,6 +59,10 @@ import {
 import {
   RALPH_TOOL_NAMES,
   callRalphTool,
+  guardFileCall,
+  requiredToolsForRole,
+  restrictToolsForRole,
+  roleMayCall,
   parseRalphCmd,
   ralphSystemBlock,
   ralphTools,
@@ -445,19 +449,22 @@ export async function runTurn(
     fileSystemBlock() +
     scheduleSystemBlock() +
     ralphSystemBlock();
-  const tools = [
+  const tools = restrictToolsForRole([
     ...openaiTools,
     ...fileTools(),
     ...scheduleTools(),
     ...ralphTools(),
     ...(skills.length > 0 ? [skillTool(skills), runScriptTool(skills)] : []),
-  ];
+  ]);
   const callTool: (name: string, args: Record<string, unknown>) => Promise<CallToolResult> =
     (name, args) => {
     // Synthetic local tools (file, schedule, skill); every other name routes to
     // the originating MCP server.
+    if (!roleMayCall(name)) {
+      return Promise.reject(new Error(`${name} is not available in this context`));
+    }
     if (FILE_TOOL_NAMES.includes(name)) {
-      return callFileTool(baseDir, name, args);
+      return callFileTool(baseDir, name, guardFileCall(baseDir, name, args));
     }
     if (SCHEDULE_TOOL_NAMES.includes(name)) {
       return callScheduleTool(name, args);
@@ -488,7 +495,7 @@ export async function runTurn(
   history.push(userMsg);
   try {
     const answer = await runAgentTurn(
-      { openai, model, systemPrompt, tools, callTool },
+      { openai, model, systemPrompt, tools, callTool, requireTool: requiredToolsForRole() },
       history,
       onToolCall
     );

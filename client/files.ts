@@ -31,7 +31,7 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { CallToolResult, OpenAiFunctionTool } from "./types.js";
 
 /** Names of the built-in file tools (reused by the UI banner and docs). */
-export const FILE_TOOL_NAMES: string[] = ["read_file", "edit_file", "write_file"];
+export const FILE_TOOL_NAMES: string[] = ["read_file", "grep_file", "edit_file", "write_file"];
 
 /**
  * Max bytes returned by `read_file`. Larger files are truncated to this limit
@@ -39,6 +39,11 @@ export const FILE_TOOL_NAMES: string[] = ["read_file", "edit_file", "write_file"
  * "lean for small models" reasoning as the skill bundle caps in skills.ts.
  */
 const MAX_READ_BYTES = 65536;
+
+/** Largest file `grep_file` will scan (it streams lines in memory). */
+const MAX_GREP_BYTES = 10_485_760; // 10 MiB
+const MAX_GREP_MATCHES = 50;
+const MAX_GREP_LINE = 300; // chars kept per output line
 
 /**
  * Hard cap on files that `edit_file` may touch: the full content is loaded
@@ -348,6 +353,64 @@ export async function writeFileInBase(
  * description states the sandbox rule explicitly so the model self-corrects
  * (relative paths only) instead of burning tool iterations on rejected calls.
  */
+/**
+ * Search a text file for a regular expression and return only the matching
+ * lines (with line numbers and optional context) — the cheap way to look
+ * inside a large file instead of reading it. Sandboxed like read_file.
+ */
+export async function grepFileInBase(
+  baseDir: string,
+  rawPath: unknown,
+  rawPattern: unknown,
+  rawContext?: unknown,
+  rawMax?: unknown,
+  rawIgnoreCase?: unknown,
+): Promise<string> {
+  const abs = resolveInBase(baseDir, rawPath);
+  const rel = relOf(baseDir, abs);
+  const st = await stat(abs).catch(() => {
+    throw new Error("no such file: " + rel);
+  });
+  if (st.isDirectory()) throw new Error(rel + " is a directory");
+  await resolveExistingInBase(baseDir, abs);
+  if (st.size > MAX_GREP_BYTES) {
+    throw new Error(rel + " is " + st.size + " bytes (max " + MAX_GREP_BYTES + " for grep_file) — read a byte range instead");
+  }
+  const patternSrc = String(rawPattern ?? "");
+  if (patternSrc === "") throw new Error("pattern must not be empty");
+  let re: RegExp;
+  try {
+    re = new RegExp(patternSrc, rawIgnoreCase === false ? "" : "i");
+  } catch {
+    // not a valid regex: treat it as a literal string
+    re = new RegExp(patternSrc.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), rawIgnoreCase === false ? "" : "i");
+  }
+  const context = Math.min(3, Math.max(0, Number.isInteger(Number(rawContext)) ? Number(rawContext) : 0));
+  const max = Math.min(MAX_GREP_MATCHES, Math.max(1, Number.isInteger(Number(rawMax)) && rawMax !== undefined ? Number(rawMax) : 20));
+  const buf = await readFile(abs);
+  if (!isText(buf)) throw new Error(rel + " is not a plain text file (binary content)");
+  const lines = buf.toString("utf8").split(/\r?\n/);
+  const clip = (l: string) => (l.length > MAX_GREP_LINE ? l.slice(0, MAX_GREP_LINE) + "…" : l);
+  const out: string[] = [];
+  let matches = 0;
+  let lastShown = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!re.test(lines[i])) continue;
+    matches += 1;
+    if (matches > max) continue; // keep counting
+    const from = Math.max(lastShown + 1, i - context);
+    if (lastShown >= 0 && from > lastShown + 1) out.push("--");
+    for (let j = from; j <= Math.min(lines.length - 1, i + context); j += 1) {
+      out.push("L" + (j + 1) + (j === i ? ": " : "- ") + clip(lines[j]));
+      lastShown = j;
+    }
+  }
+  const head =
+    rel + ": " + matches + " matching line" + (matches === 1 ? "" : "s") + " of " + lines.length +
+    (matches > max ? " (showing the first " + max + "; refine the pattern)" : "");
+  return matches === 0 ? head : head + "\n" + out.join("\n");
+}
+
 export function fileTools(): OpenAiFunctionTool[] {
   const note =
     "Paths are relative to the launch directory and may not leave it: " +
@@ -387,6 +450,30 @@ export function fileTools(): OpenAiFunctionTool[] {
             },
           },
           required: ["path"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "grep_file",
+        description:
+          "Search ONE text file under the launch directory for a regular expression " +
+          "(case-insensitive by default; an invalid regex is searched as plain text) and " +
+          "return only the matching lines with line numbers (`L12: …`), optionally with " +
+          "1-3 lines of `context` (shown as `L11- …`). Use this to look inside a large " +
+          "file instead of reading it; then pull the interesting part with read_file " +
+          "`offset`/`bytes`. At most 50 matches, long lines clipped. " + note,
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "relative path to the file" },
+            pattern: { type: "string", description: "regular expression (or plain text) to look for" },
+            context: { type: "integer", description: "lines of context around each match, 0-3 (default 0)" },
+            max_matches: { type: "integer", description: "max matches to return, 1-50 (default 20)" },
+            ignore_case: { type: "boolean", description: "case-insensitive match (default true)" },
+          },
+          required: ["path", "pattern"],
         },
       },
     },
@@ -464,7 +551,9 @@ export function fileTools(): OpenAiFunctionTool[] {
 export function fileSystemBlock(): string {
   return (
     "\n\nFile access: you have built-in file tools — `read_file` (inspect a " +
-    "text file, optionally a byte range via `offset` and `bytes`), `edit_file` " +
+    "text file, optionally a byte range via `offset` and `bytes`), `grep_file` " +
+    "(show only the lines of a file matching a pattern — use it to look inside a " +
+    "large file), `edit_file` " +
     "(atomic search-and-replace), and `write_file` (create or overwrite a file, " +
     "or append to it with `append: true`; parent directories are created as " +
     "needed). They are sandboxed to the directory you were launched in and its " +
@@ -517,6 +606,16 @@ export async function callFileTool(
       text = r.content === "" ? header : header + "\n" + r.content;
       break;
     }
+    case "grep_file":
+      text = await grepFileInBase(
+        baseDir,
+        args.path,
+        args.pattern,
+        args.context,
+        args.max_matches,
+        args.ignore_case,
+      );
+      break;
     case "edit_file": {
       const r = await editFileInBase(
         baseDir,

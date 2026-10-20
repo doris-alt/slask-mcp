@@ -277,12 +277,13 @@ bundled scripts are also shown in the startup banner and via the agent's
 
 ## File tools
 
-The client ships three **built-in** file tools that are always available to the
+The client ships four **built-in** file tools that are always available to the
 agent (they appear in the startup banner alongside server and skill tools):
 
 | Tool            | What it does                                             | Required args             |
 |-----------------|----------------------------------------------------------|---------------------------|
 | `read_file`     | read a plain-text file — the whole file, or a byte range via `offset`/`bytes` | `path`, optional `offset`, `bytes` |
+| `grep_file`     | show only the lines of a file that match a pattern (regex, case-insensitive by default; line numbers, optional 0-3 lines of context, max 50 matches) — look inside a large file without reading it | `path`, `pattern`, optional `context`, `max_matches`, `ignore_case` |
 | `edit_file`     | atomic search-and-replace; never modifies unless it succeeds | `path`, `search`, `replace`, optional `replaceAll` |
 | `write_file`    | create or overwrite a file, or append with `append: true` (parent dirs created as needed) | `path`, `content`, optional `append` |
 

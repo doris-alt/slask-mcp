@@ -139,7 +139,8 @@ export function limitsOf(cfg: Partial<RalphConfig>): {
     toolBudget,
     contextChars,
     resultChars: Math.max(2000, Math.floor(contextChars / 10)),
-    maxTokens: Math.min(4096, Math.max(512, Math.floor(contextTokens / 4))),
+    // reply allowance: ~1/8 of the window, 1k-16k (thinking models spend it before the tool call)
+    maxTokens: Math.min(16384, Math.max(1024, Math.floor(contextTokens / 8))),
     maxItems: Math.min(8, Math.max(3, Math.floor(contextTokens / 10000))),
   };
 }
@@ -619,7 +620,7 @@ export function workerPrompt(prd: RalphPrd, cfg: RalphConfig, task: RalphTask, r
     `Run directory: ${relDir}/  (relative to the current directory)`,
     `Overall goal: ${prd.description || prd.name}`,
     specLine(relDir, hasSpec),
-    `Budget: this iteration has about ${limitsOf(cfg).toolBudget} tool calls and a ~${limitsOf(cfg).contextTokens}-token context. Tool outputs are truncated and old ones are dropped, so read only what you need, in small slices, and finish early.`,
+    `Budget: this iteration has about ${limitsOf(cfg).toolBudget} tool calls and a ~${limitsOf(cfg).contextTokens}-token context. Tool outputs are truncated and old ones are dropped, so read only what you need and finish early. Never read a whole large file: use grep_file to find the lines you need, then read_file with a small offset/bytes slice.`,
     `Your task: ${task.id} — ${task.title}`,
     task.description ?? "",
     "Acceptance criteria:",
@@ -676,14 +677,13 @@ export function synthesisPrompt(prd: RalphPrd, relDir: string, outDir: string, h
 export function splitterPrompt(prd: RalphPrd, cfg: RalphConfig, task: RalphTask, relDir: string, outDir: string, hasSpec: boolean, why: string): string {
   const lim = limitsOf(cfg);
   return [
-    "You are the SPLITTER in a Ralph loop, with a fresh context. Do not do the task yourself.",
+    "You are the SPLITTER in a Ralph loop, with a fresh context. Your ONLY job is one call to ralph_split_task. Do NOT do the task, and do NOT write analysis, notes or summaries in your reply.",
     `Task ${task.id} — ${task.title} did not fit in one iteration (${why}). An iteration has only ~${lim.contextTokens} tokens of context and ${lim.toolBudget} tool calls.`,
     task.description ?? "",
     "Its acceptance criteria:",
     criteriaText(task),
-    specLine(relDir, hasSpec),
-    prd.mode === "research" ? `Partial findings may exist in ${outDir}/findings/ (read_file) — do not redo work already there.` : "",
-    `Call ralph_split_task ONCE with 2-4 smaller tasks that together cover everything the original required. Each: one deliverable, 2-4 verifiable criteria, at most ~${lim.maxItems} sources/files to consume, and a description (<600 chars) naming exactly what to do. Then stop.`,
+    `You may read ONLY ${relDir}/prd.json (the task list; short) and ${hasSpec ? `${relDir}/${SPEC_FILE} (the project spec)` : "(there is no spec)"}. Any other file — especially findings, reports and logs under ${outDir}/ — is refused: it is irrelevant for splitting and large. For the spec use grep_file (pattern) or read_file with a small offset/bytes slice (at most ${SPLIT_READ_BYTES} bytes per read); never read the whole spec.`,
+    `Call ralph_split_task ONCE with 2-4 smaller tasks that together cover everything the original required. Each: one deliverable, 2-4 verifiable criteria, at most ~${lim.maxItems} sources/files to consume, and a description (<600 chars) naming exactly what to do. If the call is rejected, fix the tasks it complains about and call again. Then stop.`,
   ].filter((l) => l !== "").join("\n");
 }
 
@@ -1386,6 +1386,61 @@ export async function callRalphTool(
     default:
       throw new Error("unknown ralph tool " + JSON.stringify(name));
   }
+}
+
+// ---------------------------------------------------------------------------
+// the splitter's sandbox: it may only look at the spec and prd.json, in small slices
+// ---------------------------------------------------------------------------
+
+export const SPLIT_READ_BYTES = 8000;
+const SPLITTER_TOOLS = ["read_file", "grep_file", "ralph_status", "ralph_split_task"];
+const REQUIRED_TOOLS: Partial<Record<Role, string[]>> = {
+  splitter: ["ralph_split_task"],
+  checker: ["ralph_verdict"],
+};
+
+/** Tool(s) a role's turn must end with (see AgentTurnConfig.requireTool); undefined = none. */
+export function requiredToolsForRole(): string[] | undefined {
+  return REQUIRED_TOOLS[ralphRole()];
+}
+
+/** Does this role get to use tool `name` at all? (Only the splitter is restricted.) */
+export function roleMayCall(name: string): boolean {
+  return ralphRole() !== "splitter" || SPLITTER_TOOLS.includes(name);
+}
+
+/** Drop every tool the current role may not use (splitter: only reading its two files + split). */
+export function restrictToolsForRole(tools: OpenAiFunctionTool[]): OpenAiFunctionTool[] {
+  return ralphRole() === "splitter" ? tools.filter((t) => SPLITTER_TOOLS.includes(t.function.name)) : tools;
+}
+
+/**
+ * Guard for the file tools. For the splitter: read_file/grep_file only, only on the run's
+ * spec.md and prd.json (never findings/reports/logs), and each read is capped at
+ * SPLIT_READ_BYTES. Returns the (possibly adjusted) args; throws a model-actionable
+ * error otherwise. A no-op for every other role.
+ */
+export function guardFileCall(base: string, name: string, args: Record<string, unknown>): Record<string, unknown> {
+  if (ralphRole() !== "splitter") return args;
+  if (name !== "read_file" && name !== "grep_file") {
+    throw new Error(`${name} is not available to the splitter — it may only read the spec and prd.json`);
+  }
+  const dir = process.env.SLASK_RALPH_DIR ?? "";
+  const target = resolve(base, String(args.path ?? ""));
+  const allowed = [join(dir, SPEC_FILE), join(dir, "prd.json")].map((p) => resolve(p));
+  if (!allowed.includes(target)) {
+    const rel = allowed.map((p) => relative(base, p));
+    throw new Error(
+      `the splitter may only read ${rel.join(" and ")} (use grep_file or a small read_file slice); ` +
+        "findings, reports and other files are off limits and not needed to split a task",
+    );
+  }
+  if (name === "read_file") {
+    const asked = Number(args.bytes);
+    const bytes = Number.isInteger(asked) && asked > 0 ? Math.min(asked, SPLIT_READ_BYTES) : SPLIT_READ_BYTES;
+    return { ...args, bytes };
+  }
+  return args;
 }
 
 export function ralphSystemBlock(): string {

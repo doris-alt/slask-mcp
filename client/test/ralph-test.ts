@@ -14,11 +14,16 @@ import { join } from "node:path";
 
 import {
   addTask,
+  guardFileCall,
   lastLine,
   limitsOf,
   lintTask,
   planPrompt,
   ralphChildEnv,
+  requiredToolsForRole,
+  restrictToolsForRole,
+  roleMayCall,
+  SPLIT_READ_BYTES,
   splitTask,
   callRalphTool,
   checkerPrompt,
@@ -49,7 +54,9 @@ import {
 import type { AgentRunArgs, ExecResult } from "../ralph.js";
 import { parse } from "../cli.js";
 import { Writable } from "node:stream";
-import { capText, pruneMessages } from "../agent.js";
+import { capText, pruneMessages, runAgentTurn } from "../agent.js";
+import { callFileTool, fileTools } from "../files.js";
+import type { OpenAI } from "openai";
 import { Spinner } from "../ui.js";
 import type { ConversationMessage } from "../types.js";
 
@@ -518,8 +525,8 @@ async function main(): Promise<void> {
     });
 
     // limits + env + configure + status + plan prompt
-    assert.deepEqual(limitsOf({}), { contextTokens: 32000, source: "default", toolBudget: 25, contextChars: 80000, resultChars: 8000, maxTokens: 4096, maxItems: 3 });
-    assert.equal(limitsOf({ contextTokens: 8000 }).maxTokens, 2000);
+    assert.deepEqual(limitsOf({}), { contextTokens: 32000, source: "default", toolBudget: 25, contextChars: 80000, resultChars: 8000, maxTokens: 4000, maxItems: 3 });
+    assert.equal(limitsOf({ contextTokens: 8000 }).maxTokens, 1024);
     const cfg = await loadConfig(base, "sp2");
     assert.equal(cfg.contextTokens, undefined, "not written unless given: MAX_CONTEXT_TOKENS decides");
     const env = ralphChildEnv("/d", "sp2", cfg, "worker", "T1");
@@ -620,7 +627,7 @@ async function main(): Promise<void> {
     try {
       process.env.MAX_CONTEXT_TOKENS = "131070";
       const lim = limitsOf({});
-      assert.deepEqual(lim, { contextTokens: 131070, source: "env", toolBudget: 25, contextChars: 327675, resultChars: 32767, maxTokens: 4096, maxItems: 8 });
+      assert.deepEqual(lim, { contextTokens: 131070, source: "env", toolBudget: 25, contextChars: 327675, resultChars: 32767, maxTokens: 16383, maxItems: 8 });
       assert.equal(limitsOf({ contextTokens: 16000 }).contextTokens, 16000, "a lower run setting wins");
       assert.equal(limitsOf({ contextTokens: 16000 }).source, "config");
       assert.equal(limitsOf({ contextTokens: 500000 }).contextTokens, 131070, "never above the env window");
@@ -738,6 +745,110 @@ async function main(): Promise<void> {
     assert.ok(logs.some((l) => /automatic split of T1 failed: ralph_split_task was rejected/.test(l)));
     console.log("PASS test18 — split outcome: ok+ids on success; precise reason on rejection/crash/no-call; CLI, chat and loop follow it");
     await rm(base, { recursive: true, force: true });
+  }
+
+  // -- test19: the splitter is sandboxed to spec.md + prd.json and must end with the tool ---
+  {
+    const base = await tmp();
+    await createRun(base, { name: "sb", mode: "research", spec: "# P\n" + "spec line\n".repeat(5000), tasks: [{ title: "big" }] });
+    await mkdir(join(base, "ralph-sb/findings"), { recursive: true });
+    await writeFile(join(base, "ralph-sb/findings/T1.md"), "HUGE FINDINGS ".repeat(1000));
+    const cfg = await loadConfig(base, "sb");
+    const sp = splitterPrompt(await loadPrd(base, "sb"), cfg, (await loadPrd(base, "sb")).tasks[0], ".slask-ralph/sb", "ralph-sb", true, "why");
+    assert.ok(/may read ONLY \.slask-ralph\/sb\/prd\.json/.test(sp) && sp.includes("ralph-sb/") && sp.includes("never read the whole spec"));
+    assert.ok(!/Partial findings/.test(sp), "no invitation to read findings");
+    assert.ok(/do NOT write analysis/i.test(sp));
+
+    const env = ralphChildEnv(join(base, ".slask-ralph/sb"), "sb", cfg, "splitter", "T1");
+    await asChild(env, async () => {
+      // tool list is restricted
+      const names = restrictToolsForRole([
+        ...fileTools(), ...ralphTools(),
+        { type: "function", function: { name: "search_tools", description: "", parameters: {} } },
+        { type: "function", function: { name: "schedule_add", description: "", parameters: {} } },
+      ]).map((t) => t.function.name).sort();
+      assert.deepEqual(names, ["grep_file", "ralph_split_task", "ralph_status", "read_file"]);
+      assert.equal(roleMayCall("search_tools"), false);
+      assert.equal(roleMayCall("write_file"), false);
+      assert.equal(roleMayCall("ralph_split_task"), true);
+      // reads: spec and prd.json only, slices capped
+      const g = guardFileCall(base, "read_file", { path: ".slask-ralph/sb/spec.md", bytes: 999999 });
+      assert.equal(g.bytes, SPLIT_READ_BYTES);
+      assert.equal(guardFileCall(base, "read_file", { path: ".slask-ralph/sb/prd.json" }).bytes, SPLIT_READ_BYTES);
+      assert.equal(guardFileCall(base, "read_file", { path: ".slask-ralph/sb/spec.md", bytes: 100 }).bytes, 100);
+      guardFileCall(base, "grep_file", { path: "./.slask-ralph/sb/spec.md", pattern: "x" });
+      for (const bad of ["ralph-sb/findings/T1.md", ".slask-ralph/sb/progress.txt", ".slask-ralph/sb/iterations/01.log", "ralph-sb", "../x", ".slask-ralph/other/spec.md"]) {
+        assert.throws(() => guardFileCall(base, "read_file", { path: bad }), /off limits|may only read/, bad);
+      }
+      assert.throws(() => guardFileCall(base, "write_file", { path: ".slask-ralph/sb/spec.md" }), /not available to the splitter/);
+      assert.throws(() => guardFileCall(base, "edit_file", { path: "x" }), /not available/);
+      assert.deepEqual(requiredToolsForRole(), ["ralph_split_task"]);
+      // end to end through the real file tool: a capped slice of the big spec
+      const slice = await callFileTool(base, "read_file", guardFileCall(base, "read_file", { path: ".slask-ralph/sb/spec.md", bytes: 50000 }));
+      assert.ok((slice.content[0] as { text: string }).text.length < SPLIT_READ_BYTES + 200);
+    });
+    await asChild({ SLASK_RALPH_DIR: "/x", SLASK_RALPH_ROLE: "worker" }, async () => {
+      assert.deepEqual(guardFileCall(base, "write_file", { path: "any" }), { path: "any" }, "workers are unrestricted");
+      assert.equal(roleMayCall("search_tools"), true);
+      assert.equal(requiredToolsForRole(), undefined);
+    });
+    await asChild({ SLASK_RALPH_DIR: "/x", SLASK_RALPH_ROLE: "checker" }, async () => {
+      assert.deepEqual(requiredToolsForRole(), ["ralph_verdict"]);
+    });
+    assert.equal(requiredToolsForRole(), undefined, "chat has no required tool");
+    console.log("PASS test19 — splitter sandbox: restricted tools, spec/prd.json only, capped reads, required tool");
+    await rm(base, { recursive: true, force: true });
+  }
+
+  // -- test20: agent nudges a role that must end with a tool call --------------------
+  {
+    type Step = { content?: string; tool?: string; finish?: string };
+    const run = async (steps: Step[], requireTool?: string[], toolFails = false) => {
+      const sent: ConversationMessage[][] = [];
+      let n = 0;
+      const openai = {
+        chat: { completions: { create: async (req: { messages: ConversationMessage[] }) => {
+          sent.push(req.messages.map((m) => ({ ...m })));
+          const st = steps[Math.min(n++, steps.length - 1)];
+          return { choices: [{ finish_reason: st.finish ?? "stop", message: st.tool
+            ? { content: null, tool_calls: [{ id: `c${n}`, type: "function", function: { name: st.tool, arguments: "{}" } }] }
+            : { content: st.content ?? "" } }] };
+        } } },
+      } as unknown as OpenAI;
+      const called: string[] = [];
+      const answer = await runAgentTurn(
+        { openai, model: "m", systemPrompt: "s", tools: [], requireTool,
+          callTool: async (name) => {
+            called.push(name);
+            return { isError: false, content: [{ type: "text", text: toolFails ? "x" : "ok" }] };
+          } },
+        [{ role: "user", content: "go" }],
+      );
+      return { answer, sent, called, calls: n };
+    };
+    // prose first -> nudged -> tool -> done
+    const a = await run([{ content: "Here is my long analysis..." }, { tool: "ralph_split_task" }, { content: "done" }], ["ralph_split_task"]);
+    assert.deepEqual(a.called, ["ralph_split_task"]);
+    assert.equal(a.answer, "done");
+    assert.ok(a.sent[1].some((m) => m.role === "user" && /not called ralph_split_task/.test(m.content as string)));
+    // reply cut off at max_tokens (finish_reason length) -> truncated text dropped, nudged, then tool
+    const b = await run([{ content: "x".repeat(5000), finish: "length" }, { tool: "ralph_split_task" }, { content: "ok" }], ["ralph_split_task"]);
+    assert.deepEqual(b.called, ["ralph_split_task"]);
+    assert.ok(b.sent[1].some((m) => m.role === "assistant" && m.content === "[reply cut off]"), "long cut-off text is not kept in context");
+    assert.ok(b.sent[1].some((m) => m.role === "user" && /cut off because it was too long/.test(m.content as string)));
+    // nudges are bounded (2), then the turn just ends
+    const c = await run([{ content: "blah" }], ["ralph_verdict"]);
+    assert.equal(c.calls, 3);
+    assert.deepEqual(c.called, []);
+    // a cut-off with nothing required still errors as before; no requirement = no nudge
+    await assert.rejects(run([{ content: "x", finish: "length" }]), /cut off by the token limit/);
+    const d = await run([{ content: "plain answer" }]);
+    assert.equal(d.calls, 1);
+    assert.equal(d.answer, "plain answer");
+    // an already-satisfied requirement is not nudged
+    const e = await run([{ tool: "ralph_verdict" }, { content: "fine" }], ["ralph_verdict"]);
+    assert.equal(e.calls, 2);
+    console.log("PASS test20 — requireTool: prose/cut-off replies are nudged (max 2) to call the required tool");
   }
 
   process.exit(0);

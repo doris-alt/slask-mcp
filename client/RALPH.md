@@ -118,6 +118,11 @@ small enough to finish inside it. Four mechanisms enforce that:
 4. **Automatic split.** If an iteration ends without claiming the task because it ran out of
    context, tool calls or time, the loop runs a splitter pass that replaces the task with 2-4
    smaller ones (`T2` -> `T2.1`, `T2.2`; up to two levels). That is not counted as a failure.
+   The splitter is deliberately boxed in: it gets only `read_file`, `grep_file`, `ralph_status` and
+   `ralph_split_task` (no MCP/search/write tools), may read **only** the run's `spec.md` and `prd.json`
+   (findings, reports and logs are refused), each read is capped at 8000 bytes (use `grep_file` or an
+   offset slice for a big spec), and if it answers in prose or its reply is cut off it is told (max twice)
+   to call `ralph_split_task` now. The research checker gets the same "call `ralph_verdict` now" nudge.
    Success is judged from the resulting task list (the task is gone and at least two replacements
    exist), never from the splitter's exit code or text. A failed split says why (the splitter's own
    rejection such as "too coarse", its crash/exit, or "never called ralph_split_task"), is logged in
@@ -341,7 +346,7 @@ or `slask-client -C ~/proj ralph run …`. Prefer this when the run must start r
 | Symptom | Likely cause / fix |
 |---------|--------------------|
 | every iteration: "worker ended … without calling ralph_complete_task — last output: …" | the reason now ends with the child's last output line. Usually the task is too big: it is split automatically, or run `ralph split <name> <id>`; set `MAX_CONTEXT_TOKENS` in `.env` to your model's real window; otherwise the model is too weak |
-| "the response was cut off by the token limit" | the context window filled up (or one reply hit max_tokens): lower `MAX_CONTEXT_TOKENS` to what the server really allows (and/or `toolBudget`), and make tasks smaller |
+| "the response was cut off by the token limit" | the context window filled up, or a single reply hit `max_tokens` (about window/8, 1k-16k; thinking models spend it before the tool call; roles that must end with a tool call are nudged instead of failing): lower `MAX_CONTEXT_TOKENS` to what the server really allows (and/or `toolBudget`), and make tasks smaller |
 | planner keeps getting "too coarse for one iteration" | working as intended: it must split the task; if it loops, plan with a stronger model or add tasks by hand (`ralph add`, which only warns) |
 | `check … failed` repeatedly | the check really fails or needs tooling the machine lacks; run it by hand in the workspace |
 | `command "x" is not allowed` | add the program to `allow` in `config.json` |
