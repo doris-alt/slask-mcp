@@ -462,8 +462,8 @@ task list (it also has `ralph_*` tools, so "plan a research run on X" works);
   `--check` command (exit 0), then commits `feat: [T1] - title`. `research`: a
   separate fresh-context checker judges the acceptance criteria against
   `findings/<id>.md`; a final pass writes `report.md`.
-- **Iterations are sized to the model's context window** (`contextTokens`, default
-  32000; `ralph init --context <tokens>`): planners must produce small tasks (oversized ones are
+- **Iterations are sized to the model's context window** (`MAX_CONTEXT_TOKENS` in `.env`,
+  default 32000; a run may lower it with `ralph init --context <tokens>`): planners must produce small tasks (oversized ones are
   rejected), tool output is truncated and old output dropped, and a task that still doesn't fit is
   split automatically (`ralph split <name> <id>` or `/ralph split <name> <id>` by hand). See RALPH.md.
 - A task that fails verification `maxFailures` (3) times in a row stops the run
@@ -496,6 +496,7 @@ task list (it also has `ralph_*` tools, so "plan a research run on X" works);
 | -p, --prompt <text>| -p  | (none)         | run one agent turn with the prompt, print the answer, and exit (instead of the REPL) |
 | OPENAI_API_KEY    |     | OPENAI_API_KEY | openai api key; only needed for the real openai endpoint (see API_BASE note)                                |
 |                   |     | OPENAI_MODEL   | legacy model name (checked after MODEL)                                                                     |
+|                   |     | MAX_CONTEXT_TOKENS | the model's context window in tokens (default 32000); Ralph sizes every iteration, incl. task splits, to it |
 
 
 ## How the agent loop works

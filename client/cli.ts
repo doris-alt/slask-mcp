@@ -150,6 +150,8 @@ Options:
              SLASK_MCP_CONFIG (config file); API_BASE (default
              https://api.openai.com), MODEL/OPENAI_MODEL, OPENAI_API_KEY (chat).
              A local OpenAI-compatible server (e.g. Ollama) needs no API key.
+             MAX_CONTEXT_TOKENS (the model's context window in tokens, default
+             32000): Ralph sizes every iteration, including task splits, to it.
 
 Multiple servers:
   The default slask HTTP server is always included (named "slask", from

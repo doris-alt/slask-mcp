@@ -103,23 +103,44 @@ export const DEFAULT_CONTEXT_TOKENS = 32000;
 export const DEFAULT_TOOL_BUDGET = 25;
 export const MAX_SPLIT_DEPTH = 2; // T2 -> T2.1 -> T2.1.1, no further
 
-/** Per-iteration limits derived from a run's config (defaults for old configs). */
+/** The model's context window from the environment (.env): MAX_CONTEXT_TOKENS. */
+export function envContextTokens(): number | undefined {
+  const raw = process.env.MAX_CONTEXT_TOKENS;
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 2000 ? n : undefined;
+}
+
+/**
+ * Per-iteration limits for a run. The context window is the smaller of the run's
+ * `contextTokens` (if set) and MAX_CONTEXT_TOKENS from the environment (if set), so a
+ * run never plans or reads beyond the model's real window; default 32000 when neither
+ * is set. Every iteration role (worker, checker, splitter) gets these via ralphChildEnv.
+ */
 export function limitsOf(cfg: Partial<RalphConfig>): {
   contextTokens: number;
+  source: "env" | "config" | "default";
   toolBudget: number;
   contextChars: number;
   resultChars: number;
   maxTokens: number;
+  /** Most sources/pages/files/items a single task may ask for (grows with the window). */
+  maxItems: number;
 } {
-  const contextTokens = cfg.contextTokens ?? DEFAULT_CONTEXT_TOKENS;
+  const env = envContextTokens();
+  const candidates = [cfg.contextTokens, env].filter((n): n is number => n !== undefined);
+  const contextTokens = candidates.length ? Math.min(...candidates) : DEFAULT_CONTEXT_TOKENS;
+  const source = candidates.length === 0 ? "default" : contextTokens === env ? "env" : "config";
   const toolBudget = cfg.toolBudget ?? DEFAULT_TOOL_BUDGET;
   const contextChars = Math.floor(contextTokens * 2.5); // conservative chars/token (HTML/JSON-heavy output)
   return {
     contextTokens,
+    source,
     toolBudget,
     contextChars,
     resultChars: Math.max(2000, Math.floor(contextChars / 10)),
     maxTokens: Math.min(4096, Math.max(512, Math.floor(contextTokens / 4))),
+    maxItems: Math.min(8, Math.max(3, Math.floor(contextTokens / 10000))),
   };
 }
 export const DEFAULT_ALLOW = [
@@ -384,11 +405,12 @@ export async function createRun(base: string, input: CreateRunInput): Promise<Ra
     maxFailures: input.maxFailures ?? 3,
     allow: input.allow ?? DEFAULT_ALLOW,
     outputDir: validateOutputDir(input.outputDir ?? `ralph-${name}`),
-    contextTokens: input.contextTokens ?? DEFAULT_CONTEXT_TOKENS,
+    // contextTokens is written only when given: otherwise MAX_CONTEXT_TOKENS (.env) decides
+    contextTokens: input.contextTokens,
     toolBudget: input.toolBudget ?? DEFAULT_TOOL_BUDGET,
   };
   for (const [k, v, min] of [["contextTokens", config.contextTokens, 2000], ["toolBudget", config.toolBudget, 3]] as const) {
-    if (v === undefined || !Number.isInteger(v) || v < min) throw new Error(`${k} must be an integer >= ${min}`);
+    if (v !== undefined && (!Number.isInteger(v) || v < min)) throw new Error(`${k} must be an integer >= ${min}`);
   }
   await mkdir(join(dir, "iterations"), { recursive: true });
   await atomicWrite(join(dir, "config.json"), JSON.stringify(config, null, 2) + "\n");
@@ -450,7 +472,7 @@ interface TaskLike {
  * Problems that make a task too coarse for ONE small-context iteration
  * (empty = fine). Heuristics, applied to model-authored tasks.
  */
-export function lintTask(mode: RalphMode, t: TaskLike): string[] {
+export function lintTask(mode: RalphMode, t: TaskLike, maxItems: number = limitsOf({}).maxItems): string[] {
   const probs: string[] = [];
   const crit = (t.acceptanceCriteria ?? []).map((c) => String(c).trim()).filter(Boolean);
   const desc = t.description ?? "";
@@ -464,20 +486,20 @@ export function lintTask(mode: RalphMode, t: TaskLike): string[] {
   }
   const nums = [...text.matchAll(/\b(?:at least|minimum(?: of)?|min\.?|≥|>=)\s*(\d+)\b|\b(\d+)\s*\+|\b(\d+)\s+(?:distinct|different|separate|independent)\b/gi)]
     .map((m) => Number(m[1] ?? m[2] ?? m[3]))
-    .filter((n) => n >= 4);
-  if (nums.length) probs.push(`asks for ${Math.max(...nums)}+ items — at most 3 per task; split by item/topic/source`);
+    .filter((n) => n > maxItems);
+  if (nums.length) probs.push(`asks for ${Math.max(...nums)}+ items — at most ${maxItems} per task; split by item/topic/source`);
   return probs;
 }
 
 /** Throw (so the planning model sees it and retries) when any task is too coarse. */
 export function assertGranular(mode: RalphMode, tasks: TaskLike[], cfg: Partial<RalphConfig> = {}): void {
-  const lines = tasks.flatMap((t, i) => lintTask(mode, t).map((p) => `- task ${i + 1} "${t.title ?? ""}": ${p}`));
-  if (lines.length === 0) return;
   const lim = limitsOf(cfg);
+  const lines = tasks.flatMap((t, i) => lintTask(mode, t, lim.maxItems).map((p) => `- task ${i + 1} "${t.title ?? ""}": ${p}`));
+  if (lines.length === 0) return;
   throw new Error(
     `too coarse for one iteration (each gets ~${lim.contextTokens} tokens of context and ${lim.toolBudget} tool calls):\n` +
       lines.join("\n") +
-      "\nSplit these into smaller tasks (one deliverable, 2-4 criteria, at most ~3 sources/files each) and call again.",
+      `\nSplit these into smaller tasks (one deliverable, 2-4 criteria, at most ~${lim.maxItems} sources/files each) and call again.`,
   );
 }
 
@@ -565,7 +587,8 @@ export async function formatStatus(base: string, name: string): Promise<string> 
   if (cfg && prd.mode === "research") lines.push(`  output: ${outputDirOf(name, cfg)}/ (findings/, report.md)`);
   if (cfg) {
     const lim = limitsOf(cfg);
-    lines.push(`  limits: ~${lim.contextTokens} tokens of context, ${lim.toolBudget} tool calls per iteration`);
+    const src = lim.source === "env" ? " (MAX_CONTEXT_TOKENS)" : lim.source === "config" ? " (run setting)" : " (default; set MAX_CONTEXT_TOKENS in .env)";
+    lines.push(`  limits: ~${lim.contextTokens} tokens of context, ${lim.toolBudget} tool calls per iteration${src}`);
   }
   if (cfg) lines.push(`  verifier: ${prd.mode === "code" ? cfg.check ?? "(none — trusts the worker's claim)" : "checker pass"}; max ${cfg.maxIterations} iterations`);
   if (st?.message) lines.push(`  note: ${st.message}`);
@@ -660,7 +683,7 @@ export function splitterPrompt(prd: RalphPrd, cfg: RalphConfig, task: RalphTask,
     criteriaText(task),
     specLine(relDir, hasSpec),
     prd.mode === "research" ? `Partial findings may exist in ${outDir}/findings/ (read_file) — do not redo work already there.` : "",
-    "Call ralph_split_task ONCE with 2-4 smaller tasks that together cover everything the original required. Each: one deliverable, 2-4 verifiable criteria, at most ~3 sources/files to consume, and a description (<600 chars) naming exactly what to do. Then stop.",
+    `Call ralph_split_task ONCE with 2-4 smaller tasks that together cover everything the original required. Each: one deliverable, 2-4 verifiable criteria, at most ~${lim.maxItems} sources/files to consume, and a description (<600 chars) naming exactly what to do. Then stop.`,
   ].filter((l) => l !== "").join("\n");
 }
 
@@ -682,7 +705,7 @@ export function planPrompt(prd: RalphPrd, hasSpec: boolean, interactive: boolean
       ? "If the problem, scope, success criteria or technical constraints are unclear, FIRST ask me 3-5 short clarifying questions, each with lettered options (A, B, C, D) so I can answer like '1A, 2C', and wait for my answers before adding tasks. If everything is already clear, skip the questions."
       : `You cannot ask questions in this mode: make reasonable assumptions and record each one with ralph_note (run "${name}"), prefixed "Assumption:".`,
     "Task rules:",
-    `- SIZE: every iteration runs in a fresh context of only ~${lim.contextTokens} tokens with at most ${lim.toolBudget} tool calls (tool outputs are truncated), so it can read just a few pages/files. A task must fit comfortably: ONE deliverable (one output file), 2-4 acceptance criteria, at most ~3 sources/pages/files to consume. If a topic needs more, make several tasks (one per source, topic, option, model class, module...). Tasks that are too coarse are REJECTED by ralph_add_task and ralph_create (more than 4 criteria, '5+' / 'at least 4' of anything, several output files, a description over 600 chars).`,
+    `- SIZE: every iteration runs in a fresh context of only ~${lim.contextTokens} tokens with at most ${lim.toolBudget} tool calls (tool outputs are truncated), so it can read just a few pages/files. A task must fit comfortably: ONE deliverable (one output file), 2-4 acceptance criteria, at most ~${lim.maxItems} sources/pages/files to consume. If a topic needs more, make several tasks (one per source, topic, option, model class, module...). Tasks that are too coarse are REJECTED by ralph_add_task and ralph_create (more than 4 criteria, more than ${lim.maxItems} of anything ('at least ${lim.maxItems + 1}', '${lim.maxItems + 2}+'), several output files, a description over 600 chars).`,
     "- COUNT: a goal with several questions normally becomes 10-25 small tasks, not 4-6. Split per question AND per option/source group; give each comparison table or summary its own task that reads earlier findings. When in doubt, split further.",
     "- Example (research): instead of 'Collect 5+ sources on hardware' make 'Find 2 recent sources on Mac mini LLM speed', 'Find 2 recent sources on NVIDIA 4090/5090 LLM speed', 'Find 2 sources on AMD/other options', then 'Table: bandwidth and tokens/sec per option, from the earlier findings'.",
     "- Order by dependency (schema -> backend -> UI; survey -> compare). Criteria must be verifiable by running a command or inspecting a file — never 'works correctly'.",
@@ -915,21 +938,22 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
         reason = `worker ended (exit ${w.code}) without calling ralph_complete_task${lastLine(w.output) ? ` — last output: ${lastLine(w.output)}` : ""}`;
         // Ran out of context / tool budget / time: have a splitter break the task up.
         if (tooBig && t.id.split(".").length - 1 < MAX_SPLIT_DEPTH) {
-          log(`  ⚠ ${t.id} did not fit in one iteration (${lastLine(w.output) || `exit ${w.code}`}) — splitting it`);
-          await runAgent({
-            prompt: splitterPrompt(after, cfg, t, relDir, outDir, hasSpec, lastLine(w.output) || `exit ${w.code}`),
-            env: childEnv("splitter", t),
-            timeoutMs: cfg.timeoutS * 1000,
-            logFile: join(dir, "iterations", `${nn}-split.log`),
-          });
+          const why = lastLine(w.output) || `exit ${w.code}`;
+          log(`  ⚠ ${t.id} did not fit in one iteration (${why}) — splitting it`);
+          let sr: SplitOutcome;
+          try {
+            sr = await splitViaAgent(base, name, t.id, (a) => runAgent(a), why);
+          } catch (e) {
+            sr = { ok: false, ids: [], code: -2, reason: e instanceof Error ? e.message : String(e), text: "" };
+          }
           current = null;
           if (aborted) return await finish("stopped", "interrupted");
-          const reloaded = await loadPrd(base, name);
-          if (!reloaded.tasks.some((x) => x.id === t.id)) {
-            log(`  ↳ ${t.id} split into smaller tasks`);
+          if (sr.ok) {
+            log(`  ↳ ${t.id} split into ${sr.ids.join(", ")}`);
             continue;
           }
-          reason += " (automatic split failed)";
+          log(`  ✗ automatic split of ${t.id} failed: ${sr.reason}`);
+          reason += ` (automatic split failed: ${sr.reason})`;
         }
       } else if (after.mode === "code") {
         if (cfg.check) {
@@ -1031,6 +1055,24 @@ async function readVerdict(dir: string): Promise<Verdict | null> {
     return null;
   }
 }
+/** Outcome of the latest ralph_split_task call, so callers know how a split went. */
+interface SplitResult {
+  taskId: string;
+  ok: boolean;
+  ids?: string[];
+  error?: string;
+}
+async function writeSplitResult(dir: string, r: SplitResult): Promise<void> {
+  await writeFile(join(dir, "split-result.json"), JSON.stringify(r)).catch(() => {});
+}
+async function readSplitResult(dir: string): Promise<SplitResult | null> {
+  try {
+    return await readJson<SplitResult>(join(dir, "split-result.json"));
+  } catch {
+    return null;
+  }
+}
+
 async function clearVerdict(dir: string): Promise<void> {
   await writeFile(join(dir, "verdict.json"), "").catch(() => {});
 }
@@ -1320,8 +1362,14 @@ export async function callRalphTool(
       const run = resolveRun(args);
       const id = process.env.SLASK_RALPH_TASK ?? "";
       if (id === "") throw new Error("no current task to split");
-      const ids = await splitTask(base, run, id, Array.isArray(args.tasks) ? (args.tasks as NewTask[]) : []);
-      return text(`${id} replaced by ${ids.join(", ")} — the loop will work on them next; stop now.`);
+      try {
+        const ids = await splitTask(base, run, id, Array.isArray(args.tasks) ? (args.tasks as NewTask[]) : []);
+        await writeSplitResult(runDir(base, run), { taskId: id, ok: true, ids });
+        return text(`${id} replaced by ${ids.join(", ")} — the loop will work on them next; stop now.`);
+      } catch (e) {
+        await writeSplitResult(runDir(base, run), { taskId: id, ok: false, error: e instanceof Error ? e.message : String(e) });
+        throw e;
+      }
     }
     case "ralph_verdict": {
       const run = resolveRun(args);
@@ -1573,32 +1621,75 @@ const defaultAgentFn = async (a: AgentRunArgs): Promise<ExecResult> => {
   });
 };
 
+export interface SplitOutcome {
+  /** True only if the task is gone AND at least two replacement tasks exist. */
+  ok: boolean;
+  /** Ids of the replacement tasks (empty on failure). */
+  ids: string[];
+  /** Exit code of the splitter child. */
+  code: number;
+  /** Why it failed (empty on success). */
+  reason: string;
+  /** Human-readable one-liner (+ task list on success). */
+  text: string;
+}
+
 /**
  * Have a splitter child replace task `id` with 2-4 smaller tasks (shared by
- * `slask-client ralph split` and `/ralph split`). `done` = the task was split.
+ * `slask-client ralph split`, `/ralph split` and the loop's automatic split).
+ * Success is judged from the resulting task list, not from the child's exit code or
+ * text; on failure the reason is the splitter's own rejection (e.g. "too coarse …"),
+ * else its exit/last output, and is recorded in progress.txt.
  */
 export async function splitViaAgent(
   base: string,
   name: string,
   id: string,
   agentFn: (a: AgentRunArgs) => Promise<ExecResult> = defaultAgentFn,
-): Promise<{ done: boolean; code: number; text: string }> {
+  why?: string,
+): Promise<SplitOutcome> {
   const prd = await loadPrd(base, name);
   const task = prd.tasks.find((x) => x.id === id);
   if (task === undefined) throw new Error(`no task ${id} in run "${name}"`);
+  if (task.passes) throw new Error(`${id} already passes — nothing to split`);
+  if (id.split(".").length - 1 >= MAX_SPLIT_DEPTH) {
+    throw new Error(`${id} was already split ${MAX_SPLIT_DEPTH} times — it cannot be split further`);
+  }
   const cfg = await loadConfig(base, name);
   const dir = runDir(base, name);
+  await writeFile(join(dir, "split-result.json"), "").catch(() => {});
   const prompt = splitterPrompt(
     prd, cfg, task, relative(base, dir), outputDirOf(name, cfg), (await specSize(base, name)) !== null,
-    task.lastFailure ?? "manual split requested",
+    why ?? task.lastFailure ?? "manual split requested",
   );
   const env = ralphChildEnv(dir, name, cfg, "splitter", id);
-  const r = await agentFn({ prompt, env, timeoutMs: cfg.timeoutS * 1000, logFile: join(dir, "iterations", `split-${id}.log`) });
-  const done = !(await loadPrd(base, name)).tasks.some((x) => x.id === id);
-  const text = done
-    ? `split ${id}:\n${await formatStatus(base, name)}`
-    : `${id} was not split (exit ${r.code}); see ${STATE_DIR}/${name}/iterations/split-${id}.log`;
-  return { done, code: r.code, text };
+  const logFile = join(dir, "iterations", `split-${id}.log`);
+  const r = await agentFn({ prompt, env, timeoutMs: cfg.timeoutS * 1000, logFile });
+
+  const after = await loadPrd(base, name);
+  const ids = after.tasks.filter((t) => t.id.startsWith(`${id}.`) && !t.id.slice(id.length + 1).includes(".")).map((t) => t.id);
+  const gone = !after.tasks.some((t) => t.id === id);
+  const ok = gone && ids.length >= 2;
+  if (ok) {
+    return { ok, ids, code: r.code, reason: "", text: `✓ split ${id} into ${ids.join(", ")}:\n${await formatStatus(base, name)}` };
+  }
+  const res = await readSplitResult(dir);
+  const reason =
+    res && res.ok === false && res.error
+      ? `ralph_split_task was rejected: ${res.error}`
+      : gone
+        ? "the task was removed but fewer than 2 replacement tasks exist"
+        : r.code !== 0
+          ? `the splitter exited with code ${r.code}${lastLine(r.output) ? `: ${lastLine(r.output)}` : ""}`
+          : "the splitter never called ralph_split_task successfully";
+  await appendProgress(base, name, `\n## ${new Date().toISOString()} — ${id} ${task.title}: SPLIT FAILED\n${reason}`);
+  return {
+    ok: false,
+    ids: [],
+    code: r.code,
+    reason,
+    text: `✗ could not split ${id}: ${reason}\n  log: ${STATE_DIR}/${name}/iterations/split-${id}.log`,
+  };
 }
 
 export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd(), deps: RalphCliDeps = {}): Promise<number> {
@@ -1681,7 +1772,7 @@ export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd
       if (name === undefined || id === undefined) throw new Error(CLI_USAGE);
       const r = await splitViaAgent(base, name, id, deps.agentFn);
       log(r.text);
-      return r.done ? 0 : 1;
+      return r.ok ? 0 : 1;
     }
     case "run": {
       if (name === undefined) throw new Error(CLI_USAGE);

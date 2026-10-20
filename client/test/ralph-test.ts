@@ -37,7 +37,10 @@ import {
   ralphTools,
   runRalph,
   runRalphRepl,
+  savePrd,
   setSpec,
+  splitViaAgent,
+  splitterPrompt,
   synthesisPrompt,
   tokenize,
   validateOutputDir,
@@ -87,6 +90,7 @@ const ok = (output = ""): ExecResult => ({ code: 0, output });
 const quiet = () => {};
 
 async function main(): Promise<void> {
+  delete process.env.MAX_CONTEXT_TOKENS; // tests must not depend on the developer's .env
   // -- test1: createRun / addTask / pickNext / import ------------------------
   {
     const base = await tmp();
@@ -514,10 +518,10 @@ async function main(): Promise<void> {
     });
 
     // limits + env + configure + status + plan prompt
-    assert.deepEqual(limitsOf({}), { contextTokens: 32000, toolBudget: 25, contextChars: 80000, resultChars: 8000, maxTokens: 4096 });
+    assert.deepEqual(limitsOf({}), { contextTokens: 32000, source: "default", toolBudget: 25, contextChars: 80000, resultChars: 8000, maxTokens: 4096, maxItems: 3 });
     assert.equal(limitsOf({ contextTokens: 8000 }).maxTokens, 2000);
     const cfg = await loadConfig(base, "sp2");
-    assert.equal(cfg.contextTokens, 32000);
+    assert.equal(cfg.contextTokens, undefined, "not written unless given: MAX_CONTEXT_TOKENS decides");
     const env = ralphChildEnv("/d", "sp2", cfg, "worker", "T1");
     assert.equal(env.SLASK_CONTEXT_CHARS, "80000");
     assert.equal(env.SLASK_MAX_TOOL_RESULT_CHARS, "8000");
@@ -603,11 +607,136 @@ async function main(): Promise<void> {
       await asChild(a.env, () => callRalphTool(base, "ralph_split_task", { tasks: [small("c1"), small("c2")] }));
       return ok();
     });
-    assert.match(viaChat.text ?? "", /split T1:[\s\S]*T1\.1 c1[\s\S]*T1\.2 c2/);
+    assert.match(viaChat.text ?? "", /✓ split T1 into T1\.1, T1\.2[\s\S]*T1\.1 c1[\s\S]*T1\.2 c2/);
     assert.match((await runRalphRepl(parseRalphCmd("/ralph split cs T9")!, base, async () => ok())).text ?? "", /no task T9/);
-    assert.match((await runRalphRepl(parseRalphCmd("/ralph split cs T1.1")!, base, async () => ok())).text ?? "", /was not split/);
+    assert.match((await runRalphRepl(parseRalphCmd("/ralph split cs T1.1")!, base, async () => ok())).text ?? "", /✗ could not split T1\.1: the splitter never called/);
     assert.equal(parse(["ralph", "init", "x", "--context", "16000", "--tool-budget", "12"]).ralph.context, "16000");
     console.log("PASS test16 — auto-split on out-of-budget iterations, real error in failure reason, ralph split CLI");
+    await rm(base, { recursive: true, force: true });
+  }
+
+  // -- test17: MAX_CONTEXT_TOKENS (.env) bounds every iteration, incl. the splitter ---
+  {
+    try {
+      process.env.MAX_CONTEXT_TOKENS = "131070";
+      const lim = limitsOf({});
+      assert.deepEqual(lim, { contextTokens: 131070, source: "env", toolBudget: 25, contextChars: 327675, resultChars: 32767, maxTokens: 4096, maxItems: 8 });
+      assert.equal(limitsOf({ contextTokens: 16000 }).contextTokens, 16000, "a lower run setting wins");
+      assert.equal(limitsOf({ contextTokens: 16000 }).source, "config");
+      assert.equal(limitsOf({ contextTokens: 500000 }).contextTokens, 131070, "never above the env window");
+      for (const bad of ["abc", "100", "", "1.5"]) {
+        process.env.MAX_CONTEXT_TOKENS = bad;
+        assert.equal(limitsOf({}).contextTokens, 32000, `invalid MAX_CONTEXT_TOKENS ${JSON.stringify(bad)} ignored`);
+      }
+      process.env.MAX_CONTEXT_TOKENS = "131070";
+
+      const base = await tmp();
+      await createRun(base, { name: "env", mode: "research", tasks: [{ title: "big", acceptanceCriteria: ["a", "b"] }] });
+      assert.ok(!("contextTokens" in JSON.parse(await readFile(join(base, ".slask-ralph/env/config.json"), "utf8"))));
+      const cfg = await loadConfig(base, "env");
+      for (const role of ["worker", "checker", "splitter"] as const) {
+        const e = ralphChildEnv("/d", "env", cfg, role, "T1");
+        assert.equal(e.SLASK_CONTEXT_CHARS, "327675", role);
+        assert.equal(e.SLASK_MAX_TOOL_RESULT_CHARS, "32767", role);
+      }
+      assert.match(await formatStatus(base, "env"), /limits: ~131070 tokens of context, 25 tool calls per iteration \(MAX_CONTEXT_TOKENS\)/);
+      const prd = await loadPrd(base, "env");
+      assert.ok(planPrompt(prd, false, false, ".slask-ralph/env", cfg).includes("~131070 tokens"));
+      assert.ok(splitterPrompt(prd, cfg, prd.tasks[0], ".slask-ralph/env", "ralph-env", false, "why").includes("~131070 tokens"));
+      // task size limits scale with the window: 6 items fine (<= 8), 9 is not
+      assert.deepEqual(lintTask("code", { title: "x", acceptanceCriteria: ["at least 6 tests", "b"] }), []);
+      assert.ok(lintTask("code", { title: "x", acceptanceCriteria: ["at least 9 tests", "b"] }).some((p) => /at most 8 per task/.test(p)));
+      // the splitter child really receives that env
+      let seen: Record<string, string> = {};
+      const outc = await splitViaAgent(base, "env", "T1", async (a) => {
+        seen = a.env;
+        return ok();
+      });
+      assert.equal(outc.ok, false);
+      assert.equal(seen.SLASK_RALPH_ROLE, "splitter");
+      assert.equal(seen.SLASK_CONTEXT_CHARS, "327675");
+      assert.match((await readFile(join(base, ".slask-ralph/env/progress.txt"), "utf8")), /T1 big: SPLIT FAILED/);
+      console.log("PASS test17 — MAX_CONTEXT_TOKENS bounds worker/checker/splitter, scales task limits, lower run setting wins");
+      await rm(base, { recursive: true, force: true });
+    } finally {
+      delete process.env.MAX_CONTEXT_TOKENS;
+    }
+  }
+
+  // -- test18: a split always knows whether it succeeded, and why not -------------
+  {
+    const base = await tmp();
+    const small = (t: string) => ({ title: t, description: "d", acceptanceCriteria: ["x.md exists", "cites"] });
+    const coarse = { title: "still big", description: "d", acceptanceCriteria: ["at least 9 items", "b"] };
+    await createRun(base, { name: "so", mode: "research", tasks: [{ title: "big" }, { title: "other" }] });
+
+    // success: ids reported, text says so
+    const good = await splitViaAgent(base, "so", "T1", async (a) => {
+      await asChild(a.env, () => callRalphTool(base, "ralph_split_task", { tasks: [small("p"), small("q"), small("r")] }));
+      return ok();
+    });
+    assert.equal(good.ok, true);
+    assert.deepEqual(good.ids, ["T1.1", "T1.2", "T1.3"]);
+    assert.equal(good.reason, "");
+    assert.match(good.text, /^✓ split T1 into T1\.1, T1\.2, T1\.3/);
+    assert.equal(JSON.parse(await readFile(join(base, ".slask-ralph/so/split-result.json"), "utf8")).ok, true);
+
+    // failure: the model's own attempt is rejected as too coarse -> reason carries that, task untouched
+    const rejected = await splitViaAgent(base, "so", "T2", async (a) => {
+      await asChild(a.env, async () => {
+        await assert.rejects(callRalphTool(base, "ralph_split_task", { tasks: [coarse, small("z")] }), /too coarse/);
+      });
+      return ok();
+    });
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.reason, /ralph_split_task was rejected: too coarse/);
+    assert.match(rejected.text, /^✗ could not split T2: ralph_split_task was rejected/);
+    assert.ok((await loadPrd(base, "so")).tasks.some((x) => x.id === "T2"), "failed split leaves the task in place");
+    assert.match(await readFile(join(base, ".slask-ralph/so/progress.txt"), "utf8"), /T2 other: SPLIT FAILED\nralph_split_task was rejected/);
+
+    // failure: splitter crashed (e.g. context overrun) -> exit code + last output line
+    const crashed = await splitViaAgent(base, "so", "T2", async () => ({ code: 1, output: "\u001b[31m the response was cut off by the token limit\u001b[0m\n" }));
+    assert.equal(crashed.ok, false);
+    assert.equal(crashed.code, 1);
+    assert.match(crashed.reason, /exited with code 1: the response was cut off by the token limit/);
+
+    // failure: child exited 0 but never split; stale result from the previous attempt must not leak
+    const idle = await splitViaAgent(base, "so", "T2", async () => ok());
+    assert.match(idle.reason, /never called ralph_split_task successfully/);
+
+    // precondition errors throw (no agent run)
+    await assert.rejects(splitViaAgent(base, "so", "T9", async () => ok()), /no task T9/);
+    await assert.rejects(splitViaAgent(base, "so", "T1.1.1", async () => ok()), /no task|cannot be split/);
+    const prd = await loadPrd(base, "so");
+    prd.tasks.find((x) => x.id === "T2")!.passes = true;
+    await savePrd(base, prd);
+    await assert.rejects(splitViaAgent(base, "so", "T2", async () => ok()), /already passes/);
+
+    // CLI exit code and chat text follow the outcome
+    await createRun(base, { name: "so2", mode: "code", tasks: [{ title: "t" }] });
+    assert.equal(await handleRalphCli({ positional: ["ralph", "split", "so2", "T1"] }, base, { agentFn: async () => ok() }), 1);
+    assert.match((await runRalphRepl(parseRalphCmd("/ralph split so2 T1")!, base, async () => ok())).text ?? "", /^✗ could not split T1/);
+
+    // loop: failed automatic split shows its reason in lastFailure and in the log
+    await createRun(base, { name: "lp", mode: "code", maxFailures: 1, tasks: [{ title: "t" }] });
+    const logs: string[] = [];
+    const out = await runRalph({
+      base, name: "lp", execFn: async () => ok(), log: (l) => logs.push(l), autoHandlers: false,
+      runAgentFn: async (a) => {
+        if (a.env.SLASK_RALPH_ROLE === "splitter") {
+          await asChild(a.env, async () => {
+            await assert.rejects(callRalphTool(base, "ralph_split_task", { tasks: [coarse, small("z")] }), /too coarse/);
+          });
+          return ok();
+        }
+        return { code: 1, output: "stopped after 25 tool calls in one turn (safety cap)" };
+      },
+    });
+    assert.equal(out.state, "stuck");
+    const lf = (await loadPrd(base, "lp")).tasks[0].lastFailure ?? "";
+    assert.match(lf, /automatic split failed: ralph_split_task was rejected: too coarse/);
+    assert.ok(logs.some((l) => /automatic split of T1 failed: ralph_split_task was rejected/.test(l)));
+    console.log("PASS test18 — split outcome: ok+ids on success; precise reason on rejection/crash/no-call; CLI, chat and loop follow it");
     await rm(base, { recursive: true, force: true });
   }
 

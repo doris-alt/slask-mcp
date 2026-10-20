@@ -810,7 +810,10 @@ export async function startChat({
           }
           const res = await runRalphRepl(ralphParsed, state.baseDir);
           if (res.prompt === undefined) {
-            if (res.text !== undefined) console.log(color("green", `  ${res.text.replace(/\n/g, "\n  ")}\n`));
+            if (res.text !== undefined) {
+              const failed = res.text.startsWith("✗");
+              console.log(color(failed ? "red" : "green", `  ${res.text.replace(/\n/g, "\n  ")}\n`));
+            }
             return loop();
           }
           turnInput = res.prompt;

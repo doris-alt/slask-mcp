@@ -17,7 +17,7 @@ parts relevant to its task. Give each task a description that names the spec
 sections it implements, so iterations don't re-read everything.
 
 ## Task size is a hard limit
-Each iteration has only a small context (`contextTokens`, default 32000 tokens) and a tool
+Each iteration has only a small context (the model's `MAX_CONTEXT_TOKENS`, default 32000 tokens) and a tool
 budget (default 25 calls). A multi-question goal usually needs 10-25 tasks, not 4-6. One task =
 one output file, 2-4 criteria, at most ~3 sources/pages/files. Split per question and per
 option/source group; give each comparison or summary its own task that reads the earlier
