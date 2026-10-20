@@ -450,10 +450,10 @@ slask-client ralph init survey --mode research   # then add tasks; or --from prd
 For a large project, attach a description file (e.g. a PRD): `ralph init shop
 --spec tasks/prd-shop.md [--plan]` (copied to `.slask-ralph/shop/spec.md`; every
 iteration reads the relevant parts; `--plan` drafts the task list headlessly) or
-`/ralph plan shop --spec tasks/prd-shop.md` in chat (asks clarifying questions
-first). The local `prd` skill writes such a PRD. See [RALPH.md](RALPH.md).
+`/ralph init shop code tasks/prd-shop.md` then `/ralph plan shop` in chat (asks
+clarifying questions first; chat commands take positional arguments, not `--flags`). The local `prd` skill writes such a PRD. See [RALPH.md](RALPH.md).
 
-In chat, `/ralph plan <name> [code|research] [--spec <file>] [goal]` has the model draft the
+In chat, `/ralph plan <name> [code|research] [goal...]` has the model draft the
 task list (it also has `ralph_*` tools, so "plan a research run on X" works);
 `/ralph start <name>` launches it.
 
