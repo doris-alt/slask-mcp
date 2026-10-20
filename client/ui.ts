@@ -8,7 +8,7 @@
 // (no TUI lib). `runOneShot` runs a single agent turn for a prompt and exits,
 // used by the `--prompt` flag.
 //
-// REPL commands: /help /h  /tools /t  /skills /s  /reset /clear /c  /compact /summarize  /schedule add|list|rm  /quit /exit /q
+// REPL commands: /help /h  /tools /t  /skills /s  /reset /clear /c  /compact /summarize  /schedule add|list|rm  /ralph  /quit /exit /q
 
 import { createInterface } from "node:readline";
 import type { Writable } from "node:stream";
@@ -56,6 +56,14 @@ import {
   scheduleSystemBlock,
   scheduleTools,
 } from "./schedule.js";
+import {
+  RALPH_TOOL_NAMES,
+  callRalphTool,
+  parseRalphCmd,
+  ralphSystemBlock,
+  ralphTools,
+  runRalphRepl,
+} from "./ralph.js";
 
 // ---------------------------------------------------------------------------
 // colors (tiny dependency-free ANSI helper)
@@ -155,6 +163,7 @@ const REPLY_HELP = [
   "  /reset    clear the conversation history",
   "  /compact  summarize the conversation so far, reclaiming context",
   "  /schedule manage scheduled jobs (add/list/rm)",
+  "  /ralph    plan/run autonomous Ralph loops (coding or research); /ralph alone for help",
   "  /quit     (or /exit, /q, or Ctrl+C) leave the REPL",
   "",
   "Otherwise, just type a request. Examples:",
@@ -325,6 +334,7 @@ export function printBanner(state: ChatState, interactive: boolean): void {
     ...state.openaiTools.map((t) => t.function.name),
     ...FILE_TOOL_NAMES,
     ...SCHEDULE_TOOL_NAMES,
+    ...ralphTools().map((t) => t.function.name),
     ...state.skills.map((s) => s.name),
   ];
   console.log(
@@ -365,11 +375,16 @@ export async function runTurn(
 ): Promise<string | null> {
   const { openai, openaiTools, skills, model, baseDir } = state;
   const systemPrompt =
-    SYSTEM_PROMPT + skillSystemBlock(skills) + fileSystemBlock() + scheduleSystemBlock();
+    SYSTEM_PROMPT +
+    skillSystemBlock(skills) +
+    fileSystemBlock() +
+    scheduleSystemBlock() +
+    ralphSystemBlock();
   const tools = [
     ...openaiTools,
     ...fileTools(),
     ...scheduleTools(),
+    ...ralphTools(),
     ...(skills.length > 0 ? [skillTool(skills), runScriptTool(skills)] : []),
   ];
   const callTool: (name: string, args: Record<string, unknown>) => Promise<CallToolResult> =
@@ -381,6 +396,9 @@ export async function runTurn(
     }
     if (SCHEDULE_TOOL_NAMES.includes(name)) {
       return callScheduleTool(name, args);
+    }
+    if (RALPH_TOOL_NAMES.includes(name)) {
+      return callRalphTool(baseDir, name, args);
     }
     if (name === "invoke_skill") {
       return invokeSkill(skills, String(args.name), args.file).then(
@@ -710,13 +728,27 @@ export async function startChat({
           return loop();
         }
       }
+      // /ralph — manage Ralph runs. `plan` hands a drafting prompt to the model.
+      let turnInput = input;
+      {
+        const ralphParsed = parseRalphCmd(input);
+        if (ralphParsed !== null) {
+          process.stdout.write("\n");
+          const res = await runRalphRepl(ralphParsed, state.baseDir);
+          if (res.prompt === undefined) {
+            if (res.text !== undefined) console.log(color("green", `  ${res.text.replace(/\n/g, "\n  ")}\n`));
+            return loop();
+          }
+          turnInput = res.prompt;
+        }
+      }
       if (cmd === "/quit" || cmd === "/exit" || cmd === "/q") {
         return shutdown();
       }
 
       // A chat turn: the model picks tools (MCP or local skills) and the agent
       // loop drives the round to completion.
-      const answer = await runTurn(state, input, history, spinner);
+      const answer = await runTurn(state, turnInput, history, spinner);
       if (answer === null) return loop(); // error already printed; re-prompt
 
       console.log(color("blue", `  ${answer ? answer : "(no response)"}`));

@@ -33,14 +33,13 @@
 // `autoHandlers: false` (no SIGINT/SIGTERM listeners installed; the caller
 // controls shutdown via the returned handle).
 
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import cron from "node-cron";
 import { dirname, join } from "node:path";
+import { runCliChild } from "./child.js";
+import type { ChildProcess } from "./child.js";
 import type { CallToolResult, OpenAiFunctionTool } from "./types.js";
-
-type ChildProcess = ReturnType<typeof spawn>;
 
 // ---------------------------------------------------------------------------
 // Job model + storage
@@ -387,48 +386,15 @@ export async function runScheduler(options: RunSchedulerOptions = {}): Promise<S
   // Spawn this CLI as a one-shot child and resolve with an effective exit
   // code: 0 = ok, -1 = timed out (SIGTERM, then SIGKILL if still alive),
   // -2 = child failed to start, >0 = the child's own non-zero exit code.
-  function runChild(job: ScheduleJob, timeoutMs: number): Promise<number> {
-    const child = spawn(
-      process.execPath,
-      [process.argv[1] ?? "", "--prompt", job.prompt, "--quiet"],
-      { stdio: "inherit" },
-    );
-    currentChild = child;
-    return new Promise<number>((resolve) => {
-      let done = false;
-      let killTimer: NodeJS.Timeout | undefined;
-      const clearKill = () => {
-        if (killTimer !== undefined) {
-          clearTimeout(killTimer);
-          killTimer = undefined;
-        }
-      };
-      const finish = (code: number) => {
-        if (done) return;
-        done = true;
-        currentChild = null;
-        resolve(code);
-      };
-      // On timeout: SIGTERM, then SIGKILL if the child is still alive.
-      const timeoutTimer = setTimeout(() => {
-        if (done) return;
-        child.kill("SIGTERM");
-        killTimer = setTimeout(() => {
-          child.kill("SIGKILL");
-          finish(-1);
-        }, SIGKILL_GRACE_MS);
-      }, timeoutMs);
-      child.on("exit", (code) => {
-        clearTimeout(timeoutTimer);
-        clearKill();
-        finish(code === null ? -1 : code);
-      });
-      child.on("error", () => {
-        clearTimeout(timeoutTimer);
-        clearKill();
-        finish(-2);
-      });
+  async function runChild(job: ScheduleJob, timeoutMs: number): Promise<number> {
+    const { code } = await runCliChild(["--prompt", job.prompt, "--quiet"], {
+      timeoutMs,
+      onSpawn: (child) => {
+        currentChild = child;
+      },
     });
+    currentChild = null;
+    return code;
   }
 
   // -- per-run bookkeeping -----------------------------------------------------

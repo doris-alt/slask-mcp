@@ -32,9 +32,11 @@
 //                               local server (e.g. Ollama) is used with a
 //                               placeholder key
 
+import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runOneShot, startChat } from "./ui.js";
+import { handleRalphCli, setRalphForwardArgs } from "./ralph.js";
 import {
   addJob,
   classifyScheduleArg,
@@ -100,12 +102,35 @@ Usage:
       last run / status.
   slask-client schedule rm <id>
       Remove a scheduled job by full id or unique id prefix.
+  slask-client ralph init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>]
+      Create a Ralph run in .slask-ralph/<name>/: a task list worked through by
+      repeated fresh-context agent iterations until every task passes. --check
+      is the code verifier (e.g. "npm run build && npm test"); research runs are
+      judged by a checker pass. --from imports a prd.json (tasks or snarktank
+      userStories). Research findings/ and report.md go to the visible folder
+      --out <dir> (default ralph-<name>/, relative to the workspace); the hidden
+      .slask-ralph/<name>/ holds only loop state.
+      --spec <file> attaches a project description (markdown, e.g. a PRD) that
+      is copied to .slask-ralph/<name>/spec.md for every iteration to read; add
+      --plan to have the model draft the task list from it (non-interactive).
+  slask-client ralph spec <name> <file>
+      Replace a run's project description.
+  slask-client ralph add <name> <title> [--criteria "a;b;c"]
+      Append a task.
+  slask-client ralph run <name> [--max N]
+      Run the loop in the foreground (default 10 iterations).
+  slask-client ralph start <name> | stop <name> | status [name] | list
+      Run in a detached process / stop / inspect. In chat, use /ralph or just
+      ask the model to plan one.
   slask-client help
       Show this help (also: --help).
 
 Options:
   -u, --url <url>        Default (slask) server endpoint (default: ${DEFAULT_URL})
   -t, --token <token>    Bearer token for the default server
+  -C, --dir <path>       Workspace directory: run as if started there (.env, mcp.json,
+                         skills/, file tools, schedule + Ralph state all resolve in it).
+                         Relative --config/--from paths are relative to it.
   -c, --config <path>    MCP servers config file (JSON; default: mcp.json in the current dir)
       --no-default       Do not include the default slask server
   -m, --model <model>    OpenAI model (chat mode; default: gpt-4o-mini)
@@ -165,6 +190,8 @@ interface CliConfig {
   prompt: string | null;
   quiet: boolean;
   help: boolean;
+  dir: string | null;
+  ralph: { mode?: string; check?: string; max?: string; from?: string; criteria?: string; out?: string; spec?: string; plan?: boolean };
 }
 
 function fail(msg: string): never {
@@ -375,6 +402,8 @@ export function parse(argv: string[]): CliConfig {
     prompt: null,
     quiet: false,
     help: false,
+    dir: null,
+    ralph: {},
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -415,6 +444,24 @@ export function parse(argv: string[]): CliConfig {
       if (++i < argv.length) config.prompt = argv[i];
     } else if (f === "--quiet" || f === "-q") {
       config.quiet = true;
+    } else if (f === "--dir" || f === "-C") {
+      if (++i < argv.length) config.dir = argv[i];
+    } else if (f === "--mode") {
+      if (++i < argv.length) config.ralph.mode = argv[i];
+    } else if (f === "--check") {
+      if (++i < argv.length) config.ralph.check = argv[i];
+    } else if (f === "--max") {
+      if (++i < argv.length) config.ralph.max = argv[i];
+    } else if (f === "--from") {
+      if (++i < argv.length) config.ralph.from = argv[i];
+    } else if (f === "--out") {
+      if (++i < argv.length) config.ralph.out = argv[i];
+    } else if (f === "--spec") {
+      if (++i < argv.length) config.ralph.spec = argv[i];
+    } else if (f === "--plan") {
+      config.ralph.plan = true;
+    } else if (f === "--criteria") {
+      if (++i < argv.length) config.ralph.criteria = argv[i];
     } else {
       config.positional.push(f);
     }
@@ -449,6 +496,20 @@ function printResult(result: CallToolResult): void {
 async function main(): Promise<void> {
   // Load .env from the current working directory (if present). Never
   // overwrites values the shell already set.
+  // --dir/-C <path> picks the workspace: chdir *first*, so .env, mcp.json,
+  // skills, file tools, the schedule file and .slask-ralph/ all resolve there,
+  // and every child process inherits it. Pre-scanned because .env must load
+  // before the full parse (parse() reads env defaults).
+  const dir = parse(process.argv.slice(2)).dir;
+  if (dir !== null) {
+    const target = resolve(dir);
+    try {
+      if (!statSync(target).isDirectory()) throw new Error("not a directory");
+      process.chdir(target);
+    } catch (e) {
+      fail(`--dir ${dir}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
   loadEnvFile(resolve(process.cwd(), ".env"));
 
   const config = parse(process.argv.slice(2));
@@ -471,6 +532,29 @@ async function main(): Promise<void> {
   if (sub === "schedule") {
     try {
       await handleScheduleCommand(config);
+    } catch (e) {
+      fail(e instanceof Error ? e.message : String(e));
+    }
+    return;
+  }
+
+  // Flags that Ralph children (iterations, detached runs) inherit.
+  const fwd: string[] = [];
+  if (config.model) fwd.push("--model", config.model);
+  if (config.base) fwd.push("--base-url", config.base);
+  if (config.config) fwd.push("--config", config.config);
+  if (config.noDefault) fwd.push("--no-default");
+  // url/token already reach children via env when set there; only forward flag
+  // overrides (a token on argv is visible in `ps`, so avoid it when env has it).
+  if (config.url !== (process.env.SLASK_MCP_URL ?? DEFAULT_URL)) fwd.push("--url", config.url);
+  if (config.token && config.token !== process.env.SLASK_MCP_TOKEN) fwd.push("--token", config.token);
+  setRalphForwardArgs(fwd);
+
+  // `ralph` manages its own state dir and spawns children for the agent work —
+  // dispatch before touching any server, same pattern as `schedule`.
+  if (sub === "ralph") {
+    try {
+      process.exit(await handleRalphCli({ positional: config.positional, ...config.ralph }));
     } catch (e) {
       fail(e instanceof Error ? e.message : String(e));
     }

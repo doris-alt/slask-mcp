@@ -30,6 +30,13 @@ export const DEFAULT_API_BASE = "https://api.openai.com"; // normalize to /v1 be
 const MAX_TOOL_ITERATIONS = 8; // safety cap: tool round-trips per turn
 const MAX_TOKENS = 1024; // hard cap on each completion
 
+// Both caps are overridable by env (read per turn). Ralph iterations set higher
+// values for their child processes — real coding turns need many tool rounds.
+function envInt(name: string, fallback: number): number {
+  const n = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 // The OpenAI SDK appends /chat/completions to your baseURL, so the base must
 // already point at the /v1 root. Normalize any input (with or without /v1,
 // with or without a trailing slash) to that form.
@@ -134,17 +141,19 @@ export async function runAgentTurn(
   onToolCall?: (record: ToolCallRecord) => void,
 ): Promise<string> {
   const { openai, model, systemPrompt, tools, callTool } = cfg;
+  const maxIterations = envInt("SLASK_MAX_TOOL_ITERATIONS", MAX_TOOL_ITERATIONS);
+  const maxTokens = envInt("SLASK_MAX_TOKENS", MAX_TOKENS);
   const messages: ConversationMessage[] = [
     { role: "system", content: systemPrompt },
     ...requestMessages,
   ];
 
-  for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
+  for (let i = 0; i < maxIterations; i++) {
     const res = await openai.chat.completions.create({
       model,
       messages,
       tools,
-      max_tokens: MAX_TOKENS,
+      max_tokens: maxTokens,
     });
     const choice = res.choices?.[0];
     const message = choice?.message;
@@ -199,5 +208,5 @@ export async function runAgentTurn(
     return message.content ?? "";
   }
 
-  throw new Error(`stopped after ${MAX_TOOL_ITERATIONS} tool calls in one turn (safety cap)`);
+  throw new Error(`stopped after ${maxIterations} tool calls in one turn (safety cap)`);
 }

@@ -429,6 +429,57 @@ nohup slask-client schedule >/var/log/sched.log 2>&1 &
   recorded `ok`, a failed one `failed`; both set `lastRun`/`lastStatus`,
   which show in `schedule list`.
 
+## Ralph loops (coding & research)
+
+> Full run guide (requirements, files, scheduling, recovery): [RALPH.md](RALPH.md).
+
+A *Ralph* run is an autonomous loop: a task list worked through by repeated
+**fresh-context** agent iterations until every task passes (the pattern from
+[snarktank/ralph](https://github.com/snarktank/ralph)). Each iteration is a
+child `slask-client --prompt` process; its only memory is `prd.json`,
+`progress.txt` and git. State lives in `.slask-ralph/<name>/` (cwd).
+
+```sh
+slask-client ralph init api --mode code --check "npm run build && npm test"
+slask-client ralph add api "Add /health endpoint" --criteria "GET /health returns 200;test added"
+slask-client ralph run api --max 10        # foreground; or `ralph start api` (detached)
+slask-client ralph status api              # also: list, stop <name>
+slask-client ralph init survey --mode research   # then add tasks; or --from prd.json
+```
+
+For a large project, attach a description file (e.g. a PRD): `ralph init shop
+--spec tasks/prd-shop.md [--plan]` (copied to `.slask-ralph/shop/spec.md`; every
+iteration reads the relevant parts; `--plan` drafts the task list headlessly) or
+`/ralph plan shop --spec tasks/prd-shop.md` in chat (asks clarifying questions
+first). The local `prd` skill writes such a PRD. See [RALPH.md](RALPH.md).
+
+In chat, `/ralph plan <name> [code|research] [--spec <file>] [goal]` has the model draft the
+task list (it also has `ralph_*` tools, so "plan a research run on X" works);
+`/ralph start <name>` launches it.
+
+- **Completion is verified, not trusted.** The worker *claims* a task
+  (`ralph_complete_task`); the loop then runs the verifier. `code`: your
+  `--check` command (exit 0), then commits `feat: [T1] - title`. `research`: a
+  separate fresh-context checker judges the acceptance criteria against
+  `findings/<id>.md`; a final pass writes `report.md`.
+- A task that fails verification `maxFailures` (3) times in a row stops the run
+  as `stuck`; the failure output is fed to the next attempt and `progress.txt`.
+- Iterations get a `run_command` tool (one allow-listed program per call, no
+  shell; allow-list in `config.json`) and higher limits (`SLASK_MAX_TOOL_ITERATIONS`
+  40, `SLASK_MAX_TOKENS` 4096 — both overridable, also for normal chat).
+- Detached runs and iterations inherit `--model/--base-url/--config` from the
+  command that started them.
+- **Where results go:** code runs change the workspace itself (and commit).
+  Research runs write `findings/<task>.md` and the final `report.md` into the
+  visible folder `ralph-<name>/` (override with `ralph init --out <dir>`, or
+  `outputDir` in `ralph_create`). `.slask-ralph/<name>/` is internal loop state
+  (prd.json, progress.txt, logs, status) and not meant to be read as a result.
+- Local skill `ralph` has guidance on writing good task lists.
+- **Workspace:** everything is relative to the directory the client runs in.
+  `-C/--dir <path>` (any command) changes into that directory first, so you can
+  start the client from anywhere/scripts: `slask-client -C ~/proj ralph run api`.
+  `.env`, `mcp.json`, skills, file tools and the schedule file follow it too.
+
 ## Options & environment
 
 | Command           | Flag| Env var        | Description                                                                                                 |

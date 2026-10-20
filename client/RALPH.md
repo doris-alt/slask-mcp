@@ -1,0 +1,317 @@
+# Running a Ralph project
+
+A step-by-step guide to the built-in Ralph loop in `slask-client`: what you need,
+which files you create or edit, how to run it (foreground, background, scheduled),
+how to watch it, and how to recover when it stops. For a short overview see the
+"Ralph loops" section of `README.md`.
+
+## 1. What Ralph does
+
+A **Ralph run** is a named list of small tasks. The loop works through them one at
+a time. Each iteration is a **fresh `slask-client --prompt` process with an empty
+context**; its only memory is files (`prd.json`, `progress.txt`, and git history
+for code). After the worker says a task is done, the loop **verifies it itself**
+before marking it passing:
+
+| Mode       | Worker does                                   | Loop verifies with                              | Result lands in                                  |
+|------------|-----------------------------------------------|-------------------------------------------------|--------------------------------------------------|
+| `code`     | edits files, runs build/tests via `run_command` | your `check` command must exit 0, then commits  | the workspace itself (+ one git commit per task) |
+| `research` | investigates, writes `findings/<id>.md`       | a separate fresh-context **checker** pass       | `ralph-<name>/findings/` and `ralph-<name>/report.md` |
+
+The loop stops when all tasks pass (`done`), after `maxIterations` (`max-iterations`),
+when one task fails verification `maxFailures` times in a row (`stuck`), or when you
+stop it (`stopped`).
+
+## 2. Requirements
+
+- **Node.js >= 20** and a built client: `cd client && npm install && npm run build`.
+  Run it as `node dist/cli.js …` or as `slask-client` if linked/installed.
+- **A model endpoint** that supports OpenAI-style tool calling:
+  - real OpenAI: `OPENAI_API_KEY` set (default model `gpt-4o-mini`, change with `MODEL`/`--model`);
+  - or any OpenAI-compatible server (e.g. Ollama): `API_BASE=http://host:11434`, no key needed.
+  - Use a capable model. Iterations make up to 40 tool calls each; a weak model will
+    fail verification repeatedly and the run ends `stuck`.
+- **Code mode:** the toolchain your `check` command needs (e.g. `npm`), and **git** if you
+  want commits. In a non-git workspace the check still gates tasks; the commit step is
+  skipped and noted in `progress.txt`.
+- **Research mode:** the client has **no built-in web search or fetch tool**. Research
+  tasks can only use what an MCP server provides, plus local files. Configure an MCP
+  server with search/fetch/knowledge tools in `mcp.json` (section 3), or the worker will
+  have nothing to research with.
+- No MCP server is required for code mode (the built-in file tools and `run_command` are enough).
+
+## 3. Setup: files you create or edit
+
+All paths are relative to the **workspace** = the directory the client runs in. Pick it
+with `-C/--dir <path>` (any command) so you can start the client from anywhere:
+`slask-client -C ~/proj ralph run api`. `.env`, `mcp.json`, `skills/`, the file tools,
+`.slask-schedule.json` and `.slask-ralph/` all resolve in the workspace.
+
+| File (in the workspace)              | You edit it? | Purpose |
+|--------------------------------------|--------------|---------|
+| `.env`                               | yes, once    | `OPENAI_API_KEY`, `MODEL`, `API_BASE`, `SLASK_*` settings (shell values win) |
+| `mcp.json`                           | optional     | extra MCP servers (needed for research tools); copy `client/mcp.example.json` |
+| `.slask-ralph/<name>/prd.json`       | yes (when stopped) | the task list: titles, criteria, priority |
+| `.slask-ralph/<name>/config.json`    | yes (when stopped) | verifier and limits (below) |
+| `.slask-ralph/<name>/spec.md`        | via `--spec` / `ralph spec` | the project description iterations read (a copy) |
+| `.slask-ralph/<name>/progress.txt`   | rarely       | append-only learnings; you may seed the "Codebase Patterns" section with project conventions |
+| `ralph-<name>/` (research output)    | no           | deliverables written by the loop |
+| `.slask-ralph/<name>/status.json`, `run.pid`, `run.log`, `iterations/`, `verdict.json` | no | loop bookkeeping and logs |
+
+Minimal `.env`:
+
+```sh
+OPENAI_API_KEY=sk-...
+MODEL=gpt-4o            # a stronger model than the default is recommended
+```
+
+### `config.json` fields
+
+```json
+{
+  "mode": "code",
+  "check": "npm run build && npm test",
+  "commit": true,
+  "maxIterations": 10,
+  "timeoutS": 1800,
+  "maxFailures": 3,
+  "allow": ["git", "npm", "pnpm", "npx", "node", "tsc", "cargo", "python3", "make", "ls", "cat"],
+  "outputDir": "ralph-<name>"
+}
+```
+
+- `check` (code): shell command (`sh -c`) that must exit 0. Without it the loop trusts the
+  worker's claim. Set it. Make sure it fails when the work is wrong.
+- `commit` (code): commit `feat: [T1] - title` after each verified task.
+- `maxIterations`: hard cap per `ralph run` (also `--max N`).
+- `timeoutS`: per-child timeout (worker, checker, and the `check` command).
+- `maxFailures`: consecutive verification failures of one task before the run is `stuck`.
+- `allow`: first words `run_command` may execute (one program per call, no shell, `&&`/`|` rejected).
+  Remove `node`/`npx`/`python3` if you want it tighter; add what your project needs (`go`, `pytest`, …).
+- `outputDir` (research): visible folder for findings and report; must be relative, no `..`,
+  not under `.slask-ralph/`.
+
+### `prd.json` shape
+
+```json
+{
+  "name": "api",
+  "mode": "code",
+  "description": "overall goal",
+  "branchName": "ralph/api",
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Add /health endpoint",
+      "description": "optional detail",
+      "acceptanceCriteria": ["GET /health returns 200 {\"ok\":true}", "a test covers it"],
+      "priority": 1,
+      "passes": false
+    }
+  ]
+}
+```
+
+Lower `priority` runs first. `passes`, `claimed`, `failures`, `lastFailure`, `notes` are
+loop-managed. Only edit `prd.json` and `config.json` **while the run is not running**; the loop
+rewrites `prd.json` every iteration.
+
+## 4. Create a run
+
+### Option A: let the model plan it (chat)
+
+```
+slask-client -C ~/proj
+> /ralph plan api code Add a /health endpoint and request logging to the server
+> /ralph plan survey research Compare three vector databases for our use case
+```
+
+The model drafts the tasks (for code it inspects the project and proposes a `check`
+command), calls `ralph_create`, shows you the list and waits. Review it with
+`/ralph status api`; fix with `/ralph add api <title>` or by editing `prd.json`.
+Asking in plain language ("plan a research run on X") works the same way.
+
+### Option B: the CLI
+
+```sh
+slask-client -C ~/proj ralph init api --mode code --check "npm run build && npm test"
+slask-client -C ~/proj ralph add api "Add /health endpoint" --criteria "GET /health returns 200;a test covers it"
+slask-client -C ~/proj ralph init survey --mode research --out reports/survey
+```
+
+`--from prd.json` imports an existing task list; it accepts this client's `tasks` and
+snarktank/ralph's `userStories`. `ralph init` fails if the run already exists.
+
+### Writing good tasks (the part that decides success)
+
+- One task = one iteration. If it needs more than a couple of sentences, split it.
+- Order by dependency. 2 to 5 concrete, checkable criteria per task.
+- Code: make the first task create or repair the test harness if there isn't one.
+- Research: one question per task; require sources and stated uncertainty in the criteria.
+  Don't add a "write the report" task; the loop does a final synthesis pass itself.
+- The local `ralph` skill (`skills/ralph/SKILL.md`) carries this guidance for the model.
+
+## 4b. Describing a large project (spec file)
+
+A one-line goal is rarely enough. Attach a **project description file** (markdown;
+a PRD works well) when you create the run:
+
+```sh
+slask-client -C ~/proj ralph init shop --mode code --check "npm run build && npm test" \
+    --spec tasks/prd-shop.md          # path relative to the workspace
+```
+
+- The file is **copied** to `.slask-ralph/shop/spec.md` (max 2 MB). Editing the original
+  later does not change a run; replace the copy with `ralph spec shop tasks/prd-shop.md`.
+- If you give no description, the run's goal is taken from the spec's first `# ` heading.
+- Every iteration (worker, checker, final synthesis) is told to read the parts of the spec
+  relevant to its task. The spec is **not** pasted into the prompt, so keep an overview
+  (goals, non-goals, technical considerations) at the top, and have tasks name the
+  sections they implement.
+- Works in both modes, and together with `--from prd.json`.
+
+**Turning the spec into tasks**
+
+- *Interactive (chat):* `/ralph plan shop --spec tasks/prd-shop.md`. It creates the run if
+  needed, then the model reads the spec, asks 3-5 clarifying questions with lettered options
+  (answer like `1A, 2C`) if anything essential is unclear, sets the `check` command (code)
+  and adds tasks. It shows you the list and waits; start the run yourself afterwards.
+  Running it on an existing run appends tasks.
+- *Headless (scripts):* add `--plan` to `init`:
+  `slask-client -C ~/proj ralph init shop --spec tasks/prd-shop.md --plan`.
+  One non-interactive model run drafts the task list (it cannot ask; its assumptions are
+  logged in `progress.txt` as `Assumption: ...`). It never starts the run. Review with
+  `ralph status shop` and edit before `ralph run`.
+- *Writing the PRD itself:* the local `prd` skill (`skills/prd/SKILL.md`) interviews you
+  and writes `tasks/prd-<name>.md`. Skills load from the **workspace's** `./skills/`, so
+  copy `skills/prd` and `skills/ralph` into a workspace to use them there. The plan
+  prompts above are built in and don't depend on the skills.
+
+## 5. Before you start (code mode)
+
+- **Start from a clean git tree, on a branch.** After each verified task the loop runs
+  `git add -A` (scoped to the workspace) and commits. Unrelated uncommitted changes would be
+  swept into those commits. Set `branchName` in `prd.json` and the loop checks it out
+  (or creates it) at the start of the run.
+- `.slask-ralph/` (prd, progress, status) is committed with the work, as in the original Ralph.
+  `iterations/` logs and `run.*` are excluded. Add `.slask-ralph/` to `.gitignore` if you
+  prefer it out of history.
+- **Safety:** runs are unattended and the worker can write files in the workspace and run the
+  allow-listed programs. `node`, `npx` and `python3` can execute arbitrary code, and the
+  checker is told not to edit but isn't technically prevented from. Use a throwaway
+  branch/clone or a container for anything you don't fully trust.
+
+## 6. Run it
+
+```sh
+# foreground (Ctrl+C stops after killing the current iteration)
+slask-client -C ~/proj ralph run api --max 10
+
+# background (detached; log in .slask-ralph/api/run.log)
+slask-client -C ~/proj ralph start api
+slask-client -C ~/proj ralph stop api
+```
+
+In chat: `/ralph start api`, `/ralph stop api`, or ask the model (`ralph_start`).
+Only one loop per run is allowed (a pid lock); starting a second reports the pid.
+
+Detached runs and iteration children inherit `--model`, `--base-url`, `--config`
+(and `--no-default`) from the command that launched them, and the workspace
+directory. Per-iteration limits default to 40 tool rounds and 4096 tokens per reply
+(`SLASK_MAX_TOOL_ITERATIONS`, `SLASK_MAX_TOKENS`); `run_command` times out after
+300 s (`SLASK_RUN_COMMAND_TIMEOUT_S`).
+
+## 7. Watch it
+
+```sh
+slask-client -C ~/proj ralph status api     # tasks, [x]/[ ], state, iteration, failures, output dir
+slask-client -C ~/proj ralph list           # one line per run
+tail -f ~/proj/.slask-ralph/api/run.log     # background runs
+less ~/proj/.slask-ralph/api/iterations/03.log   # what iteration 3's agent did
+cat ~/proj/.slask-ralph/api/progress.txt    # PASS/FAIL per task + the worker's notes
+```
+
+States: `running`, `done`, `stuck`, `max-iterations`, `stopped`. For a research run the
+deliverables are in `ralph-<name>/` (`findings/T1.md`, …, `report.md`).
+
+## 8. Scheduling
+
+The built-in scheduler (`slask-client schedule`) fires **prompts**, not CLI commands:
+each job spawns `slask-client --prompt "<text>" --quiet`. There are two ways to use it
+for Ralph.
+
+**a) Scheduler job whose prompt starts the run** (the model calls `ralph_start`):
+
+```sh
+# the daemon must run from, or be pointed at, the workspace
+cd ~/proj && slask-client schedule            # keep alive (tmux/launchd/systemd)
+
+# in another shell, same workspace:
+slask-client -C ~/proj schedule add "0 2 * * *" "Start the Ralph run named nightly-audit with ralph_start, then reply with its pid."
+slask-client -C ~/proj schedule add at "2026-10-21T01:30:00Z" "Start the Ralph run named api with ralph_start."
+```
+
+- The jobs file is `<workspace>/.slask-schedule.json`; the daemon re-reads it every ~15 s.
+- The daemon's children inherit the **daemon's** cwd. Start the daemon with `-C ~/proj`
+  (or `cd` first) so the child finds the same `.env`, `mcp.json` and `.slask-ralph/`.
+- `ralph_start` returns immediately (the loop runs detached), so the scheduler job
+  finishes in seconds. Check results with `ralph status`. A weak model might not call the
+  tool; keep the prompt literal and check `lastStatus` with `schedule list`.
+- A one-shot whose time passed while the daemon was down is **not** fired later.
+- Recurring runs: a finished run has all tasks `passes: true`, so a second start does
+  nothing useful. For repeated work, schedule a prompt that first adds tasks
+  (`ralph_add_task`) or creates a fresh run, then starts it.
+
+**b) Plain OS scheduling (deterministic, no model in the loop):**
+
+```cron
+0 2 * * *  cd ~/proj && /usr/local/bin/node /path/to/client/dist/cli.js ralph run nightly-audit --max 15 >> /tmp/ralph-nightly-audit.log 2>&1
+```
+
+or `slask-client -C ~/proj ralph run …`. Prefer this when the run must start reliably.
+
+## 9. Resuming, retrying, changing course
+
+- **Resume:** run `ralph run <name>` again. Tasks with `passes: true` are skipped; the
+  iteration counter restarts at 1 against `maxIterations`.
+- **`stuck`:** read the failure at the bottom of `progress.txt` (or `lastFailure` in
+  `prd.json`). Fix the cause, then rewrite or split the task (sharper criteria, smaller scope).
+  Set that task's `"failures": 0` before re-running; otherwise the next failure re-sticks
+  it immediately because the counter persists.
+- **`max-iterations`:** raise it with `--max N` or `maxIterations`, then run again.
+- **Stop mid-run:** `ralph stop <name>` / Ctrl+C. The in-flight iteration is killed and its
+  task stays unverified (retried on the next run).
+- **Add or reorder tasks:** `ralph add`, or edit `prd.json` while stopped.
+- **Start over:** delete `.slask-ralph/<name>/` (and `ralph-<name>/` for research), then
+  `init` again. There is no archive step; copy the folder first if you want to keep it.
+
+## 10. Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---------|--------------------|
+| every iteration: "worker ended without calling ralph_complete_task" | model too weak, or hit the 40-round limit; use a better model (`MODEL`), raise `SLASK_MAX_TOOL_ITERATIONS`, or split the task |
+| `check … failed` repeatedly | the check really fails or needs tooling the machine lacks; run it by hand in the workspace |
+| `command "x" is not allowed` | add the program to `allow` in `config.json` |
+| `there is no shell` | the model tried `&&`/`|`; it must issue one command per `run_command` call (the loop's own `check` is run through a shell and may chain) |
+| `already running (pid …)` | another loop holds the run; `ralph stop <name>` (a pid file of a dead process is ignored automatically) |
+| research findings thin / invented | no MCP search/fetch tool is configured; add one to `mcp.json` and tighten the criteria (sources required) |
+| scheduler job ran but nothing happened | wrong cwd for the daemon (`-C`), or the model did not call `ralph_start`; check `schedule list` and `.slask-ralph/<name>/run.log` |
+| `OPENAI_API_KEY is not set` | set it in the workspace `.env` or the shell, or point `API_BASE` at a local server |
+| MCP server unreachable warning | non-fatal; built-in tools still work, but research needs its tools |
+
+## 11. Quick reference
+
+```text
+slask-client [-C <dir>] ralph init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>] [--max N]
+slask-client [-C <dir>] ralph spec <name> <file>        replace the project description
+slask-client [-C <dir>] ralph add <name> <title> [--criteria "a;b;c"]
+slask-client [-C <dir>] ralph run <name> [--max N]      foreground
+slask-client [-C <dir>] ralph start|stop <name>         background
+slask-client [-C <dir>] ralph status [name] | list
+chat:   /ralph  list | status | plan [--spec f] | init [--spec f] | add | start | stop
+tools:  ralph_list ralph_status ralph_create ralph_add_task ralph_configure ralph_note ralph_start ralph_stop   (chat)
+        ralph_note ralph_complete_task run_command                                    (worker iterations)
+        ralph_verdict                                                                 (research checker)
+env:    SLASK_MAX_TOOL_ITERATIONS (40 in runs)  SLASK_MAX_TOKENS (4096 in runs)  SLASK_RUN_COMMAND_TIMEOUT_S (300)
+        SLASK_SCHEDULE_TIMEOUT_S (1800)  SLASK_SCHEDULE_POLL_S (15)
+```
