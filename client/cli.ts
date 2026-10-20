@@ -509,12 +509,16 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (registry.views.length === 0) {
-    const last = registry.warnings.length
-      ? registry.warnings[registry.warnings.length - 1]
-      : null;
-    fail(`no MCP servers could be reached` + (last ? ` (last error: ${last.error})` : ""));
-    return;
+  // No reachable MCP server is *not* fatal: the built-in file/schedule tools
+  // and local skills stay fully usable, so the client always starts. Per-server
+  // warnings are shown here (once) for every command — chat, one-shot, list, call.
+  if (registry.views.length === 0 && registry.warnings.length === 0) {
+    console.error(
+      "⚠ no MCP servers configured — using only built-in tools and local skills."
+    );
+  }
+  for (const w of registry.warnings) {
+    console.error(`⚠ could not reach server ${w.name}: ${w.error}${hintFor(w.error)}`);
   }
 
   if (!sub || sub === "chat") {
@@ -537,11 +541,6 @@ async function main(): Promise<void> {
   if (sub !== "list" && sub !== "call") {
     fail(`unknown command: ${sub}\n\n${HELP}`);
     return;
-  }
-
-  // Show any servers we could not reach (skipped, not fatal).
-  for (const w of registry.warnings) {
-    console.error(`⚠ could not reach server ${w.name}: ${w.error}${hintFor(w.error)}`);
   }
 
   let action = "the request";

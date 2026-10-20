@@ -14,7 +14,7 @@ import { createInterface } from "node:readline";
 import type { Writable } from "node:stream";
 
 import { OpenAI } from "openai";
-import { hintFor, printTools } from "./client.js";
+import { printTools } from "./client.js";
 import { closeAll, callToolBy, openAiTools } from "./servers.js";
 import {
   DEFAULT_API_BASE,
@@ -261,10 +261,10 @@ export interface ChatState {
 }
 
 // Open the OpenAI client, build the MCP tool list, and discover local skills
-// (best-effort, like the mcp.json servers). Prints any unreachable-server
-// warnings so the REPL and one-shot runs report them identically.
-// An `openai` client can be injected (optional seam) so callers that don't
-// need a real model (tests) can skip the real `OpenAI` constructor.
+// (best-effort, like the mcp.json servers). Per-server connection warnings are
+// printed once by the caller (cli.ts) before dispatch, so this layer does not
+// re-emit them. An `openai` client can be injected (optional seam) so callers
+// that don't need a real model (tests) can skip the real `OpenAI` constructor.
 async function buildChatState(options: {
   registry: Registry;
   model: string;
@@ -293,12 +293,6 @@ async function buildChatState(options: {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(color("red", `  ⚠ could not discover local skills: ${msg}`));
-  }
-
-  for (const w of registry.warnings) {
-    console.error(
-      color("red", `  ⚠ could not reach server ${w.name}: ${w.error}${hintFor(w.error)}`)
-    );
   }
 
   return {
