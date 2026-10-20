@@ -1365,6 +1365,7 @@ export const RALPH_HELP = [
   "  /ralph plan <name> [code|research] [goal...]     have the model draft the task list (asks questions first);",
   "                                                   creates the run if needed (then a goal is required)",
   "  /ralph add <name> <title...>                     append a task",
+  "  /ralph split <name> <task-id>                    replace a too-big task with 2-4 smaller ones (model-assisted)",
   "  /ralph start <name>                              run the loop in the background",
   "  /ralph stop <name>                               stop a running loop",
   "",
@@ -1380,6 +1381,7 @@ export type RalphParse =
   | { kind: "init"; name: string; mode: RalphMode; spec?: string }
   | { kind: "spec"; name: string; file: string }
   | { kind: "check"; name: string; command: string }
+  | { kind: "split"; name: string; id: string }
   | { kind: "add"; name: string; title: string }
   | { kind: "start"; name: string }
   | { kind: "stop"; name: string }
@@ -1430,6 +1432,12 @@ export function parseRalphCmd(line: string): RalphParse | null {
       }
       return { kind: "spec", name, file: parts[3] };
     }
+    case "split": {
+      if (name === undefined || parts[3] === undefined || parts.length > 4) {
+        return { kind: "error", message: "usage: /ralph split <name> <task-id> (e.g. /ralph split local-llm T2)" };
+      }
+      return { kind: "split", name, id: parts[3] };
+    }
     case "check": {
       const command = parts.slice(3).join(" ");
       if (name === undefined || command === "") {
@@ -1456,6 +1464,7 @@ export function parseRalphCmd(line: string): RalphParse | null {
 export async function runRalphRepl(
   p: RalphParse,
   base: string = process.cwd(),
+  agentFn?: (a: AgentRunArgs) => Promise<ExecResult>,
 ): Promise<{ text?: string; prompt?: string }> {
   try {
     switch (p.kind) {
@@ -1480,6 +1489,8 @@ export async function runRalphRepl(
       case "spec":
         await setSpec(base, p.name, await readSpecSource(base, p.file));
         return { text: `spec for "${p.name}" replaced from ${p.file}` };
+      case "split":
+        return { text: (await splitViaAgent(base, p.name, p.id, agentFn)).text };
       case "check": {
         await configureRun(base, p.name, { check: p.command });
         return { text: `check for "${p.name}" set to: ${p.command}` };
@@ -1562,6 +1573,34 @@ const defaultAgentFn = async (a: AgentRunArgs): Promise<ExecResult> => {
   });
 };
 
+/**
+ * Have a splitter child replace task `id` with 2-4 smaller tasks (shared by
+ * `slask-client ralph split` and `/ralph split`). `done` = the task was split.
+ */
+export async function splitViaAgent(
+  base: string,
+  name: string,
+  id: string,
+  agentFn: (a: AgentRunArgs) => Promise<ExecResult> = defaultAgentFn,
+): Promise<{ done: boolean; code: number; text: string }> {
+  const prd = await loadPrd(base, name);
+  const task = prd.tasks.find((x) => x.id === id);
+  if (task === undefined) throw new Error(`no task ${id} in run "${name}"`);
+  const cfg = await loadConfig(base, name);
+  const dir = runDir(base, name);
+  const prompt = splitterPrompt(
+    prd, cfg, task, relative(base, dir), outputDirOf(name, cfg), (await specSize(base, name)) !== null,
+    task.lastFailure ?? "manual split requested",
+  );
+  const env = ralphChildEnv(dir, name, cfg, "splitter", id);
+  const r = await agentFn({ prompt, env, timeoutMs: cfg.timeoutS * 1000, logFile: join(dir, "iterations", `split-${id}.log`) });
+  const done = !(await loadPrd(base, name)).tasks.some((x) => x.id === id);
+  const text = done
+    ? `split ${id}:\n${await formatStatus(base, name)}`
+    : `${id} was not split (exit ${r.code}); see ${STATE_DIR}/${name}/iterations/split-${id}.log`;
+  return { done, code: r.code, text };
+}
+
 export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd(), deps: RalphCliDeps = {}): Promise<number> {
   const [, sub, name] = a.positional;
   const log = (s: string) => console.log(s);
@@ -1640,21 +1679,9 @@ export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd
     case "split": {
       const id = a.positional[3];
       if (name === undefined || id === undefined) throw new Error(CLI_USAGE);
-      const prd = await loadPrd(base, name);
-      const task = prd.tasks.find((x) => x.id === id);
-      if (task === undefined) throw new Error(`no task ${id} in run "${name}"`);
-      const cfg = await loadConfig(base, name);
-      const dir = runDir(base, name);
-      const prompt = splitterPrompt(
-        prd, cfg, task, relative(base, dir), outputDirOf(name, cfg), (await specSize(base, name)) !== null,
-        task.lastFailure ?? "manual split requested",
-      );
-      const env = ralphChildEnv(dir, name, cfg, "splitter", id);
-      const r = await (deps.agentFn ?? defaultAgentFn)({ prompt, env, timeoutMs: cfg.timeoutS * 1000, logFile: join(dir, "iterations", `split-${id}.log`) });
-      const after = await loadPrd(base, name);
-      const done = !after.tasks.some((x) => x.id === id);
-      log(done ? `split ${id}:\n${await formatStatus(base, name)}` : `${id} was not split (exit ${r.code}); see ${STATE_DIR}/${name}/iterations/split-${id}.log`);
-      return done ? 0 : 1;
+      const r = await splitViaAgent(base, name, id, deps.agentFn);
+      log(r.text);
+      return r.done ? 0 : 1;
     }
     case "run": {
       if (name === undefined) throw new Error(CLI_USAGE);

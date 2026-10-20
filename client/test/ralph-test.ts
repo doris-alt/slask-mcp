@@ -594,6 +594,18 @@ async function main(): Promise<void> {
     assert.equal(await handleRalphCli({ positional: ["ralph", "split", "ms", "T1"] }, base, { agentFn }), 0);
     assert.deepEqual((await loadPrd(base, "ms")).tasks.map((x) => x.id), ["T1.1", "T1.2"]);
     assert.equal(await handleRalphCli({ positional: ["ralph", "split", "ms", "T1.1"] }, base, { agentFn: async () => ok() }), 1);
+    // chat: /ralph split <name> <task-id>
+    assert.deepEqual(parseRalphCmd("/ralph  split local-llm T2 "), { kind: "split", name: "local-llm", id: "T2" });
+    assert.equal(parseRalphCmd("/ralph split x")?.kind, "error");
+    assert.equal(parseRalphCmd("/ralph split x T1 extra")?.kind, "error");
+    await createRun(base, { name: "cs", mode: "code", tasks: [{ title: "huge" }] });
+    const viaChat = await runRalphRepl(parseRalphCmd("/ralph split cs T1")!, base, async (a) => {
+      await asChild(a.env, () => callRalphTool(base, "ralph_split_task", { tasks: [small("c1"), small("c2")] }));
+      return ok();
+    });
+    assert.match(viaChat.text ?? "", /split T1:[\s\S]*T1\.1 c1[\s\S]*T1\.2 c2/);
+    assert.match((await runRalphRepl(parseRalphCmd("/ralph split cs T9")!, base, async () => ok())).text ?? "", /no task T9/);
+    assert.match((await runRalphRepl(parseRalphCmd("/ralph split cs T1.1")!, base, async () => ok())).text ?? "", /was not split/);
     assert.equal(parse(["ralph", "init", "x", "--context", "16000", "--tool-budget", "12"]).ralph.context, "16000");
     console.log("PASS test16 — auto-split on out-of-budget iterations, real error in failure reason, ralph split CLI");
     await rm(base, { recursive: true, force: true });

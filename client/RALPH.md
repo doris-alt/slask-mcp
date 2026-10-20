@@ -115,7 +115,8 @@ small enough to finish inside it. Four mechanisms enforce that:
 4. **Automatic split.** If an iteration ends without claiming the task because it ran out of
    context, tool calls or time, the loop runs a splitter pass that replaces the task with 2-4
    smaller ones (`T2` -> `T2.1`, `T2.2`; up to two levels). That is not counted as a failure.
-   You can also trigger it by hand: `slask-client ralph split <name> <task-id>`.
+   You can also trigger it by hand: `slask-client ralph split <name> <task-id>`, or in chat
+   `/ralph split <name> <task-id>` (e.g. `/ralph split local-llm T2`).
 
 If your model keeps dying with "cut off by the token limit", lower `contextTokens` (and/or
 `toolBudget`) rather than raising anything: smaller budgets mean smaller tasks and shorter
@@ -351,7 +352,7 @@ slask-client [-C <dir>] ralph run <name> [--max N]      foreground
 slask-client [-C <dir>] ralph start|stop <name>         background
 slask-client [-C <dir>] ralph status [name] | list
 chat:   /ralph list | status <n> | init <n> [mode] [spec-file] | spec <n> <file> | check <n> <cmd...>
-                | plan <n> [mode] [goal...] | add <n> <title...> | start <n> | stop <n>      (positional; flags are CLI-only)
+                | plan <n> [mode] [goal...] | add <n> <title...> | split <n> <task-id> | start <n> | stop <n>   (positional; flags are CLI-only)
 tools:  ralph_list ralph_status ralph_create ralph_add_task ralph_configure ralph_note ralph_start ralph_stop   (chat)
         ralph_status ralph_add_task ralph_note ralph_complete_task ralph_split_task run_command                  (worker iterations)
         ralph_status ralph_verdict                                                                              (research checker)

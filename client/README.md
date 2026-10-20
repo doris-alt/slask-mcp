@@ -465,7 +465,7 @@ task list (it also has `ralph_*` tools, so "plan a research run on X" works);
 - **Iterations are sized to the model's context window** (`contextTokens`, default
   32000; `ralph init --context <tokens>`): planners must produce small tasks (oversized ones are
   rejected), tool output is truncated and old output dropped, and a task that still doesn't fit is
-  split automatically (`ralph split <name> <id>` by hand). See RALPH.md.
+  split automatically (`ralph split <name> <id>` or `/ralph split <name> <id>` by hand). See RALPH.md.
 - A task that fails verification `maxFailures` (3) times in a row stops the run
   as `stuck`; the failure output is fed to the next attempt and `progress.txt`.
 - Iterations get a `run_command` tool (one allow-listed program per call, no

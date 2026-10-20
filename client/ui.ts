@@ -284,7 +284,7 @@ const SLASH_COMMANDS = [
 const SCHEDULE_SUBCOMMANDS = ["add", "list", "rm"];
 // Kept in sync with parseRalphCmd in ralph.ts.
 const RALPH_SUBCOMMANDS = [
-  "add", "check", "init", "list", "plan", "spec", "start", "status", "stop",
+  "add", "check", "init", "list", "plan", "spec", "split", "start", "status", "stop",
 ];
 
 export function slashCompletions(line: string): [string[], string] {
@@ -805,6 +805,9 @@ export async function startChat({
         const ralphParsed = parseRalphCmd(input);
         if (ralphParsed !== null) {
           process.stdout.write("\n");
+          if (ralphParsed.kind === "split") {
+            console.log(color("dim", `  splitting ${ralphParsed.id} (runs a model pass; this can take a minute)…`));
+          }
           const res = await runRalphRepl(ralphParsed, state.baseDir);
           if (res.prompt === undefined) {
             if (res.text !== undefined) console.log(color("green", `  ${res.text.replace(/\n/g, "\n  ")}\n`));
