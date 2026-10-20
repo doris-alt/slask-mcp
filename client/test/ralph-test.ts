@@ -236,9 +236,23 @@ async function main(): Promise<void> {
   {
     assert.equal(parseRalphCmd("/schedule list"), null);
     assert.deepEqual(parseRalphCmd("/ralph"), { kind: "help" });
-    assert.deepEqual(parseRalphCmd("/ralph init x research"), { kind: "init", name: "x", mode: "research", check: undefined, spec: undefined });
-    assert.deepEqual(parseRalphCmd("/ralph init x --check npm run build"), { kind: "init", name: "x", mode: "code", check: "npm run build", spec: undefined });
-    assert.deepEqual(parseRalphCmd("/ralph plan x research Compare A and B"), { kind: "plan", name: "x", mode: "research", goal: "Compare A and B", spec: undefined });
+    assert.deepEqual(parseRalphCmd("/ralph init x research"), { kind: "init", name: "x", mode: "research", spec: undefined });
+    assert.deepEqual(parseRalphCmd("/ralph init x tasks/p.md"), { kind: "init", name: "x", mode: "code", spec: "tasks/p.md" });
+    assert.deepEqual(parseRalphCmd("/ralph init x research tasks/p.md"), { kind: "init", name: "x", mode: "research", spec: "tasks/p.md" });
+    assert.equal(parseRalphCmd("/ralph init x a.md b.md")?.kind, "error");
+    assert.deepEqual(parseRalphCmd("/ralph check x npm run build && npm test"), { kind: "check", name: "x", command: "npm run build && npm test" });
+    assert.deepEqual(parseRalphCmd("/ralph spec x tasks/p.md"), { kind: "spec", name: "x", file: "tasks/p.md" });
+    assert.equal(parseRalphCmd("/ralph spec x")?.kind, "error");
+    // flags are CLI-only: init/spec reject them with a pointer instead of misreading
+    for (const l of ["/ralph init x --spec p.md", "/ralph spec x --file p.md", "/ralph start x --now"]) {
+      const r = parseRalphCmd(l);
+      assert.equal(r?.kind, "error", l);
+      assert.match((r as { message: string }).message, /options are not used in chat/);
+    }
+    // free text (goal / title / command) may contain dashes
+    assert.equal(parseRalphCmd("/ralph check x npm test -- --coverage")?.kind, "check");
+    assert.equal(parseRalphCmd("/ralph plan x Fix the -v flag")?.kind, "plan");
+    assert.deepEqual(parseRalphCmd("/ralph plan x research Compare A and B"), { kind: "plan", name: "x", mode: "research", goal: "Compare A and B" });
     assert.deepEqual(parseRalphCmd("/ralph add x Do the thing"), { kind: "add", name: "x", title: "Do the thing" });
     assert.equal(parseRalphCmd("/ralph start")?.kind, "error");
     const cfg = parse(["ralph", "init", "x", "--mode", "research", "--check", "make", "--max", "4", "--from", "p.json", "--criteria", "a;b"]);
@@ -248,7 +262,7 @@ async function main(): Promise<void> {
     assert.equal(parse(["--dir", "/y", "list"]).dir, "/y");
     assert.deepEqual(parse(["-C", "/x", "ralph", "list"]).positional, ["ralph", "list"]);
     assert.equal(parse(["list"]).dir, null);
-    console.log("PASS test8 — /ralph REPL + CLI flag parsing");
+    console.log("PASS test8 — /ralph REPL (positional) + CLI flag parsing");
   }
 
   // -- test9: abort via signal stops the loop ----------------------------------
@@ -359,22 +373,28 @@ async function main(): Promise<void> {
   {
     const base = await tmp();
     await writeFile(join(base, "prd.md"), "# Shop\n\n- US-1 cart\n");
-    assert.deepEqual(parseRalphCmd("/ralph plan x --spec prd.md research Do it"), { kind: "plan", name: "x", mode: "research", goal: "Do it", spec: "prd.md" });
-    assert.deepEqual(parseRalphCmd("/ralph plan x --spec prd.md"), { kind: "plan", name: "x", mode: "code", goal: "", spec: "prd.md" });
     assert.equal(parseRalphCmd("/ralph plan")?.kind, "error");
     assert.equal(parseRalphCmd("/ralph plan x")?.kind, "plan");
-    assert.match((await runRalphRepl(parseRalphCmd("/ralph plan ghost")!, base)).text ?? "", /no run named "ghost"/);
-    assert.equal(parseRalphCmd("/ralph plan x --spec")?.kind, "error");
-    assert.equal((parseRalphCmd("/ralph init x --spec a.md") as { spec?: string }).spec, "a.md");
+    assert.match((await runRalphRepl(parseRalphCmd("/ralph plan ghost")!, base)).text ?? "", /no run named "ghost".*\/ralph init ghost/);
     assert.deepEqual(parse(["ralph", "init", "x", "--spec", "p.md", "--plan"]).ralph, { spec: "p.md", plan: true });
 
-    // chat plan: creates the run with the spec, returns the interactive prompt
-    const res = await runRalphRepl(parseRalphCmd("/ralph plan shop --spec prd.md")!, base);
+    // chat flow: init with spec file, check, spec replace, then plan (interactive prompt)
+    assert.match((await runRalphRepl(parseRalphCmd("/ralph init shop prd.md")!, base)).text ?? "", /created run "shop".*with spec/);
+    assert.match((await runRalphRepl(parseRalphCmd("/ralph check shop npm test")!, base)).text ?? "", /check for "shop" set/);
+    assert.equal((await loadConfig(base, "shop")).check, "npm test");
+    await writeFile(join(base, "prd-b.md"), "# Shop B\n");
+    assert.match((await runRalphRepl(parseRalphCmd("/ralph spec shop prd-b.md")!, base)).text ?? "", /replaced/);
+    assert.equal(await readFile(join(base, ".slask-ralph/shop/spec.md"), "utf8"), "# Shop B\n");
+    await setSpec(base, "shop", "# Shop\n\n- US-1 cart\n");
+    assert.match((await runRalphRepl(parseRalphCmd("/ralph spec shop nope.md")!, base)).text ?? "", /not found/);
+    const res = await runRalphRepl(parseRalphCmd("/ralph plan shop")!, base);
     assert.ok(res.prompt && res.prompt.includes("clarifying questions") && res.prompt.includes(".slask-ralph/shop/spec.md"));
     assert.ok(res.prompt!.includes("ralph_configure") && res.prompt!.includes("Do NOT start the run"));
     assert.equal((await loadPrd(base, "shop")).description, "Shop");
-    const again = await runRalphRepl(parseRalphCmd("/ralph plan shop")!, base); // existing run: no recreate
-    assert.ok(again.prompt);
+    // new run from a goal (no spec): created with the goal as description
+    const g = await runRalphRepl(parseRalphCmd("/ralph plan quick research Compare A and B")!, base);
+    assert.ok(g.prompt && g.prompt.includes("Compare A and B"));
+    assert.equal((await loadPrd(base, "quick")).mode, "research");
 
     // headless: init --spec --plan with a fake planner that adds tasks
     let seen = "";
@@ -397,7 +417,7 @@ async function main(): Promise<void> {
     await writeFile(join(base, "prd2.md"), "# Shop v2\n");
     assert.equal(await handleRalphCli({ positional: ["ralph", "spec", "auto", "prd2.md"] }, base), 0);
     assert.equal(await readFile(join(base, ".slask-ralph/auto/spec.md"), "utf8"), "# Shop v2\n");
-    console.log("PASS test13 — /ralph plan --spec, init --spec --plan (headless), spec replace");
+    console.log("PASS test13 — /ralph init/spec/check/plan (positional), init --spec --plan (headless CLI), spec replace");
     await rm(base, { recursive: true, force: true });
   }
 

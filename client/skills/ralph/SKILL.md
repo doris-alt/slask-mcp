@@ -10,7 +10,8 @@ quality of the task list decides the outcome.
 ## Large projects: use a spec file
 A one-line goal is not enough for a big project. Write a project description
 (the `prd` skill produces one: `tasks/prd-<name>.md`) and attach it:
-`ralph init <name> --spec <file> [--plan]` or `/ralph plan <name> --spec <file>`.
+`slask-client ralph init <name> --spec <file> [--plan]` (shell) or, in chat,
+`/ralph init <name> code <file>` then `/ralph plan <name>`.
 The file is copied to `.slask-ralph/<name>/spec.md` and every iteration reads the
 parts relevant to its task. Give each task a description that names the spec
 sections it implements, so iterations don't re-read everything.

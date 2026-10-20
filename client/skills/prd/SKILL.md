@@ -53,6 +53,6 @@ Tell the user the next step:
 slask-client ralph init <name> --spec tasks/prd-<short-name>.md --mode code --check "<build+test cmd>" --plan
 ```
 
-(or `/ralph plan <name> --spec tasks/prd-<short-name>.md` in chat for an interactive
-version). `--plan` drafts the task list from the PRD; review it with
+(or, in chat, `/ralph init <name> code tasks/prd-<short-name>.md` then
+`/ralph plan <name>` for an interactive version). `--plan` drafts the task list from the PRD; review it with
 `slask-client ralph status <name>` before `ralph run`.

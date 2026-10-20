@@ -126,8 +126,8 @@ slask-client -C ~/proj
 > /ralph plan survey research Compare three vector databases for our use case
 ```
 
-The model drafts the tasks (for code it inspects the project and proposes a `check`
-command), calls `ralph_create`, shows you the list and waits. Review it with
+The model drafts the tasks (for code it inspects the project and sets the `check`
+command), shows you the list and waits. Review it with
 `/ralph status api`; fix with `/ralph add api <title>` or by editing `prd.json`.
 Asking in plain language ("plan a research run on X") works the same way.
 
@@ -172,11 +172,18 @@ slask-client -C ~/proj ralph init shop --mode code --check "npm run build && npm
 
 **Turning the spec into tasks**
 
-- *Interactive (chat):* `/ralph plan shop --spec tasks/prd-shop.md`. It creates the run if
-  needed, then the model reads the spec, asks 3-5 clarifying questions with lettered options
-  (answer like `1A, 2C`) if anything essential is unclear, sets the `check` command (code)
-  and adds tasks. It shows you the list and waits; start the run yourself afterwards.
-  Running it on an existing run appends tasks.
+- *Interactive (chat; plain positional arguments, no `--flags`):*
+  ```
+  /ralph init shop code tasks/prd-shop.md     create the run with the description file
+  /ralph plan shop                            the model drafts the tasks
+  /ralph start shop                           after you have reviewed them
+  ```
+  `plan` makes the model read the spec, ask 3-5 clarifying questions with lettered options
+  (answer like `1A, 2C`) if anything essential is unclear, set the `check` command (code) and
+  add tasks. It shows you the list and waits; start the run yourself afterwards. Running it on
+  an existing run appends tasks. Also: `/ralph spec shop <file>` replaces the description,
+  `/ralph check shop npm run build && npm test` sets the code verifier by hand.
+  (`/ralph plan <name> [code|research] <goal...>` creates a run from a goal alone.)
 - *Headless (scripts):* add `--plan` to `init`:
   `slask-client -C ~/proj ralph init shop --spec tasks/prd-shop.md --plan`.
   One non-interactive model run drafts the task list (it cannot ask; its assumptions are
@@ -308,7 +315,8 @@ slask-client [-C <dir>] ralph add <name> <title> [--criteria "a;b;c"]
 slask-client [-C <dir>] ralph run <name> [--max N]      foreground
 slask-client [-C <dir>] ralph start|stop <name>         background
 slask-client [-C <dir>] ralph status [name] | list
-chat:   /ralph  list | status | plan [--spec f] | init [--spec f] | add | start | stop
+chat:   /ralph list | status <n> | init <n> [mode] [spec-file] | spec <n> <file> | check <n> <cmd...>
+                | plan <n> [mode] [goal...] | add <n> <title...> | start <n> | stop <n>      (positional; flags are CLI-only)
 tools:  ralph_list ralph_status ralph_create ralph_add_task ralph_configure ralph_note ralph_start ralph_stop   (chat)
         ralph_note ralph_complete_task run_command                                    (worker iterations)
         ralph_verdict                                                                 (research checker)

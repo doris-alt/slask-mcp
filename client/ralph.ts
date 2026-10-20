@@ -1162,22 +1162,29 @@ export function ralphSystemBlock(): string {
 // ---------------------------------------------------------------------------
 
 export const RALPH_HELP = [
-  "  /ralph list                                   list runs",
-  "  /ralph status <name>                          tasks + state of a run",
-  "  /ralph plan <name> [code|research] [--spec <file>] [goal...]   have the model draft the task list",
-  "                                                (creates the run if needed; --spec = project description file)",
-  "  /ralph init <name> [code|research] [--spec <file>] [--check <cmd>]   create an empty run",
-  "  /ralph add <name> <title...>                  append a task",
-  "  /ralph start <name>                           run the loop in the background",
-  "  /ralph stop <name>                            stop a running loop",
+  "  /ralph list                                      list runs",
+  "  /ralph status <name>                             tasks + state of a run",
+  "  /ralph init <name> [code|research] [spec-file]   create a run; spec-file = project description (e.g. a PRD)",
+  "  /ralph spec <name> <file>                        attach / replace the project description",
+  "  /ralph check <name> <command...>                 set the code verifier (must exit 0), e.g. npm run build && npm test",
+  "  /ralph plan <name> [code|research] [goal...]     have the model draft the task list (asks questions first);",
+  "                                                   creates the run if needed (then a goal is required)",
+  "  /ralph add <name> <title...>                     append a task",
+  "  /ralph start <name>                              run the loop in the background",
+  "  /ralph stop <name>                               stop a running loop",
+  "",
+  "Typical flow for a big project:",
+  "  /ralph init shop code tasks/prd-shop.md   ->   /ralph plan shop   ->   /ralph start shop",
 ].join("\n");
 
 export type RalphParse =
   | { kind: "help" }
   | { kind: "list" }
   | { kind: "status"; name: string }
-  | { kind: "plan"; name: string; mode: RalphMode; goal: string; spec?: string }
-  | { kind: "init"; name: string; mode: RalphMode; check?: string; spec?: string }
+  | { kind: "plan"; name: string; mode: RalphMode; goal: string }
+  | { kind: "init"; name: string; mode: RalphMode; spec?: string }
+  | { kind: "spec"; name: string; file: string }
+  | { kind: "check"; name: string; command: string }
   | { kind: "add"; name: string; title: string }
   | { kind: "start"; name: string }
   | { kind: "stop"; name: string }
@@ -1185,16 +1192,14 @@ export type RalphParse =
 
 /** Parse a `/ralph …` REPL line; null when the line is not a /ralph command. */
 export function parseRalphCmd(line: string): RalphParse | null {
-  let parts = line.trim().split(/\s+/).filter(Boolean);
+  const parts = line.trim().split(/\s+/).filter(Boolean);
   if (parts.length === 0 || parts[0].toLowerCase() !== "/ralph") return null;
   if (parts.length === 1) return { kind: "help" };
-  // `--spec <file>` may appear anywhere (init/plan); pull it out first.
-  let spec: string | undefined;
-  const si = parts.indexOf("--spec");
-  if (si >= 0) {
-    spec = parts[si + 1];
-    if (spec === undefined) return { kind: "error", message: "--spec needs a file path" };
-    parts = [...parts.slice(0, si), ...parts.slice(si + 2)];
+  // The REPL takes plain positional arguments (like /schedule); `--flags` are
+  // for the shell CLI only. Say so instead of silently misreading them.
+  const flag = parts.slice(2).find((p) => /^--?[A-Za-z]/.test(p));
+  if (flag !== undefined && !/^\/ralph\s+(add|plan|check)\b/i.test(line.trim())) {
+    return { kind: "error", message: `"${flag}": options are not used in chat — see /ralph for the positional syntax` };
   }
   const sub = parts[1].toLowerCase();
   const name = parts[2];
@@ -1217,20 +1222,32 @@ export function parseRalphCmd(line: string): RalphParse | null {
       return { kind: "add", name, title };
     }
     case "init": {
-      const e = need("/ralph init <name> [code|research] [--spec <file>] [--check <cmd>]");
-      if (e) return e;
-      const mode = modeAt(3) ?? "code";
-      const ci = parts.indexOf("--check");
-      const check = ci >= 0 ? parts.slice(ci + 1).join(" ") || undefined : undefined;
-      return { kind: "init", name, mode, check, spec };
+      const usage = "usage: /ralph init <name> [code|research] [spec-file]";
+      if (name === undefined) return { kind: "error", message: usage };
+      const mode = modeAt(3);
+      const rest = parts.slice(mode ? 4 : 3);
+      if (rest.length > 1) return { kind: "error", message: `${usage} (one spec file; paths with spaces are not supported)` };
+      return { kind: "init", name, mode: mode ?? "code", spec: rest[0] };
+    }
+    case "spec": {
+      if (name === undefined || parts[3] === undefined || parts.length > 4) {
+        return { kind: "error", message: "usage: /ralph spec <name> <file>" };
+      }
+      return { kind: "spec", name, file: parts[3] };
+    }
+    case "check": {
+      const command = parts.slice(3).join(" ");
+      if (name === undefined || command === "") {
+        return { kind: "error", message: "usage: /ralph check <name> <command...> (e.g. /ralph check shop npm run build && npm test)" };
+      }
+      return { kind: "check", name, command };
     }
     case "plan": {
-      const mode = modeAt(3);
-      const goal = parts.slice(mode ? 4 : 3).join(" ");
       if (name === undefined) {
-        return { kind: "error", message: "usage: /ralph plan <name> [code|research] [--spec <file>] [goal...] (a new run needs a goal or --spec)" };
+        return { kind: "error", message: "usage: /ralph plan <name> [code|research] [goal...]" };
       }
-      return { kind: "plan", name, mode: mode ?? "code", goal, spec };
+      const mode = modeAt(3);
+      return { kind: "plan", name, mode: mode ?? "code", goal: parts.slice(mode ? 4 : 3).join(" ") };
     }
     default:
       return { kind: "error", message: `unknown /ralph command "${sub}" — try /ralph` };
@@ -1262,8 +1279,15 @@ export async function runRalphRepl(
         return { text: await formatStatus(base, p.name) };
       case "init": {
         const spec = p.spec ? await readSpecSource(base, p.spec) : undefined;
-        await createRun(base, { name: p.name, mode: p.mode, check: p.check, spec });
-        return { text: `created run "${p.name}" [${p.mode}]${spec ? " with spec" : ""} — ${spec ? `plan it with /ralph plan ${p.name}, or ` : ""}add tasks with /ralph add ${p.name} <title>` };
+        await createRun(base, { name: p.name, mode: p.mode, spec });
+        return { text: `created run "${p.name}" [${p.mode}]${spec ? " with spec" : ""} — ${spec ? `draft the tasks with /ralph plan ${p.name}, or ` : ""}add tasks with /ralph add ${p.name} <title>` };
+      }
+      case "spec":
+        await setSpec(base, p.name, await readSpecSource(base, p.file));
+        return { text: `spec for "${p.name}" replaced from ${p.file}` };
+      case "check": {
+        await configureRun(base, p.name, { check: p.command });
+        return { text: `check for "${p.name}" set to: ${p.command}` };
       }
       case "add": {
         const t = await addTask(base, p.name, { title: p.title });
@@ -1274,22 +1298,22 @@ export async function runRalphRepl(
       case "stop":
         return { text: (await stopRun(base, p.name)) ? `stopping "${p.name}"` : `"${p.name}" is not running` };
       case "plan": {
-        const spec = p.spec ? await readSpecSource(base, p.spec) : undefined;
         let exists = true;
         try {
           await loadPrd(base, p.name);
         } catch {
           exists = false;
         }
-        if (!exists && !p.goal && spec === undefined) {
-          return { text: `no run named "${p.name}" yet — give a goal or --spec <file>: /ralph plan ${p.name} [code|research] [--spec <file>] [goal...]` };
+        if (!exists && !p.goal) {
+          return {
+            text: `no run named "${p.name}" yet — give a goal: /ralph plan ${p.name} [code|research] <goal...>, or create it from a description file first: /ralph init ${p.name} [code|research] <spec-file>`,
+          };
         }
-        if (!exists) await createRun(base, { name: p.name, mode: p.mode, description: p.goal, spec });
-        else if (spec !== undefined) await setSpec(base, p.name, spec);
+        if (!exists) await createRun(base, { name: p.name, mode: p.mode, description: p.goal });
+        else if (p.goal && !(await loadPrd(base, p.name)).description) await configureRun(base, p.name, { description: p.goal });
         const prd = await loadPrd(base, p.name);
-        if (exists && p.goal && !prd.description) await configureRun(base, p.name, { description: p.goal });
         const relDir = relative(base, runDir(base, p.name));
-        return { prompt: planPrompt(await loadPrd(base, p.name), (await specSize(base, p.name)) !== null, true, relDir) };
+        return { prompt: planPrompt(prd, (await specSize(base, p.name)) !== null, true, relDir) };
       }
     }
   } catch (e) {
