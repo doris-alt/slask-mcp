@@ -529,7 +529,7 @@ try {
     ];
     const scheduleSubs = ["add", "list", "rm"];
     const ralphSubs = [
-      "add", "check", "init", "list", "plan", "spec", "start", "status", "stop",
+      "add", "check", "init", "list", "plan", "spec", "split", "start", "status", "stop",
     ];
 
     // No hint for plain text or an empty line.

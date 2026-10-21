@@ -135,6 +135,13 @@ export interface AgentTurnConfig {
   systemPrompt: string;
   tools: OpenAiFunctionTool[];
   callTool: (name: string, args: Record<string, unknown>) => Promise<CallToolResult>;
+  /**
+   * Tool(s) the turn must end with: if the model answers in prose (or its reply is
+   * cut off) before one of them has been called successfully, it is told to call one
+   * now (at most twice) instead of the turn ending without the result. Used for
+   * single-purpose Ralph roles (splitter, checker).
+   */
+  requireTool?: string[];
 }
 
 export interface ToolCallRecord {

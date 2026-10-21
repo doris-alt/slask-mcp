@@ -37,6 +37,54 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+// Context control (both off by default; Ralph iterations switch them on so a
+// run fits the model's context window):
+//   SLASK_MAX_TOOL_RESULT_CHARS  cap each tool result (head kept, rest dropped)
+//   SLASK_CONTEXT_CHARS          budget for the whole message list; when over,
+//                                the oldest tool outputs are replaced by a stub
+const PRUNED_STUB = "[older tool output removed to save context]";
+
+/** Truncate `s` to `max` chars (0/negative = unlimited), with a notice. */
+export function capText(s: string, max: number): string {
+  if (max <= 0 || s.length <= max) return s;
+  return (
+    s.slice(0, max) +
+    `\n[... truncated ${s.length - max} of ${s.length} chars to save context — ` +
+    "ask for a narrower slice (offset, selector, smaller query) instead of the whole thing]"
+  );
+}
+
+function messageChars(m: ConversationMessage): number {
+  let n = typeof m.content === "string" ? m.content.length : 0;
+  if (m.role === "assistant" && m.tool_calls) {
+    for (const tc of m.tool_calls) n += tc.function.arguments.length + tc.function.name.length;
+  }
+  return n;
+}
+
+/**
+ * Keep the message list under `budget` chars by replacing the oldest tool
+ * outputs with a stub (the last two tool messages are always kept). The
+ * assistant tool_calls stay, so the transcript remains well-formed. Returns a
+ * new array when something was pruned. budget <= 0 disables pruning.
+ */
+export function pruneMessages(messages: ConversationMessage[], budget: number): ConversationMessage[] {
+  if (budget <= 0) return messages;
+  let total = messages.reduce((n, m) => n + messageChars(m), 0);
+  if (total <= budget) return messages;
+  const toolIdx = messages.flatMap((m, i) => (m.role === "tool" ? [i] : []));
+  const prunable = toolIdx.slice(0, Math.max(0, toolIdx.length - 2));
+  const out = [...messages];
+  for (const i of prunable) {
+    if (total <= budget) break;
+    const m = out[i];
+    if (m.role !== "tool" || m.content === PRUNED_STUB) continue;
+    total -= m.content.length - PRUNED_STUB.length;
+    out[i] = { role: "tool", tool_call_id: m.tool_call_id, content: PRUNED_STUB };
+  }
+  return out;
+}
+
 // The OpenAI SDK appends /chat/completions to your baseURL, so the base must
 // already point at the /v1 root. Normalize any input (with or without /v1,
 // with or without a trailing slash) to that form.
@@ -143,12 +191,19 @@ export async function runAgentTurn(
   const { openai, model, systemPrompt, tools, callTool } = cfg;
   const maxIterations = envInt("SLASK_MAX_TOOL_ITERATIONS", MAX_TOOL_ITERATIONS);
   const maxTokens = envInt("SLASK_MAX_TOKENS", MAX_TOKENS);
-  const messages: ConversationMessage[] = [
+  const maxResultChars = envInt("SLASK_MAX_TOOL_RESULT_CHARS", 0);
+  const contextChars = envInt("SLASK_CONTEXT_CHARS", 0);
+  const required = cfg.requireTool ?? [];
+  const calledOk = new Set<string>();
+  let nudges = 0;
+  const unmet = () => required.length > 0 && !required.some((n) => calledOk.has(n));
+  let messages: ConversationMessage[] = [
     { role: "system", content: systemPrompt },
     ...requestMessages,
   ];
 
   for (let i = 0; i < maxIterations; i++) {
+    messages = pruneMessages(messages, contextChars);
     const res = await openai.chat.completions.create({
       model,
       messages,
@@ -189,6 +244,7 @@ export async function runAgentTurn(
         try {
           const result = await callTool(toolName, args);
           resultText = mcpResultToText(result);
+          if (!result.isError) calledOk.add(toolName);
         } catch (e) {
           // A bad/unknown tool, a transport error, or a 4xx/5xx from the
           // server: feed the failure back to the model instead of crashing the
@@ -196,14 +252,38 @@ export async function runAgentTurn(
           const msg = e instanceof Error ? e.message : String(e);
           resultText = `ERROR calling ${toolName}: ${msg}`;
         }
+        resultText = capText(resultText, maxResultChars);
         onToolCall?.({ name: toolName, args, resultText });
         messages.push({ role: "tool", tool_call_id: tc.id, content: resultText });
       }
       continue;
     }
 
+    if (finishReason === "length" && unmet() && nudges < 2) {
+      // Rambled until the completion limit instead of acting: don't keep the long
+      // text in context, just insist on the tool call.
+      nudges++;
+      messages.push({ role: "assistant", content: "[reply cut off]" });
+      messages.push({
+        role: "user",
+        content: `Your last reply was cut off because it was too long. Do not explain or analyse: call ${required.join(" or ")} now, with short field values.`,
+      });
+      continue;
+    }
     if (finishReason === "length") {
-      throw new Error("the response was cut off by the token limit — try a shorter prompt");
+      throw new Error(
+        "the response was cut off by the token limit — try a shorter prompt " +
+          `(max_tokens=${maxTokens}; this also happens when the model's context window is full)`,
+      );
+    }
+    if (unmet() && nudges < 2) {
+      nudges++;
+      messages.push({ role: "assistant", content: message.content ?? "" });
+      messages.push({
+        role: "user",
+        content: `You have not called ${required.join(" or ")} yet. Do not write more text: call it now.`,
+      });
+      continue;
     }
     return message.content ?? "";
   }

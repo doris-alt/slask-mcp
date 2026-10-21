@@ -277,12 +277,13 @@ bundled scripts are also shown in the startup banner and via the agent's
 
 ## File tools
 
-The client ships three **built-in** file tools that are always available to the
+The client ships four **built-in** file tools that are always available to the
 agent (they appear in the startup banner alongside server and skill tools):
 
 | Tool            | What it does                                             | Required args             |
 |-----------------|----------------------------------------------------------|---------------------------|
 | `read_file`     | read a plain-text file — the whole file, or a byte range via `offset`/`bytes` | `path`, optional `offset`, `bytes` |
+| `grep_file`     | show only the lines of a file that match a pattern (regex, case-insensitive by default; line numbers, optional 0-3 lines of context, max 50 matches) — look inside a large file without reading it | `path`, `pattern`, optional `context`, `max_matches`, `ignore_case` |
 | `edit_file`     | atomic search-and-replace; never modifies unless it succeeds | `path`, `search`, `replace`, optional `replaceAll` |
 | `write_file`    | create or overwrite a file, or append with `append: true` (parent dirs created as needed) | `path`, `content`, optional `append` |
 
@@ -462,6 +463,10 @@ task list (it also has `ralph_*` tools, so "plan a research run on X" works);
   `--check` command (exit 0), then commits `feat: [T1] - title`. `research`: a
   separate fresh-context checker judges the acceptance criteria against
   `findings/<id>.md`; a final pass writes `report.md`.
+- **Iterations are sized to the model's context window** (`MAX_CONTEXT_TOKENS` in `.env`,
+  default 32000; a run may lower it with `ralph init --context <tokens>`): planners must produce small tasks (oversized ones are
+  rejected), tool output is truncated and old output dropped, and a task that still doesn't fit is
+  split automatically (`ralph split <name> <id>` or `/ralph split <name> <id>` by hand). See RALPH.md.
 - A task that fails verification `maxFailures` (3) times in a row stops the run
   as `stuck`; the failure output is fed to the next attempt and `progress.txt`.
 - Iterations get a `run_command` tool (one allow-listed program per call, no
@@ -492,6 +497,7 @@ task list (it also has `ralph_*` tools, so "plan a research run on X" works);
 | -p, --prompt <text>| -p  | (none)         | run one agent turn with the prompt, print the answer, and exit (instead of the REPL) |
 | OPENAI_API_KEY    |     | OPENAI_API_KEY | openai api key; only needed for the real openai endpoint (see API_BASE note)                                |
 |                   |     | OPENAI_MODEL   | legacy model name (checked after MODEL)                                                                     |
+|                   |     | MAX_CONTEXT_TOKENS | the model's context window in tokens (default 32000); Ralph sizes every iteration, incl. task splits, to it |
 
 
 ## How the agent loop works

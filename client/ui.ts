@@ -59,6 +59,10 @@ import {
 import {
   RALPH_TOOL_NAMES,
   callRalphTool,
+  guardFileCall,
+  requiredToolsForRole,
+  restrictToolsForRole,
+  roleMayCall,
   parseRalphCmd,
   ralphSystemBlock,
   ralphTools,
@@ -114,6 +118,9 @@ export class Spinner {
   }
 
   start(label: string = "thinking…") {
+    // No animation when output is not a terminal (logs, pipes, scheduler and
+    // Ralph children): the repainted frames would bloat and garble the log.
+    if (!(this.out as { isTTY?: boolean }).isTTY) return;
     if (this.timer) return;
     this.label = label;
     this.i = 0;
@@ -129,6 +136,8 @@ export class Spinner {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    } else if (!(this.out as { isTTY?: boolean }).isTTY) {
+      return;
     }
     this.out.write(`\r${" ".repeat(this.padWidth() + 4)}\r`);
   }
@@ -138,6 +147,8 @@ export class Spinner {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    } else if (!(this.out as { isTTY?: boolean }).isTTY) {
+      return;
     }
     this.out.write(`\r${" ".repeat(this.padWidth() + 4)}\r\n`);
   }
@@ -277,7 +288,7 @@ const SLASH_COMMANDS = [
 const SCHEDULE_SUBCOMMANDS = ["add", "list", "rm"];
 // Kept in sync with parseRalphCmd in ralph.ts.
 const RALPH_SUBCOMMANDS = [
-  "add", "check", "init", "list", "plan", "spec", "start", "status", "stop",
+  "add", "check", "init", "list", "plan", "spec", "split", "start", "status", "stop",
 ];
 
 export function slashCompletions(line: string): [string[], string] {
@@ -438,19 +449,22 @@ export async function runTurn(
     fileSystemBlock() +
     scheduleSystemBlock() +
     ralphSystemBlock();
-  const tools = [
+  const tools = restrictToolsForRole([
     ...openaiTools,
     ...fileTools(),
     ...scheduleTools(),
     ...ralphTools(),
     ...(skills.length > 0 ? [skillTool(skills), runScriptTool(skills)] : []),
-  ];
+  ]);
   const callTool: (name: string, args: Record<string, unknown>) => Promise<CallToolResult> =
     (name, args) => {
     // Synthetic local tools (file, schedule, skill); every other name routes to
     // the originating MCP server.
+    if (!roleMayCall(name)) {
+      return Promise.reject(new Error(`${name} is not available in this context`));
+    }
     if (FILE_TOOL_NAMES.includes(name)) {
-      return callFileTool(baseDir, name, args);
+      return callFileTool(baseDir, name, guardFileCall(baseDir, name, args));
     }
     if (SCHEDULE_TOOL_NAMES.includes(name)) {
       return callScheduleTool(name, args);
@@ -481,7 +495,7 @@ export async function runTurn(
   history.push(userMsg);
   try {
     const answer = await runAgentTurn(
-      { openai, model, systemPrompt, tools, callTool },
+      { openai, model, systemPrompt, tools, callTool, requireTool: requiredToolsForRole() },
       history,
       onToolCall
     );
@@ -798,9 +812,15 @@ export async function startChat({
         const ralphParsed = parseRalphCmd(input);
         if (ralphParsed !== null) {
           process.stdout.write("\n");
+          if (ralphParsed.kind === "split") {
+            console.log(color("dim", `  splitting ${ralphParsed.id} (runs a model pass; this can take a minute)…`));
+          }
           const res = await runRalphRepl(ralphParsed, state.baseDir);
           if (res.prompt === undefined) {
-            if (res.text !== undefined) console.log(color("green", `  ${res.text.replace(/\n/g, "\n  ")}\n`));
+            if (res.text !== undefined) {
+              const failed = res.text.startsWith("✗");
+              console.log(color(failed ? "red" : "green", `  ${res.text.replace(/\n/g, "\n  ")}\n`));
+            }
             return loop();
           }
           turnInput = res.prompt;
