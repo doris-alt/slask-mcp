@@ -19,6 +19,8 @@ import {
   limitsOf,
   lintTask,
   planPrompt,
+  reopenTask,
+  runReport,
   ralphChildEnv,
   requiredToolsForRole,
   restrictToolsForRole,
@@ -901,6 +903,82 @@ async function main(): Promise<void> {
     assert.match(o3.message ?? "", /T2 used all 2 iterations without passing/);
     assert.equal((await loadPrd(base, "st")).tasks.find((x) => x.id === "T3")?.passes, false);
     console.log("PASS test21 — iteration counter is per task (resets for each new task, a pass doesn't use it up)");
+    await rm(base, { recursive: true, force: true });
+  }
+
+  // -- test22: patch a finished research run: add / reopen a task, redo only that + the report --
+  {
+    const base = await tmp();
+    await createRun(base, { name: "pr", mode: "research", tasks: [{ title: "A" }, { title: "B" }] });
+    const seen: string[] = [];
+    let reports = 0;
+    const agent = async (a: AgentRunArgs): Promise<ExecResult> => {
+      const role = a.env.SLASK_RALPH_ROLE;
+      const task = a.env.SLASK_RALPH_TASK;
+      seen.push(task ? `${role}:${task}` : `${role}:report`);
+      await asChild(a.env, async () => {
+        if (role === "checker") await callRalphTool(base, "ralph_verdict", { taskId: task, pass: true, reason: "ok" });
+        else if (task) await callRalphTool(base, "ralph_complete_task", { summary: "found" });
+      });
+      if (role === "worker" && !task) {
+        await mkdir(join(base, "ralph-pr"), { recursive: true });
+        await writeFile(join(base, "ralph-pr", "report.md"), `report v${++reports}`);
+      }
+      return ok();
+    };
+    const go = () => runRalph({ base, name: "pr", execFn: async () => ok(), runAgentFn: agent, log: quiet, autoHandlers: false });
+    assert.equal((await go()).state, "done");
+    assert.deepEqual(seen, ["worker:T1", "checker:T1", "worker:T2", "checker:T2", "worker:report"]);
+    assert.equal(await readFile(join(base, "ralph-pr", "report.md"), "utf8"), "report v1");
+
+    // add a task to the finished run (CLI, with --desc): only it + its checker + the report run again
+    seen.length = 0;
+    assert.equal(await handleRalphCli({ positional: ["ralph", "add", "pr", "C"], criteria: "x;y", desc: "compare against B" }, base), 0);
+    const c = (await loadPrd(base, "pr")).tasks.find((t) => t.id === "T3")!;
+    assert.equal(c.description, "compare against B");
+    assert.equal(c.passes, false);
+    assert.equal((await go()).state, "done");
+    assert.deepEqual(seen, ["worker:T3", "checker:T3", "worker:report"]);
+    assert.equal(await readFile(join(base, "ralph-pr", "report.md"), "utf8"), "report v2");
+    assert.equal(await readFile(join(base, "ralph-pr", "report.prev.md"), "utf8"), "report v1", "old report is kept");
+
+    // reopen a passed task: only it is redone
+    seen.length = 0;
+    await assert.rejects(reopenTask(base, "pr", "T9"), /no task "T9"/);
+    assert.equal(await handleRalphCli({ positional: ["ralph", "reopen", "pr", "T1"], note: "missed a source" }, base), 0);
+    const t1 = (await loadPrd(base, "pr")).tasks.find((t) => t.id === "T1")!;
+    assert.equal(t1.passes, false);
+    assert.match(t1.lastFailure ?? "", /missed a source/);
+    assert.match(await readFile(join(base, ".slask-ralph", "pr", "progress.txt"), "utf8"), /T1 A: RE-OPENED \(missed a source\)/);
+    assert.equal((await go()).state, "done");
+    assert.deepEqual(seen, ["worker:T1", "checker:T1", "worker:report"]);
+
+    // report only: no task runs; refuses while a task is pending or in code mode
+    seen.length = 0;
+    const r = await runReport({ base, name: "pr", runAgentFn: agent, log: quiet });
+    assert.ok(r.ok, r.text);
+    assert.deepEqual(seen, ["worker:report"]);
+    assert.equal(await readFile(join(base, "ralph-pr", "report.md"), "utf8"), "report v4");
+    await reopenTask(base, "pr", "T2");
+    await assert.rejects(runReport({ base, name: "pr", runAgentFn: agent, log: quiet }), /tasks still pending: T2/);
+    await createRun(base, { name: "cc", mode: "code", tasks: [{ title: "x" }] });
+    await assert.rejects(runReport({ base, name: "cc", runAgentFn: agent, log: quiet }), /only research runs/);
+    // a report agent that writes nothing is reported as a failure
+    await rm(join(base, ".slask-ralph", "pr", "run.pid"), { force: true });
+    await savePrd(base, { ...(await loadPrd(base, "pr")), tasks: (await loadPrd(base, "pr")).tasks.map((t) => ({ ...t, passes: true })) });
+    await rm(join(base, "ralph-pr", "report.md"));
+    const bad = await runReport({ base, name: "pr", runAgentFn: async () => ok(), log: quiet });
+    assert.equal(bad.ok, false);
+    assert.match(bad.text, /report not written/);
+
+    // chat syntax
+    assert.deepEqual(parseRalphCmd("/ralph reopen pr T2"), { kind: "reopen", name: "pr", id: "T2" });
+    assert.deepEqual(parseRalphCmd("/ralph report pr"), { kind: "report", name: "pr" });
+    assert.equal(parseRalphCmd("/ralph reopen pr")?.kind, "error");
+    assert.equal(parseRalphCmd("/ralph report")?.kind, "error");
+    assert.equal(parse(["ralph", "add", "pr", "t", "--desc", "d"]).ralph.desc, "d");
+    assert.equal(parse(["ralph", "reopen", "pr", "T1", "--note", "why"]).ralph.note, "why");
+    console.log("PASS test22 — add/reopen a task on a finished research run redoes only it + the report; ralph report");
     await rm(base, { recursive: true, force: true });
   }
 

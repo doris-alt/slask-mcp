@@ -30,7 +30,7 @@
 
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
-import { appendFile, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import { runCliChild } from "./child.js";
 import type { ChildProcess } from "./child.js";
@@ -435,6 +435,24 @@ export async function addTask(base: string, name: string, t: NewTask): Promise<R
   prd.tasks.push(task);
   await savePrd(base, prd);
   return task;
+}
+
+/**
+ * Re-open a task that already passed so the loop runs it again (and, in research
+ * mode, has it re-checked). The old findings file stays; the worker is told why
+ * via `notes`/`lastFailure` and progress.txt.
+ */
+export async function reopenTask(base: string, name: string, id: string, why?: string): Promise<RalphTask> {
+  const prd = await loadPrd(base, name);
+  const t = prd.tasks.find((x) => x.id === id);
+  if (t === undefined) throw new Error(`no task "${id}" in run "${name}" (have: ${prd.tasks.map((x) => x.id).join(", ") || "none"})`);
+  t.passes = false;
+  t.claimed = false;
+  t.failures = 0;
+  t.lastFailure = why ? `re-opened: ${why}` : "re-opened for another attempt";
+  await savePrd(base, prd);
+  await appendProgress(base, name, `\n## ${new Date().toISOString()} — ${t.id} ${t.title}: RE-OPENED${why ? ` (${why})` : ""}`);
+  return t;
 }
 
 export function pickNext(prd: RalphPrd): RalphTask | undefined {
@@ -1020,12 +1038,7 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
     const done = await loadPrd(base, name);
     if (done.mode === "research" && done.tasks.length > 0) {
       log("\n=== final synthesis ===");
-      await runAgent({
-        prompt: synthesisPrompt(done, relDir, outDir, (await specSize(base, name)) !== null),
-        env: childEnv("worker"),
-        timeoutMs: cfg.timeoutS * 1000,
-        logFile: join(dir, "iterations", "report.log"),
-      });
+      await synthesize(base, name, cfg, done, runAgent);
       current = null;
     }
     return await finish("done", done.mode === "research" ? `report: ${outDir}/report.md` : undefined);
@@ -1035,6 +1048,74 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
       process.off("SIGTERM", onSig);
     }
     opts.signal?.removeEventListener("abort", abort);
+    await writeFile(join(dir, "run.pid"), "").catch(() => {});
+  }
+}
+
+/**
+ * The final research step: one fresh-context iteration that writes report.md from
+ * every findings file. The previous report (if any) is kept as report.prev.md.
+ */
+async function synthesize(
+  base: string,
+  name: string,
+  cfg: RalphConfig,
+  prd: RalphPrd,
+  runAgent: (a: AgentRunArgs) => Promise<ExecResult>,
+): Promise<ExecResult> {
+  const dir = runDir(base, name);
+  const outDir = outputDirOf(name, cfg);
+  await mkdir(join(dir, "iterations"), { recursive: true });
+  await copyFile(join(base, outDir, "report.md"), join(base, outDir, "report.prev.md")).catch(() => {});
+  return runAgent({
+    prompt: synthesisPrompt(prd, relative(base, dir) || ".", outDir, (await specSize(base, name)) !== null),
+    env: ralphChildEnv(dir, name, cfg, "worker", ""),
+    timeoutMs: cfg.timeoutS * 1000,
+    logFile: join(dir, "iterations", "report.log"),
+  });
+}
+
+export interface RunReportOptions {
+  base?: string;
+  name: string;
+  runAgentFn?: (a: AgentRunArgs) => Promise<ExecResult>;
+  log?: (s: string) => void;
+}
+
+/** `ralph report`: redo just the final synthesis of a research run whose tasks all pass. */
+export async function runReport(opts: RunReportOptions): Promise<{ ok: boolean; text: string }> {
+  const base = opts.base ?? process.cwd();
+  const name = validateName(opts.name);
+  const prd = await loadPrd(base, name);
+  if (prd.mode !== "research") throw new Error(`"${name}" is a ${prd.mode} run — only research runs have a report`);
+  const pending = prd.tasks.filter((t) => !t.passes).map((t) => t.id);
+  if (pending.length > 0) throw new Error(`tasks still pending: ${pending.join(", ")} — run \`ralph start ${name}\` to finish them (the report is written at the end)`);
+  const other = await readPid(base, name);
+  if (other !== null && other !== process.pid) throw new Error(`ralph run "${name}" is already running (pid ${other})`);
+  const cfg = await loadConfig(base, name);
+  const outDir = outputDirOf(name, cfg);
+  const dir = runDir(base, name);
+  const runAgent =
+    opts.runAgentFn ??
+    ((a: AgentRunArgs) =>
+      runCliChild(["--prompt", a.prompt, "--quiet", ...forwardArgs], {
+        timeoutMs: a.timeoutMs,
+        env: a.env,
+        capture: true,
+        onOutput: (chunk) => void appendFile(a.logFile, chunk).catch(() => {}),
+      }));
+  await writeFile(join(dir, "run.pid"), String(process.pid));
+  const startedAt = Date.now();
+  try {
+    await writeStatus(base, name, { state: "running", iteration: 0, message: "rewriting the report" });
+    (opts.log ?? console.log)(`rewriting ${outDir}/report.md from ${prd.tasks.length} task(s)…`);
+    const r = await synthesize(base, name, cfg, prd, runAgent);
+    const written = await stat(join(base, outDir, "report.md")).then((s) => s.mtimeMs >= startedAt - 1000, () => false);
+    const ok = r.code === 0 && written;
+    const message = ok ? `report: ${outDir}/report.md` : `report not written (exit ${r.code}); log: ${STATE_DIR}/${name}/iterations/report.log`;
+    await writeStatus(base, name, { state: ok ? "done" : "stuck", iteration: 0, message });
+    return { ok, text: ok ? `✓ ${message} (previous version: ${outDir}/report.prev.md)` : `✗ ${message}` };
+  } finally {
     await writeFile(join(dir, "run.pid"), "").catch(() => {});
   }
 }
@@ -1478,6 +1559,8 @@ export const RALPH_HELP = [
   "  /ralph plan <name> [code|research] [goal...]     have the model draft the task list (asks questions first);",
   "                                                   creates the run if needed (then a goal is required)",
   "  /ralph add <name> <title...>                     append a task",
+  "  /ralph reopen <name> <task-id>                   re-run a task that already passed (then /ralph start)",
+  "  /ralph report <name>                             research: rewrite report.md from the findings (all tasks must pass)",
   "  /ralph split <name> <task-id>                    replace a too-big task with 2-4 smaller ones (model-assisted)",
   "  /ralph start <name>                              run the loop in the background",
   "  /ralph stop <name>                               stop a running loop",
@@ -1495,6 +1578,8 @@ export type RalphParse =
   | { kind: "spec"; name: string; file: string }
   | { kind: "check"; name: string; command: string }
   | { kind: "split"; name: string; id: string }
+  | { kind: "reopen"; name: string; id: string }
+  | { kind: "report"; name: string }
   | { kind: "add"; name: string; title: string }
   | { kind: "start"; name: string }
   | { kind: "stop"; name: string }
@@ -1551,6 +1636,14 @@ export function parseRalphCmd(line: string): RalphParse | null {
       }
       return { kind: "split", name, id: parts[3] };
     }
+    case "reopen": {
+      if (name === undefined || parts[3] === undefined || parts.length > 4) {
+        return { kind: "error", message: "usage: /ralph reopen <name> <task-id> (e.g. /ralph reopen local-llm T2.1)" };
+      }
+      return { kind: "reopen", name, id: parts[3] };
+    }
+    case "report":
+      return need("/ralph report <name>") ?? { kind: "report", name };
     case "check": {
       const command = parts.slice(3).join(" ");
       if (name === undefined || command === "") {
@@ -1604,6 +1697,12 @@ export async function runRalphRepl(
         return { text: `spec for "${p.name}" replaced from ${p.file}` };
       case "split":
         return { text: (await splitViaAgent(base, p.name, p.id, agentFn)).text };
+      case "reopen": {
+        const t = await reopenTask(base, p.name, p.id);
+        return { text: `re-opened ${t.id}: ${t.title} — /ralph start ${p.name} runs it again` };
+      }
+      case "report":
+        return { text: (await runReport({ base, name: p.name, runAgentFn: agentFn, log: () => {} })).text };
       case "check": {
         await configureRun(base, p.name, { check: p.command });
         return { text: `check for "${p.name}" set to: ${p.command}` };
@@ -1653,11 +1752,13 @@ export interface RalphCliArgs {
   plan?: boolean;
   context?: string;
   toolBudget?: string;
+  desc?: string;
+  note?: string;
 }
 
 const CLI_USAGE =
   "usage: slask-client ralph <init|add|run|start|stop|status|list> [name] — " +
-  "init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>] [--context <tokens>] [--tool-budget <n>]; spec <name> <file>; split <name> <task-id>; add <name> <title> [--criteria \"a;b\"]; " +
+  "init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>] [--context <tokens>] [--tool-budget <n>]; spec <name> <file>; split <name> <task-id>; add <name> <title> [--criteria \"a;b\"] [--desc <text>]; reopen <name> <task-id> [--note <why>]; report <name>; " +
   "run <name> [--max N]; start|stop <name>; status [name]; list";
 
 /** The `slask-client ralph …` subcommand. Returns the process exit code. */
@@ -1826,11 +1927,25 @@ export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd
       if (name === undefined || title === "") throw new Error(CLI_USAGE);
       const t = await addTask(base, name, {
         title,
+        description: a.desc,
         acceptanceCriteria: a.criteria ? a.criteria.split(";").map((s) => s.trim()).filter(Boolean) : [],
       });
       log(`added ${t.id}: ${t.title}`);
       for (const p of lintTask((await loadPrd(base, name)).mode, t)) log(`⚠ ${t.id}: ${p}`);
       return 0;
+    }
+    case "reopen": {
+      const id = a.positional[3];
+      if (name === undefined || id === undefined) throw new Error(CLI_USAGE);
+      const t = await reopenTask(base, name, id, a.note);
+      log(`re-opened ${t.id}: ${t.title} — \`ralph start ${name}\` runs it again${(await loadPrd(base, name)).mode === "research" ? " and rewrites the report" : ""}`);
+      return 0;
+    }
+    case "report": {
+      if (name === undefined) throw new Error(CLI_USAGE);
+      const r = await runReport({ base, name, runAgentFn: deps.agentFn, log });
+      log(r.text);
+      return r.ok ? 0 : 1;
     }
     case "split": {
       const id = a.positional[3];

@@ -288,7 +288,7 @@ const SLASH_COMMANDS = [
 const SCHEDULE_SUBCOMMANDS = ["add", "list", "rm"];
 // Kept in sync with parseRalphCmd in ralph.ts.
 const RALPH_SUBCOMMANDS = [
-  "add", "check", "init", "list", "plan", "spec", "split", "start", "status", "stop",
+  "add", "check", "init", "list", "plan", "reopen", "report", "spec", "split", "start", "status", "stop",
 ];
 
 export function slashCompletions(line: string): [string[], string] {
