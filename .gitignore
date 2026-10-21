@@ -3,6 +3,10 @@ client/dist/
 client/external/
 # Local per-user MCP server config (template: client/mcp.example.json).
 client/mcp.json
+# Local scratch / experiment directories (not part of the client).
+client/obscura/
+client/tmp/
+client/xx/
 # Runtime state of the client scheduler (created on first `schedule add`; any workspace dir).
 .slask-schedule.json
 node_modules/
