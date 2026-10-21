@@ -851,6 +851,59 @@ async function main(): Promise<void> {
     console.log("PASS test20 — requireTool: prose/cut-off replies are nudged (max 2) to call the required tool");
   }
 
+  // -- test21: the iteration counter is per task: a pass does not use it up -------------
+  {
+    const base = await tmp();
+    // 5 tasks, maxIterations 3, all pass first time: previously stopped after the 3rd task
+    await createRun(base, { name: "pt", mode: "code", maxIterations: 3, tasks: [1, 2, 3, 4, 5].map((i) => ({ title: `task ${i}` })) });
+    const logs: string[] = [];
+    const claim = async (a: AgentRunArgs): Promise<ExecResult> => {
+      await asChild(a.env, () => callRalphTool(base, "ralph_complete_task", { summary: "ok" }));
+      return ok();
+    };
+    const out = await runRalph({ base, name: "pt", execFn: async () => ok(), runAgentFn: claim, log: (l) => logs.push(l), autoHandlers: false });
+    assert.equal(out.state, "done");
+    assert.equal(out.passed, 5);
+    assert.equal(out.iterations, 5, "total worker runs still counted for status/logs");
+    const heads = logs.filter((l) => l.startsWith("\n=== iteration"));
+    assert.deepEqual(heads.map((h) => h.match(/iteration (\d+)\/3/)![1]), ["1", "1", "1", "1", "1"], "every task starts at iteration 1");
+    assert.match(heads[4], /\[run #5\]/);
+
+    // a task needing a retry: 1/3, 2/3, then the NEXT task is back at 1/3
+    await createRun(base, { name: "rt", mode: "code", maxIterations: 3, maxFailures: 9, tasks: [{ title: "flaky" }, { title: "next" }] });
+    const logs2: string[] = [];
+    let flakyTries = 0;
+    const flaky = async (a: AgentRunArgs): Promise<ExecResult> => {
+      if (a.env.SLASK_RALPH_TASK === "T1" && ++flakyTries < 3) return ok(); // no claim -> failure
+      return claim(a);
+    };
+    const o2 = await runRalph({ base, name: "rt", execFn: async () => ok(), runAgentFn: flaky, log: (l) => logs2.push(l), autoHandlers: false });
+    assert.equal(o2.state, "done");
+    assert.deepEqual(
+      logs2.filter((l) => l.startsWith("\n=== iteration")).map((h) => h.replace(/\n=== iteration (\d+\/3): (\S+).*/, "$2 $1")),
+      ["T1 1/3", "T1 2/3", "T1 3/3", "T2 1/3"],
+    );
+
+    // one task that never passes still stops after maxIterations of ITS OWN, and names the task
+    await createRun(base, { name: "st", mode: "code", maxIterations: 2, maxFailures: 9, tasks: [{ title: "good" }, { title: "bad" }, { title: "never reached" }] });
+    let tries = 0;
+    const badAgent = async (a: AgentRunArgs): Promise<ExecResult> => {
+      if (a.env.SLASK_RALPH_TASK === "T2") {
+        tries++;
+        return ok();
+      }
+      return claim(a);
+    };
+    const o3 = await runRalph({ base, name: "st", execFn: async () => ok(), runAgentFn: badAgent, log: quiet, autoHandlers: false });
+    assert.equal(o3.state, "max-iterations");
+    assert.equal(tries, 2);
+    assert.equal(o3.iterations, 3, "T1 once + T2 twice");
+    assert.match(o3.message ?? "", /T2 used all 2 iterations without passing/);
+    assert.equal((await loadPrd(base, "st")).tasks.find((x) => x.id === "T3")?.passes, false);
+    console.log("PASS test21 — iteration counter is per task (resets for each new task, a pass doesn't use it up)");
+    await rm(base, { recursive: true, force: true });
+  }
+
   process.exit(0);
 }
 

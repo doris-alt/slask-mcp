@@ -18,7 +18,7 @@ before marking it passing:
 | `code`     | edits files, runs build/tests via `run_command` | your `check` command must exit 0, then commits  | the workspace itself (+ one git commit per task) |
 | `research` | investigates, writes `findings/<id>.md`       | a separate fresh-context **checker** pass       | `ralph-<name>/findings/` and `ralph-<name>/report.md` |
 
-The loop stops when all tasks pass (`done`), after `maxIterations` (`max-iterations`),
+The loop stops when all tasks pass (`done`), when one task has used `maxIterations` iterations without passing (`max-iterations`),
 when one task fails verification `maxFailures` times in a row (`stuck`), or when you
 stop it (`stopped`).
 
@@ -85,7 +85,9 @@ MODEL=gpt-4o            # a stronger model than the default is recommended
 - `check` (code): shell command (`sh -c`) that must exit 0. Without it the loop trusts the
   worker's claim. Set it. Make sure it fails when the work is wrong.
 - `commit` (code): commit `feat: [T1] - title` after each verified task.
-- `maxIterations`: hard cap per `ralph run` (also `--max N`).
+- `maxIterations`: max iterations **per task** (also `--max N`). The counter starts at 1 for every
+  task and a pass moves on to the next task, so a run of 20 tasks needs no more than this per task,
+  not 20. `ralph run` prints `iteration k/N` per task plus the overall `[run #n]` (= the `iterations/NN.log`).
 - `timeoutS`: per-child timeout (worker, checker, and the `check` command).
 - `maxFailures`: consecutive verification failures of one task before the run is `stuck`.
 - `allow`: first words `run_command` may execute (one program per call, no shell, `&&`/`|` rejected).
@@ -329,12 +331,13 @@ or `slask-client -C ~/proj ralph run …`. Prefer this when the run must start r
 ## 9. Resuming, retrying, changing course
 
 - **Resume:** run `ralph run <name>` again. Tasks with `passes: true` are skipped; the
-  iteration counter restarts at 1 against `maxIterations`.
+  the iteration counter starts again at 1 for the task it resumes on.
 - **`stuck`:** read the failure at the bottom of `progress.txt` (or `lastFailure` in
   `prd.json`). Fix the cause, then rewrite or split the task (sharper criteria, smaller scope).
   Set that task's `"failures": 0` before re-running; otherwise the next failure re-sticks
   it immediately because the counter persists.
-- **`max-iterations`:** raise it with `--max N` or `maxIterations`, then run again.
+- **`max-iterations`:** one task used all its iterations without passing (the message names it). Raise
+  `--max N` / `maxIterations`, or fix or split that task, then run again.
 - **Stop mid-run:** `ralph stop <name>` / Ctrl+C. The in-flight iteration is killed and its
   task stays unverified (retried on the next run).
 - **Add or reorder tasks:** `ralph add`, or edit `prd.json` while stopped.

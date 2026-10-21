@@ -591,7 +591,7 @@ export async function formatStatus(base: string, name: string): Promise<string> 
     const src = lim.source === "env" ? " (MAX_CONTEXT_TOKENS)" : lim.source === "config" ? " (run setting)" : " (default; set MAX_CONTEXT_TOKENS in .env)";
     lines.push(`  limits: ~${lim.contextTokens} tokens of context, ${lim.toolBudget} tool calls per iteration${src}`);
   }
-  if (cfg) lines.push(`  verifier: ${prd.mode === "code" ? cfg.check ?? "(none — trusts the worker's claim)" : "checker pass"}; max ${cfg.maxIterations} iterations`);
+  if (cfg) lines.push(`  verifier: ${prd.mode === "code" ? cfg.check ?? "(none — trusts the worker's claim)" : "checker pass"}; max ${cfg.maxIterations} iterations per task`);
   if (st?.message) lines.push(`  note: ${st.message}`);
   for (const t of [...prd.tasks].sort((a, b) => a.priority - b.priority)) {
     lines.push(`  [${t.passes ? "x" : " "}] ${t.id} ${t.title}${t.failures ? ` (failed ${t.failures}x)` : ""}`);
@@ -740,7 +740,7 @@ export interface ExecResult {
 export interface RunRalphOptions {
   base?: string;
   name: string;
-  /** Override config.maxIterations. */
+  /** Override config.maxIterations (max iterations per task). */
   maxIterations?: number;
   /** Flags forwarded to each child (e.g. --model). Default: setRalphForwardArgs(). */
   extraArgs?: string[];
@@ -870,7 +870,12 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
   const childEnv = (role: "worker" | "checker" | "splitter", task?: RalphTask): Record<string, string> =>
     ralphChildEnv(dir, name, cfg, role, task?.id ?? "");
 
+  // `iteration` counts every worker run in this loop (status.json, iterations/NN.log);
+  // `attempt` counts tries at the CURRENT task: it restarts at 1 for each new task, so
+  // maxIterations bounds how long one task may take, not the whole run.
   let iteration = 0;
+  let attempt = 0;
+  let attemptTask = "";
   const finish = async (state: RalphState, message?: string): Promise<RalphOutcome> => {
     const prd = await loadPrd(base, name);
     await writeStatus(base, name, { state, iteration, message });
@@ -888,7 +893,7 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
   try {
     await writeStatus(base, name, { state: "running", iteration: 0 });
     const first = await loadPrd(base, name);
-    log(`ralph "${name}" [${first.mode}] — ${first.tasks.length} task(s), max ${maxIterations} iteration(s)`);
+    log(`ralph "${name}" [${first.mode}] — ${first.tasks.length} task(s), max ${maxIterations} iteration(s) per task`);
 
     if (first.mode === "code" && cfg.commit && first.branchName) {
       const co = await exec(`git checkout ${shq(first.branchName)} || git checkout -b ${shq(first.branchName)}`, base, 30_000);
@@ -900,14 +905,19 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
       const prd = await loadPrd(base, name);
       const task = pickNext(prd);
       if (task === undefined) break;
-      if (iteration >= maxIterations) {
-        return await finish("max-iterations", `reached ${maxIterations} iterations`);
+      if (task.id !== attemptTask) {
+        attemptTask = task.id; // a new task (the previous one passed or was split): start counting afresh
+        attempt = 0;
       }
+      if (attempt >= maxIterations) {
+        return await finish("max-iterations", `${task.id} used all ${maxIterations} iterations without passing`);
+      }
+      attempt++;
       iteration++;
       const hasSpec = (await specSize(base, name)) !== null;
       const nn = String(iteration).padStart(2, "0");
-      log(`\n=== iteration ${iteration}/${maxIterations}: ${task.id} ${task.title} ===`);
-      await writeStatus(base, name, { state: "running", iteration, message: `${task.id} ${task.title}` });
+      log(`\n=== iteration ${attempt}/${maxIterations}: ${task.id} ${task.title} [run #${iteration}] ===`);
+      await writeStatus(base, name, { state: "running", iteration, message: `${task.id} ${task.title} (iteration ${attempt}/${maxIterations})` });
       await clearVerdict(dir);
       task.claimed = false;
       await savePrd(base, prd);

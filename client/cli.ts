@@ -124,7 +124,8 @@ Usage:
   slask-client ralph add <name> <title> [--criteria "a;b;c"]
       Append a task.
   slask-client ralph run <name> [--max N]
-      Run the loop in the foreground (default 10 iterations).
+      Run the loop in the foreground. --max N = most iterations per task
+      (default 10; the count restarts for each task).
   slask-client ralph start <name> | stop <name> | status [name] | list
       Run in a detached process / stop / inspect. In chat, use /ralph or just
       ask the model to plan one.
