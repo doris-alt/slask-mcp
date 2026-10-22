@@ -21,6 +21,8 @@ import {
   callFileTool,
   editFileInBase,
   fileTools,
+  globToRegExp,
+  listFilesInBase,
   resolveExistingInBase,
   resolveInBase,
   readFileInBase,
@@ -292,32 +294,38 @@ const disk = async (p: string): Promise<string> => readFile(p, "utf8");
 }
 
 // ---------------------------------------------------------------------------
-// 6. fileTools(): 4 tools, names, required arrays, non-empty descriptions ----
+// 6. fileTools(): 5 tools, names, required arrays, non-empty descriptions ----
 // ---------------------------------------------------------------------------
 {
   const tools = fileTools();
-  assert(tools.length === 4, String(tools.length));
+  assert(tools.length === 5, String(tools.length));
   const byName = new Map(tools.map((t) => [t.function.name, t]));
-  for (const n of ["read_file", "grep_file", "edit_file", "write_file"]) {
+  for (const n of ["read_file", "grep_file", "edit_file", "write_file", "list_files"]) {
     assert(byName.has(n), n);
   }
   const req = (t: any) => JSON.stringify(t.function.parameters.required);
   assert(req(byName.get("read_file")!) === JSON.stringify(["path"]));
   assert(req(byName.get("edit_file")!) === JSON.stringify(["path", "search", "replace"]));
   assert(req(byName.get("write_file")!) === JSON.stringify(["path", "content"]));
+  assert(req(byName.get("list_files")!) === JSON.stringify(["path"]));
   const rp = (byName.get("read_file")!.function.parameters) as any;
   assert(rp.properties.path.type === "string", "read_file.path should be a string");
   assert(rp.properties.offset.type === "integer", "read_file.offset should be an integer");
   assert(rp.properties.bytes.type === "integer", "read_file.bytes should be an integer");
   const wp = (byName.get("write_file")!.function.parameters) as any;
   assert(wp.properties.append.type === "boolean", "write_file.append should be a boolean");
+  const lp = (byName.get("list_files")!.function.parameters) as any;
+  assert(lp.properties.path.type === "string", "list_files.path should be a string");
+  assert(lp.properties.pattern.type === "string", "list_files.pattern should be a string");
+  assert(lp.properties.recursive.type === "boolean", "list_files.recursive should be a boolean");
+  assert(lp.properties.max_count.type === "integer", "list_files.max_count should be an integer");
   for (const t of tools) {
     assert(t.type === "function", t.function.name);
     const d = t.function.description;
     assert(typeof d === "string" && d.length > 0, t.function.name);
     assert(d.includes("launch directory"), t.function.name);
   }
-  console.log("PASS test6 — fileTools() shape");
+  console.log("PASS test6 — fileTools() shape (five tools)");
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +495,176 @@ const disk = async (p: string): Promise<string> => readFile(p, "utf8");
   await writeFile(join(root, "bin.dat"), Buffer.from([65, 0, 66]));
   assert(/binary/.test(await thrown(() => callFileTool(root, "grep_file", { path: "bin.dat", pattern: "A" }))));
   console.log("PASS test9 — grep_file (matches, context, caps, literal fallback, sandbox, binary)");
+}
+
+// ---------------------------------------------------------------------------
+// 10. list_files: fixture, direct listing, glob patterns --------------------
+// ---------------------------------------------------------------------------
+{
+  const lr = join(root, "listroot");
+  await mkdir(join(lr, "sub/nested"), { recursive: true });
+  await mkdir(join(lr, "sub2"), { recursive: true });
+  await writeFile(join(lr, "a.txt"), "x", "utf8");
+  await writeFile(join(lr, "b.md"), "y", "utf8");
+  await writeFile(join(lr, ".env"), "z", "utf8");
+  await writeFile(join(lr, "sub/c.txt"), "c", "utf8");
+  await writeFile(join(lr, "sub/.hidden"), "h", "utf8");
+  await writeFile(join(lr, "sub/nested/d.txt"), "d", "utf8");
+  await writeFile(join(lr, "sub/nested/.git"), "g", "utf8");
+  await writeFile(join(lr, "sub2/empty.txt"), "e", "utf8");
+  // symlinked dir -> outside (listed, never entered); symlinked dir -> in-base
+  // (entered; cycle-safe via the visited real-path set)
+  await symlink(outside, join(lr, "escsub"));
+  await symlink(join(lr, "sub"), join(lr, "goodlink"));
+
+  const ls = (
+    pattern?: string,
+    recursive = false,
+    maxCount?: unknown,
+  ) => listFilesInBase(root, "listroot", pattern, recursive, maxCount);
+
+  // globToRegExp directly — the contract the tool description promises
+  assert(globToRegExp("*").test(".env"), "* must match dotfiles");
+  assert(!globToRegExp("*").test("sub/c.txt"), "* must not cross /");
+  assert(globToRegExp("**").test("a.txt") && globToRegExp("**").test("sub/nested/.git"), "** matches everything at any depth");
+  assert(globToRegExp("a/*.txt").test("a/b.txt") && !globToRegExp("a/*.txt").test("a/b/c.txt"), "single * stays one level");
+  assert(globToRegExp("sub/**").test("sub"), "sub/** matches sub itself");
+  assert(globToRegExp("sub/**").test("sub/nested/x.txt"), "sub/** crosses below sub");
+  assert(!globToRegExp("sub/**/*.ts").test("sub"), "sub/**/*.ts does not match the prefix alone");
+  assert(globToRegExp("[ab]").test("a") && !globToRegExp("[ab]").test("c"), "char class");
+  assert(globToRegExp("x?y").test("xzy") && !globToRegExp("x?y").test("xy"), "? is one non-slash char");
+  assert(globToRegExp("a+").test("a+") && !globToRegExp("a+").test("a"), "metachars are literal");
+  assert(globToRegExp("x[y").test("x[y"), "unterminated [ is literal");
+  assert(globToRegExp("[]").test("[]"), "empty class is literal");
+
+  // direct listing: 7 entries, sorted, directories carry a trailing /, dotfile present
+  const dir = await ls();
+  assert(dir.dirRel === "listroot", dir.dirRel);
+  assert(
+    dir.entries.join(", ") === ".env, a.txt, b.md, escsub/, goodlink/, sub/, sub2/",
+    dir.entries.join(", "),
+  );
+  assert(dir.total === 7 && dir.truncated === false && dir.skipped === 0, JSON.stringify(dir));
+
+  // patterns: * (everything incl. dotfiles), literal match, wildcards, literal
+  // metachars, rejected empty pattern
+  assert((await ls("*")).entries.length === 7, (await ls("*")).entries.join(","));
+  const exact = await ls(".env");
+  assert(exact.entries.length === 1 && exact.entries[0] === ".env", exact.entries.join(","));
+  const star = await ls("a*.txt");
+  assert(star.entries.length === 1 && star.entries[0] === "a.txt", star.entries.join(","));
+  const q = await ls("b.m?");
+  assert(q.entries.length === 1 && q.entries[0] === "b.md", q.entries.join(","));
+  assert((await ls("b.md")).entries.length === 1, "b.md matches with the dot literal");
+  assert((await ls("a+")).entries.length === 0, "a+ is literal; no such file");
+  assert((await ls("sub/*.txt")).entries.length === 0, "single * doesn't cross / (non-recursive)");
+  assert((await ls("escsub/*")).entries.length === 0, "escsub has no direct children");
+  assert(/pattern must not be empty/.test(await thrown(() => ls(""))), "empty pattern");
+
+  console.log("PASS test10 — list_files direct listing + glob patterns");
+}
+
+// ---------------------------------------------------------------------------
+// 11. list_files: recursive walk, symlink handling, max_count ---------------
+// ---------------------------------------------------------------------------
+{
+  const ls = (
+    pattern?: string,
+    recursive = false,
+    maxCount?: unknown,
+  ) => listFilesInBase(root, "listroot", pattern, recursive, maxCount);
+
+  const rec = await ls(undefined, true);
+  assert(rec.total === 18 && rec.entries.length === 18 && rec.truncated === false, JSON.stringify(rec));
+  assert(rec.skipped === 1, String(rec.skipped));
+  assert(
+    rec.entries.includes("sub/c.txt") && rec.entries.includes("goodlink/c.txt"),
+    "linked subtree is entered under both names",
+  );
+  const uniq = new Set(rec.entries);
+  assert(uniq.size === rec.entries.length, "no duplicate entries");
+
+  const starRec = await ls("*", true);
+  assert(starRec.total === 7, String(starRec.total));
+  assert((await ls("**", true)).total === 18, "lone ** matches the whole tree");
+  const txtAll = await ls("**/*.txt", true);
+  assert(txtAll.total === 6, String(txtAll.total));
+  assert(txtAll.entries.includes("a.txt"), "zero-segment **/ matches the top level");
+  const dTxt = await ls("**/d.txt", true);
+  assert(dTxt.entries.length === 2, dTxt.entries.join(","));
+  const subAll = await ls("sub/**", true);
+  assert(
+    subAll.entries.length === 6 && subAll.entries.includes("sub/"),
+    subAll.entries.join(","),
+  );
+  assert(subAll.entries.includes("sub/nested/.git"), subAll.entries.join(","));
+  assert(!subAll.entries.includes("goodlink/c.txt"), "sub/** matches nowhere else");
+  const subOne = await ls("sub/*.txt", true);
+  assert(subOne.entries.length === 1 && subOne.entries[0] === "sub/c.txt", subOne.entries.join(","));
+
+  // max_count: default 100 covers the small tree; a small cap truncates;
+  // out-of-range values clamp or throw
+  assert(rec.entries.length === 18, "default 100 covers the whole tree");
+  const capped = await ls(undefined, true, 4);
+  assert(capped.truncated === true && capped.entries.length === 4, JSON.stringify(capped));
+  assert(capped.entries.join(", ") === ".env, a.txt, b.md, escsub/", capped.entries.join(", "));
+  assert((await ls(undefined, true, 99999)).entries.length === 18, "1500 clamps to 1000 (tree is smaller)");
+  assert(/max_count must be a positive integer/.test(await thrown(() => ls(undefined, true, 0))), "max_count 0");
+  assert(/max_count must be a positive integer/.test(await thrown(() => ls(undefined, true, "-1"))), "max_count -1");
+  assert(/max_count must be a positive integer/.test(await thrown(() => ls(undefined, true, "ten"))), "max_count 'ten'");
+
+  // 1100-file tree: real truncation at the default cap, clamp at the hard cap
+  const big = join(root, "bigroot");
+  await mkdir(big, { recursive: true });
+  for (let i = 0; i < 1100; i += 1) {
+    await writeFile(join(big, "f" + i + ".txt"), "x", "utf8");
+  }
+  const bdef = await listFilesInBase(root, "bigroot");
+  assert(bdef.total === 1100 && bdef.entries.length === 100 && bdef.truncated === true, JSON.stringify({ total: bdef.total, n: bdef.entries.length }));
+  const bcap = await listFilesInBase(root, "bigroot", undefined, false, 1500);
+  assert(bcap.entries.length === 1000, String(bcap.entries.length));
+  const few = await listFilesInBase(root, "bigroot", "f11*.txt");
+  assert(few.total === 11 && few.truncated === false, JSON.stringify(few));
+
+  console.log("PASS test11 — list_files recursive walk, symlinks, max_count");
+}
+
+// ---------------------------------------------------------------------------
+// 12. list_files: errors + router headers -----------------------------------
+// ---------------------------------------------------------------------------
+{
+  // path-level errors (same sandbox contract as the other file tools)
+  assert(/no such directory/.test(await thrown(() => listFilesInBase(root, "listroot/nope"))));
+  assert(/is not a directory/.test(await thrown(() => listFilesInBase(root, "listroot/a.txt"))));
+  assert(/escapes the launch directory/.test(await thrown(() => listFilesInBase(root, "../listroot"))));
+  assert(/escapes the launch directory \(symlink\)/.test(await thrown(() => listFilesInBase(root, "listroot/escsub"))));
+
+  const direct = textOf(await callFileTool(root, "list_files", { path: "listroot" }));
+  assert(direct.startsWith("listroot/: 7 entries"), direct);
+  assert(direct.includes(".env") && direct.includes("sub/") && !direct.includes("showing"), direct);
+
+  const rec = textOf(
+    await callFileTool(root, "list_files", { path: "listroot", recursive: true }),
+  );
+  assert(
+    rec.startsWith("listroot/: 18 entries — skipped 1 symlinked directory that resolves"),
+    rec,
+  );
+  assert(rec.includes("sub/c.txt") && rec.includes("goodlink/c.txt"), rec);
+
+  const launch = textOf(await callFileTool(root, "list_files", { path: "." }));
+  assert(launch.startsWith("launch directory:"), launch);
+
+  const zero = textOf(await callFileTool(root, "list_files", { path: "listroot", pattern: "zzz" }));
+  assert(zero === "listroot/: 0 entries", zero);
+
+  const bigHead = textOf(await callFileTool(root, "list_files", { path: "bigroot" }));
+  assert(
+    /bigroot\/: 1100 entries \(showing the first 100 of 1100; raise max_count or refine the pattern\)/.test(bigHead),
+    bigHead,
+  );
+
+  console.log("PASS test12 — list_files errors + router headers");
 }
 
 await rm(root, { recursive: true, force: true });

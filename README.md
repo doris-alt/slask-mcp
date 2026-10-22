@@ -52,7 +52,7 @@ What it supports:
 - **Multiple MCP servers** — the default slask server plus any number of additional stdio or HTTP servers listed in the config file.
 - **Agent chat** — a line-based REPL where an OpenAI-compatible model (real or local, e.g. Ollama) picks tools via function-calling and answers; `--prompt "<text>"` runs a single turn and exits, without the REPL.
 - **Local skills** — discovered from `./skills/`: advisory prompt material in `SKILL.md`, plus an optional executable `scripts/` folder (`.sh`/`.py`/`.js`).
-- **File tools** — built-in `read_file` / `edit_file` / `write_file`, hard-sandboxed by the client to the launch directory and its subdirectories (parent, upstream, and neighbouring paths are never reachable; symlinks that resolve outside are rejected in code, not by the model).
+- **File tools** — built-in `read_file` / `grep_file` / `edit_file` / `write_file` / `list_files`, hard-sandboxed by the client to the launch directory and its subdirectories (parent, upstream, and neighbouring paths are never reachable; symlinks that resolve outside are rejected in code, not by the model). `list_files` lists directory entries (files and directories, dotfiles included) with optional glob patterns (`*` never crosses `/`, `**` does), optional recursive walk, and a `max_count` bound (default 100, cap 1000) with the total found always reported.
 - **Direct commands** — `list` (every tool with its input schema), `call <tool>`, and `skill run <skill> <script>`, all without a model.
 - **Name collision** — a tool shared by two servers is namespaced as `<serverName>__<toolName>`.
 

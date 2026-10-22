@@ -1,5 +1,5 @@
-// files.ts — the client's built-in file tools: `read_file`, `edit_file`,
-// `write_file`.
+// files.ts — the client's built-in file tools: `read_file`, `grep_file`,
+// `edit_file`, `write_file`, `list_files`.
 //
 // All paths are resolved relative to the launch directory (the cwd where
 // `slask-client` started). Access is hard-sandboxed in client code — not by
@@ -21,17 +21,24 @@ import {
   mkdir,
   open,
   readFile,
+  readdir,
   realpath,
   stat,
   writeFile,
   appendFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { CallToolResult, OpenAiFunctionTool } from "./types.js";
 
 /** Names of the built-in file tools (reused by the UI banner and docs). */
-export const FILE_TOOL_NAMES: string[] = ["read_file", "grep_file", "edit_file", "write_file"];
+export const FILE_TOOL_NAMES: string[] = [
+  "read_file",
+  "grep_file",
+  "edit_file",
+  "write_file",
+  "list_files",
+];
 
 /**
  * Max bytes returned by `read_file`. Larger files are truncated to this limit
@@ -51,6 +58,15 @@ const MAX_GREP_LINE = 300; // chars kept per output line
  * model's own per-completion token limit bounds what it can emit anyway.
  */
 const MAX_EDIT_BYTES = 10_485_760; // 10 MiB
+
+/** Default `max_count` for `list_files` when the argument is omitted. */
+const DEFAULT_LIST_COUNT = 100;
+
+/**
+ * Hard cap on `max_count` (silent clamp, same house style as `read_file`'s
+ * byte cap and `grep_file`'s match cap).
+ */
+const MAX_LIST_COUNT = 1000;
 
 /** Plain text = no NUL bytes (same heuristic as skills.ts `isText`). */
 function isText(buf: Buffer): boolean {
@@ -411,6 +427,214 @@ export async function grepFileInBase(
   return matches === 0 ? head : head + "\n" + out.join("\n");
 }
 
+/**
+ * Convert a relative-path glob to a fully-anchored `RegExp`.
+ *
+ * Semantics (also documented in the `list_files` tool description):
+ *   - `*`  matches any run of characters *not* including `/` (dotfiles
+ *     match: `*` lists `.env`);
+ *   - `**` crosses subdirectories — a lone `**` matches everything;
+ *     a `**` followed by `/` and a name matches that name at any depth,
+ *     including the top level;
+ *   - `?`  one character other than `/`;
+ *   - `[abc]` a character class; an empty class (`[]`) is emitted as the
+ *     literal `[`/`]` characters; an unterminated `[` is literal;
+ *   - everything else is literal (all other regex metacharacters escape).
+ */
+export function globToRegExp(glob: string): RegExp {
+  let out = "";
+  let i = 0;
+  while (i < glob.length) {
+    const c = glob[i];
+    if (c === "*" && glob[i + 1] === "*") {
+      i += 2;
+      if (glob[i] === "/") {
+        // `**/`: zero or more full segments — so `**/x` also matches the
+        // top-level `x`.
+        out += "(?:[^/]+/)*";
+        i += 1; // swallow the separator
+      } else if (i >= glob.length) {
+        // trailing `**`: matches the prefix itself too (`sub/**` → `sub`).
+        if (out === "") {
+          // lone `**` at the start: anything at any depth.
+          out += ".*";
+        } else {
+          // drop a trailing `/` so the prefix alone still matches.
+          if (out.endsWith("\\/")) {
+            out = out.slice(0, out.length - 2);
+          }
+          out += "(?:/.*)?";
+        }
+      } else {
+        // `**` mid-pattern (e.g. `a**b`): any run, possibly empty.
+        out += ".*";
+      }
+    } else if (c === "*") {
+      out += "[^/]*";
+      i += 1;
+    } else if (c === "?") {
+      out += "[^/]";
+      i += 1;
+    } else if (c === "[") {
+      const end = glob.indexOf("]", i + 1);
+      if (end === -1) {
+        // unterminated class: literal `[`
+        out += "\\[";
+        i += 1;
+      } else {
+        const body = glob.slice(i + 1, end);
+        out += body === "" ? "\\[]" : "[" + body + "]";
+        i = end + 1;
+      }
+    } else {
+      out += c.replace(/[\/\\^$*.+?()|{}-]/g, "\\$&");
+      i += 1;
+    }
+  }
+  return new RegExp("^" + out + "$");
+}
+
+/** Result of a `list_files` call. */
+export interface FileListResult {
+  /** The listed directory, relative to the launch directory (`.` for the base). */
+  dirRel: string;
+  /**
+   * Entries, relative to the listed directory (directories carry a trailing
+   * `/`), sorted depth-first, per-directory name order. Bounded to `max_count`.
+   */
+  entries: string[];
+  /** Total matching entries found (before the `max_count` cap). */
+  total: number;
+  /** true iff `entries` is shorter than `total`. */
+  truncated: boolean;
+  /**
+   * Symlinked subdirectories that resolve outside the launch directory: they
+   * are listed by name but never entered.
+   */
+  skipped: number;
+}
+
+function parseListCount(value: unknown): number {
+  if (value === undefined || value === null) {
+    return DEFAULT_LIST_COUNT;
+  }
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1 || !Number.isInteger(n)) {
+    throw new Error(
+      "max_count must be a positive integer count (got " + JSON.stringify(value) + ")",
+    );
+  }
+  return Math.min(MAX_LIST_COUNT, n);
+}
+
+/**
+ * List directory entries under the sandbox base, optionally filtered by a
+ * glob over each entry's relative path and bounded by `max_count`.
+ *
+ * `recursive` false: direct entries only. `recursive` true: full depth-first
+ * walk (each directory's own entries sorted). A symlinked directory is entered
+ * only when it resolves inside the launch directory and hasn't been entered
+ * before — a link resolving outside is still *listed* by name, simply never
+ * descended into (counted in `skipped`) — and the real-path set keeps
+ * symlink cycles from looping the walk. Plain directories are always entered
+ * (a symlink-free tree is acyclic), so a link to a plain dir is also entered
+ * once, under the link's name. The pattern filters *displayed* entries only:
+ * the full tree is always scanned, so `sub/**` finds entries even when `sub`
+ * itself does not match.
+ */
+export async function listFilesInBase(
+  baseDir: string,
+  rawPath: unknown,
+  rawPattern?: unknown,
+  rawRecursive?: unknown,
+  rawMaxCount?: unknown,
+): Promise<FileListResult> {
+  const abs = resolveInBase(baseDir, rawPath);
+  const rel = relOf(baseDir, abs);
+  let st;
+  try {
+    st = await stat(abs);
+  } catch {
+    throw new Error("no such directory: " + rel);
+  }
+  if (!st.isDirectory()) {
+    throw new Error(rel + " is not a directory");
+  }
+  const realRoot = await resolveExistingInBase(baseDir, abs);
+
+  const pattern =
+    rawPattern === undefined || rawPattern === null ? null : String(rawPattern).trim();
+  if (rawPattern !== undefined && rawPattern !== null && pattern === "") {
+    throw new Error("pattern must not be empty");
+  }
+  const re = pattern === null ? null : globToRegExp(pattern);
+  const recursive = Boolean(rawRecursive);
+  const max = parseListCount(rawMaxCount);
+
+  const matched: string[] = [];
+  let skipped = 0;
+  const entered = new Set<string>([realRoot]);
+
+  const add = (relName: string, isDir: boolean): void => {
+    if (re === null || re.test(relName)) {
+      matched.push(isDir ? relName + "/" : relName);
+    }
+  };
+
+  const walk = async (dirAbs: string, relDir: string): Promise<void> => {
+    const attrs = await readdir(dirAbs, { withFileTypes: true });
+    attrs.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const e of attrs) {
+      const name = e.name;
+      const entryRel = relDir === "" ? name : relDir + "/" + name;
+      let isDir = e.isDirectory();
+      const childAbs = join(dirAbs, name);
+      if (!isDir && e.isSymbolicLink()) {
+        // symlinked regular files: `readdir` reports them as
+        // `isDir === false` and `isSymbolicLink() === true`; a symlink *to*
+        // a directory still shows `isDir === true` in `readdir`, so the
+        // `stat` re-check is what makes the trailing-slash decision right.
+        const cst = await stat(childAbs).catch(() => null);
+        isDir = cst !== null && cst.isDirectory();
+      }
+      add(entryRel, isDir);
+      if (recursive && isDir) {
+        if (e.isSymbolicLink()) {
+          // A symlinked directory is entered only when it resolves inside the
+          // base and hasn't been entered before (cycle guard).
+          try {
+            const real = await resolveExistingInBase(baseDir, childAbs);
+            if (entered.has(real)) continue;
+            entered.add(real);
+            await walk(childAbs, entryRel);
+          } catch {
+            // resolves outside the base (or vanished): listed, never entered.
+            skipped += 1;
+          }
+        } else {
+          // Plain directories are inside the base by construction and can't
+          // participate in a cycle, so they're always entered; remembering
+          // their real path keeps a later symlink to one from re-entering.
+          const real = await resolveExistingInBase(baseDir, childAbs).catch(() => childAbs);
+          entered.add(real);
+          await walk(childAbs, entryRel);
+        }
+      }
+    }
+  };
+
+  await walk(abs, "");
+
+  const total = matched.length;
+  return {
+    dirRel: rel,
+    entries: matched.slice(0, max),
+    total,
+    truncated: total > max,
+    skipped,
+  };
+}
+
 export function fileTools(): OpenAiFunctionTool[] {
   const note =
     "Paths are relative to the launch directory and may not leave it: " +
@@ -544,6 +768,52 @@ export function fileTools(): OpenAiFunctionTool[] {
         },
       },
     },
+    {
+      type: "function",
+      function: {
+        name: "list_files",
+        description:
+          "List the entries of a directory under the launch directory: files " +
+          "and directories (directories end with `/`), relative to the directory " +
+          "being listed. Optional `pattern` is a glob over each entry's relative " +
+          "path: `*` matches any run that does not cross `/` (dotfiles match, so " +
+          "`*` lists `.env`), `**` crosses subdirectories (a lone `**` matches " +
+          "everything; `**/*.ts` matches `.ts` files at any depth, including the " +
+          "top level). `recursive` (default false) walks the whole tree depth-" +
+          "first from `path`; with `recursive: true` the full tree is scanned, so " +
+          "`sub/**` also finds entries when `sub` itself does not match. " +
+          "`max_count` (default 100, hard cap 1000) bounds the entries returned; " +
+          "the total found is always reported in the header, so truncation is " +
+          "visible. Symlinked subdirectories that resolve outside the launch " +
+          "directory are listed but never entered (counted in the result). " +
+          note,
+        parameters: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "directory to list, relative to the launch directory (`.` = the launch directory)",
+            },
+            pattern: {
+              type: "string",
+              description:
+                "glob over each entry's relative path (`*`, `?`, `**`, `[...]`); " +
+                "`*` never crosses `/`, `**` does; omitted = no filter",
+            },
+            recursive: {
+              type: "boolean",
+              description: "walk all subdirectories depth-first from `path` (default: false)",
+            },
+            max_count: {
+              type: "integer",
+              description:
+                "max entries to return (default: 100, hard cap: 1000); the total found is always reported",
+            },
+          },
+          required: ["path"],
+        },
+      },
+    },
   ];
 }
 
@@ -562,7 +832,14 @@ export function fileSystemBlock(): string {
     "`write_file` once to start the file (the default overwrite is fine for the " +
     "first chunk), then send each further chunk with `append: true`. To read a " +
     "large file, use `read_file` byte ranges and continue from the `next " +
-    "offset` the result reports. Use `edit_file` for targeted changes."
+    "offset` the result reports. Use `edit_file` for targeted changes. " +
+    "`list_files` lists a directory's entries — files and directories (directories " +
+    "end with `/`) — relative to the directory being listed; `pattern` is a glob " +
+    "over each entry's relative path where `*` never crosses `/` (dotfiles match) " +
+    "and `**` does (`**/*.ts` finds `.ts` at any depth); `recursive: true` walks " +
+    "the whole tree from `path`; `max_count` bounds the result (default 100, " +
+    "cap 1000) and the total found is always reported; symlinked subdirectories " +
+    "outside the base are listed but never entered."
   );
 }
 
@@ -634,6 +911,35 @@ export async function callFileTool(
         r.appended
           ? "appended " + r.bytes + " bytes to " + r.path + (r.created ? " (new file)" : "")
           : "wrote " + r.bytes + " bytes to " + r.path + (r.created ? " (new file)" : "");
+      break;
+    }
+    case "list_files": {
+      const r = await listFilesInBase(
+        baseDir,
+        args.path,
+        args.pattern,
+        args.recursive,
+        args.max_count,
+      );
+      const label = r.dirRel === "." ? "launch directory" : r.dirRel + "/";
+      let header = label + ": " + r.total + " entr" + (r.total === 1 ? "y" : "ies");
+      if (r.truncated) {
+        header +=
+          " (showing the first " +
+          r.entries.length +
+          " of " +
+          r.total +
+          "; raise max_count or refine the pattern)";
+      }
+      if (r.skipped > 0) {
+        header +=
+          " — skipped " +
+          r.skipped +
+          " symlinked director" +
+          (r.skipped === 1 ? "y that resolves" : "ies that resolve") +
+          " outside the launch directory";
+      }
+      text = r.entries.length === 0 ? header : header + "\n" + r.entries.join("\n");
       break;
     }
     default:

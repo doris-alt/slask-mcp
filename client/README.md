@@ -277,7 +277,7 @@ bundled scripts are also shown in the startup banner and via the agent's
 
 ## File tools
 
-The client ships four **built-in** file tools that are always available to the
+The client ships five **built-in** file tools that are always available to the
 agent (they appear in the startup banner alongside server and skill tools):
 
 | Tool            | What it does                                             | Required args             |
@@ -286,6 +286,7 @@ agent (they appear in the startup banner alongside server and skill tools):
 | `grep_file`     | show only the lines of a file that match a pattern (regex, case-insensitive by default; line numbers, optional 0-3 lines of context, max 50 matches) — look inside a large file without reading it | `path`, `pattern`, optional `context`, `max_matches`, `ignore_case` |
 | `edit_file`     | atomic search-and-replace; never modifies unless it succeeds | `path`, `search`, `replace`, optional `replaceAll` |
 | `write_file`    | create or overwrite a file, or append with `append: true` (parent dirs created as needed) | `path`, `content`, optional `append` |
+| `list_files`    | list a directory's entries — files and directories (directories end with `/`) — relative to the directory being listed; optional glob `pattern` (`*` never crosses `/`, `**` does, dotfiles match), `recursive: true` walks the whole tree, `max_count` bounds the result (default 100, cap 1000; the total found is always reported) | `path`, optional `pattern`, `recursive`, `max_count` |
 
 - **`read_file(path, offset?, bytes?)`** returns the file text, its total
   byte count, and a `truncated` flag. The default read covers bytes from 0
@@ -311,8 +312,20 @@ agent (they appear in the startup banner alongside server and skill tools):
   created if it does not yet exist. Use the append mode to write a large file
   in chunks: one `write_file` call for the first chunk (default overwrite),
   then each following chunk with `append: true`.
+- **`list_files(path[, pattern, recursive, max_count])`** lists a directory's
+  entries — files and directories (directories end with `/`) — relative to the
+  directory being listed. `pattern` is a glob over each entry's relative path:
+  `*` matches any run of characters that never crosses `/` (dotfiles match, so
+  `*` lists `.env`), `**` crosses subdirectories (a lone `**` matches
+  everything; `**/*.ts` matches `.ts` files at any depth). `recursive`
+  (default false) walks the whole tree depth-first from `path`; since the full
+  tree is always scanned when recursive, `sub/**` finds entries even when `sub`
+  itself does not match. `max_count` (default 100, hard cap 1000) bounds the
+  entries returned, and the total found is always reported in the header so
+  truncation is visible. Symlinked subdirectories that resolve outside the
+  launch directory are listed by name but never entered.
 
-**Sandbox (enforced in client code, not by the agent).** All three tools only
+**Sandbox (enforced in client code, not by the agent).** All five tools only
 touch paths under the **launch directory** — the directory where
 `slask-client` was started — and its subdirectories. Refused by the client,
 as model-actionable `ERROR calling …` feed-back:
