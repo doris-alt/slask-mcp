@@ -360,18 +360,49 @@ or `slask-client -C ~/proj ralph run …`. Prefer this when the run must start r
 | `OPENAI_API_KEY is not set` | set it in the workspace `.env` or the shell, or point `API_BASE` at a local server |
 | MCP server unreachable warning | non-fatal; built-in tools still work, but research needs its tools |
 
+## 10b. Patching a finished run (add a task, redo one task, redo the report)
+
+You do not have to restart a run to change its result. The loop skips every task with
+`passes: true`, so a re-run only does the new or re-opened work. For a research run it then
+repeats the final synthesis, which rewrites `report.md` from all findings (the previous
+report is kept as `report.prev.md`).
+
+Example: the report left out a comparison, run `local-llm` in `xx/`:
+
+```text
+# 1. add the missing task (a run in state "done" accepts new tasks)
+slask-client -C xx ralph add local-llm "Compare the Mac mini M6" \
+  --criteria "ralph-local-llm/findings/mac-mini-m6.md exists;cites at least 2 recent sources;states whether it changes the top-line pick" \
+  --desc "Compare the Mac mini M6 against the table in ralph-local-llm/findings/hardware-tradeoff.md: price, memory, bandwidth, tokens/sec. Write findings/mac-mini-m6.md."
+# 2. run: only the new task, its checker, and the report run
+slask-client -C xx ralph start local-llm
+```
+
+- **Redo a task that passed but was weak:** `ralph reopen <name> <task-id> [--note "what was missing"]`
+  (chat: `/ralph reopen <name> <task-id>`), then `ralph start <name>`. The note is shown to the
+  worker as the last failure. Its old findings file stays in place for it to improve.
+- **Redo only the report:** `ralph report <name>` (chat: `/ralph report <name>`). Needs a research run
+  whose tasks all pass. `ralph start <name>` on a finished run does the same.
+- Keep tasks small (see "Small tasks and the context window"): new tasks go through the same lint.
+- The synthesis reads `findings/` and `progress.txt`, so old conclusions can anchor it. Put "state
+  whether this changes the top-line recommendation" in the new task's criteria so the report has
+  something explicit to pick up.
+- In code mode `reopen` re-runs the task and the `check` command; `report` does not apply.
+
 ## 11. Quick reference
 
 ```text
 slask-client [-C <dir>] ralph init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>] [--max N] [--context <tokens>] [--tool-budget <n>]
 slask-client [-C <dir>] ralph spec <name> <file>        replace the project description
-slask-client [-C <dir>] ralph add <name> <title> [--criteria "a;b;c"]     (warns if the task looks too coarse)
+slask-client [-C <dir>] ralph add <name> <title> [--criteria "a;b;c"] [--desc <text>]     (warns if the task looks too coarse)
+slask-client [-C <dir>] ralph reopen <name> <task-id> [--note <why>]   run a passed task again
+slask-client [-C <dir>] ralph report <name>             research: rewrite report.md only
 slask-client [-C <dir>] ralph split <name> <task-id>    have the model replace a too-big task with 2-4 smaller ones
 slask-client [-C <dir>] ralph run <name> [--max N]      foreground
 slask-client [-C <dir>] ralph start|stop <name>         background
 slask-client [-C <dir>] ralph status [name] | list
 chat:   /ralph list | status <n> | init <n> [mode] [spec-file] | spec <n> <file> | check <n> <cmd...>
-                | plan <n> [mode] [goal...] | add <n> <title...> | split <n> <task-id> | start <n> | stop <n>   (positional; flags are CLI-only)
+                | plan <n> [mode] [goal...] | add <n> <title...> | split <n> <task-id> | reopen <n> <task-id> | report <n> | start <n> | stop <n>   (positional; flags are CLI-only)
 tools:  ralph_list ralph_status ralph_create ralph_add_task ralph_configure ralph_note ralph_start ralph_stop   (chat)
         ralph_status ralph_add_task ralph_note ralph_complete_task ralph_split_task run_command                  (worker iterations)
         ralph_status ralph_verdict                                                                              (research checker)

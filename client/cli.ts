@@ -121,8 +121,13 @@ Usage:
       init takes --context <tokens> (the model's context window, default
       32000) and --tool-budget <n> (tool calls per iteration, default 25);
       iterations are sized and truncated to fit them.
-  slask-client ralph add <name> <title> [--criteria "a;b;c"]
+  slask-client ralph add <name> <title> [--criteria "a;b;c"] [--desc <text>]
       Append a task.
+  slask-client ralph reopen <name> <task-id> [--note <why>]
+      Mark a finished task as not done so the next start runs it again.
+  slask-client ralph report <name>
+      Research: rewrite report.md from the findings (previous one is kept
+      as report.prev.md). All tasks must pass.
   slask-client ralph run <name> [--max N]
       Run the loop in the foreground. --max N = most iterations per task
       (default 10; the count restarts for each task).
@@ -200,7 +205,7 @@ interface CliConfig {
   quiet: boolean;
   help: boolean;
   dir: string | null;
-  ralph: { mode?: string; check?: string; max?: string; from?: string; criteria?: string; out?: string; spec?: string; plan?: boolean; context?: string; toolBudget?: string };
+  ralph: { mode?: string; check?: string; max?: string; from?: string; criteria?: string; out?: string; spec?: string; plan?: boolean; context?: string; toolBudget?: string; desc?: string; note?: string };
 }
 
 function fail(msg: string): never {
@@ -473,6 +478,10 @@ export function parse(argv: string[]): CliConfig {
       if (++i < argv.length) config.ralph.toolBudget = argv[i];
     } else if (f === "--plan") {
       config.ralph.plan = true;
+    } else if (f === "--desc") {
+      if (++i < argv.length) config.ralph.desc = argv[i];
+    } else if (f === "--note") {
+      if (++i < argv.length) config.ralph.note = argv[i];
     } else if (f === "--criteria") {
       if (++i < argv.length) config.ralph.criteria = argv[i];
     } else {
