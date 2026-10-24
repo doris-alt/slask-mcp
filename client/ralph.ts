@@ -798,10 +798,10 @@ export interface AgentRunArgs {
   timeoutMs: number;
   logFile: string;
   /**
-   * The models.json id to hand to the child via `--model`. When set, the
-   * default runners append it *after* `forwardArgs`, so last-value-wins makes the
-   * role's model override the top-level session default. Omitted = inherit whatever
-   * `forwardArgs` (the session `--model`) already carried.
+   * The models.json selection (`provider/id`) to hand to the child via `--model`.
+   * When set, the default runners append it *after* `forwardArgs`, so last-value-wins
+   * makes the role's model override the top-level session default. Omitted = inherit
+   * whatever `forwardArgs` (the session `--model`) already carried.
    */
   modelId?: string;
 }
@@ -818,17 +818,18 @@ export interface RunRalphOptions {
   /** The `--base-url` session override, used only when the selected entry has no base of its own. */
   baseOverride?: string | null;
   /**
-   * models.json id for the top-level / role-default model (the `--model` flag).
-   * Omitted/null = resolve the file default (the `default: true` entry, else first).
+   * models.json selection (`provider/id`) for the top-level / role-default model
+   * (the `--model` flag). Omitted/null = resolve the file default (the first
+   * provider's first model).
    */
   modelId?: string | null;
-  /** models.json id for the *worker* role (fresh-context iterations). Omitted = modelId. */
+  /** models.json selection (`provider/id`) for the *worker* role (fresh-context iterations). Omitted = modelId. */
   workerModelId?: string | null;
-  /** models.json id for the *checker* role (research verification). Omitted = modelId. */
+  /** models.json selection (`provider/id`) for the *checker* role (research verification). Omitted = modelId. */
   checkerModelId?: string | null;
-  /** models.json id for the *splitter* role (task splitting). Omitted = modelId. */
+  /** models.json selection (`provider/id`) for the *splitter* role (task splitting). Omitted = modelId. */
   splitterModelId?: string | null;
-  /** models.json id for the *report* role (final synthesis). Omitted = modelId. */
+  /** models.json selection (`provider/id`) for the *report* role (final synthesis). Omitted = modelId. */
   reportModelId?: string | null;
   /** Flags forwarded to each child (e.g. --model). Default: setRalphForwardArgs(). */
   extraArgs?: string[];
@@ -928,15 +929,16 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
   const maxIterations = opts.maxIterations ?? cfg.maxIterations;
   const outDir = outputDirOf(name, cfg);
 
-  // Resolve the role models up front — an unknown id fails fast here with the
-  // available-id list (strict). A role with no explicit id inherits the top
-  // model; the top level with no id uses the file default.
+  // Resolve the role models up front — an unknown selection fails fast here with
+  // the available provider/id list (strict). A role with no explicit selection
+  // inherits the top model; the top level with no selection uses the file
+  // default.
   const resolveRole = async (
-    id?: string | null,
+    selection?: string | null,
     fallback?: ResolvedModel,
   ): Promise<ResolvedModel> =>
-    id
-      ? resolveModel(base, { id, baseOverride: opts.baseOverride ?? null })
+    selection
+      ? resolveModel(base, { selection, baseOverride: opts.baseOverride ?? null })
       : (fallback ?? resolveModel(base, { baseOverride: opts.baseOverride ?? null }));
   const topModel = await resolveRole(opts.modelId);
   const workerModel = await resolveRole(opts.workerModelId, topModel);
@@ -1052,11 +1054,11 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
       const logFile = join(dir, "iterations", `${nn}.log`);
       await mkdir(join(dir, "iterations"), { recursive: true });
       const w = await runAgent({
-        prompt: workerPrompt(prd, cfg, task, relDir, outDir, hasSpec, workerModel.maxContext),
-        env: childEnv("worker", task, workerModel.maxContext),
+        prompt: workerPrompt(prd, cfg, task, relDir, outDir, hasSpec, workerModel.contextWindow),
+        env: childEnv("worker", task, workerModel.contextWindow),
         timeoutMs: cfg.timeoutS * 1000,
         logFile,
-        modelId: workerModel.id,
+        modelId: workerModel.selection,
       });
       current = null;
       if (aborted) return await finish("stopped", "interrupted");
@@ -1106,10 +1108,10 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
         log("  verifying: checker pass");
         await runAgent({
           prompt: checkerPrompt(after, t, outDir, relDir, hasSpec),
-          env: childEnv("checker", t, checkerModel.maxContext),
+          env: childEnv("checker", t, checkerModel.contextWindow),
           timeoutMs: cfg.timeoutS * 1000,
           logFile: join(dir, "iterations", `${nn}-check.log`),
-          modelId: checkerModel.id,
+          modelId: checkerModel.selection,
         });
         current = null;
         if (aborted) return await finish("stopped", "interrupted");
@@ -1149,7 +1151,7 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
     const done = await loadPrd(base, name);
     if (done.mode === "research" && done.tasks.length > 0) {
       log("\n=== final synthesis ===");
-      await synthesize(base, name, cfg, done, runAgent, reportModel.maxContext, reportModel.id);
+      await synthesize(base, name, cfg, done, runAgent, reportModel.contextWindow, reportModel.selection);
       current = null;
     }
     return await finish("done", done.mode === "research" ? `report: ${outDir}/report.md` : undefined);
@@ -1173,8 +1175,8 @@ async function synthesize(
   cfg: RalphConfig,
   prd: RalphPrd,
   runAgent: (a: AgentRunArgs) => Promise<ExecResult>,
-  reportModelMaxContext?: number,
-  reportModelId?: string,
+  reportModelContextWindow?: number,
+  reportModelSelection?: string,
 ): Promise<ExecResult> {
   const dir = runDir(base, name);
   const outDir = outputDirOf(name, cfg);
@@ -1184,20 +1186,20 @@ async function synthesize(
   // collapses it to worker anyway, which is exactly what synthesis needs: the worker
   // toolset, including `ralph_complete_task`). The *empty* task is what marks it as
   // the synthesis step. The report model's context window is threaded through
-  // `reportModelMaxContext` rather than flipping the env role.
+  // `reportModelContextWindow` rather than flipping the env role.
   return runAgent({
     prompt: synthesisPrompt(prd, relative(base, dir) || ".", outDir, (await specSize(base, name)) !== null),
-    env: ralphChildEnv(dir, name, cfg, "worker", "", reportModelMaxContext),
+    env: ralphChildEnv(dir, name, cfg, "worker", "", reportModelContextWindow),
     timeoutMs: cfg.timeoutS * 1000,
     logFile: join(dir, "iterations", "report.log"),
-    ...(reportModelId ? { modelId: reportModelId } : {}),
+    ...(reportModelSelection ? { modelId: reportModelSelection } : {}),
   });
 }
 
 export interface RunReportOptions {
   base?: string;
   name: string;
-  /** models.json id for the report role. Omitted/null = resolve the file default. */
+  /** models.json selection (`provider/id`) for the report role. Omitted/null = resolve the file default. */
   reportModelId?: string | null;
   /** The `--base-url` session override. Omitted/null = null. */
   baseOverride?: string | null;
@@ -1218,9 +1220,10 @@ export async function runReport(opts: RunReportOptions): Promise<{ ok: boolean; 
   const cfg = await loadConfig(base, name);
   const outDir = outputDirOf(name, cfg);
   const dir = runDir(base, name);
-  // Resolve the report model (fail-fast on unknown ids, listing available ids).
+  // Resolve the report model (fail-fast on unknown selection, listing the
+  // available provider/id entries).
   const reportModel = await resolveModel(base, {
-    id: opts.reportModelId ?? null,
+    selection: opts.reportModelId ?? null,
     baseOverride: opts.baseOverride ?? null,
   });
   const runAgent =
@@ -1246,7 +1249,7 @@ export async function runReport(opts: RunReportOptions): Promise<{ ok: boolean; 
   try {
     await writeStatus(base, name, { state: "running", iteration: 0, message: "rewriting the report" });
     (opts.log ?? console.log)(`rewriting ${outDir}/report.md from ${prd.tasks.length} task(s)…`);
-    const r = await synthesize(base, name, cfg, prd, runAgent, reportModel.maxContext, reportModel.id);
+    const r = await synthesize(base, name, cfg, prd, runAgent, reportModel.contextWindow, reportModel.selection);
     const written = await stat(join(base, outDir, "report.md")).then((s) => s.mtimeMs >= startedAt - 1000, () => false);
     const ok = r.code === 0 && written;
     const message = ok ? `report: ${outDir}/report.md` : `report not written (exit ${r.code}); log: ${STATE_DIR}/${name}/iterations/report.log`;
@@ -1895,25 +1898,25 @@ export interface RalphCliArgs {
   toolBudget?: string;
   desc?: string;
   note?: string;
-  /** models.json id for the top-level / role-default model (`--model`). */
+  /** models.json selection (`provider/id`) for the top-level / role-default model (`--model`). */
   model?: string | null;
   /** The `--base-url` session override. */
   base?: string | null;
-  /** models.json id for the worker role (`--worker-model`). Omitted = model. */
+  /** models.json selection (`provider/id`) for the worker role (`--worker-model`). Omitted = model. */
   workerModel?: string | null;
-  /** models.json id for the checker role (`--checker-model`). Omitted = model. */
+  /** models.json selection (`provider/id`) for the checker role (`--checker-model`). Omitted = model. */
   checkerModel?: string | null;
-  /** models.json id for the splitter role (`--splitter-model`). Omitted = model. */
+  /** models.json selection (`provider/id`) for the splitter role (`--splitter-model`). Omitted = model. */
   splitterModel?: string | null;
-  /** models.json id for the report role (`--report-model`). Omitted = model. */
+  /** models.json selection (`provider/id`) for the report role (`--report-model`). Omitted = model. */
   reportModel?: string | null;
 }
 
 const CLI_USAGE =
   "usage: slask-client ralph <init|add|run|start|stop|status|list> [name] — " +
-  "init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>] [--context <tokens>] [--tool-budget <n>]; spec <name> <file>; split <name> <task-id> [--splitter-model <id>]; add <name> <title> [--criteria \"a;b\"] [--desc <text>]; reopen <name> <task-id> [--note <why>]; report <name> [--report-model <id>]; " +
-  "run <name> [--max N] [--model <id>] [--worker-model <id>] [--checker-model <id>] [--splitter-model <id>] [--report-model <id>]; start|stop <name>; status [name]; list " +
-  "(--model and role flags take models.json ids; unknown ids fail with the available-id list)";
+  "init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>] [--context <tokens>] [--tool-budget <n>]; spec <name> <file>; split <name> <task-id> [--splitter-model <provider/id>]; add <name> <title> [--criteria \"a;b\"] [--desc <text>]; reopen <name> <task-id> [--note <why>]; report <name> [--report-model <provider/id>]; " +
+  "run <name> [--max N] [--model <provider/id>] [--worker-model <provider/id>] [--checker-model <provider/id>] [--splitter-model <provider/id>] [--report-model <provider/id>]; start|stop <name>; status [name]; list " +
+  "(--model and role flags take models.json selections (provider/id, or a bare id if unique); unknown selections fail with the available provider/id list)";
 
 /** The `slask-client ralph …` subcommand. Returns the process exit code. */
 export interface RalphCliDeps {
@@ -1993,11 +1996,11 @@ export async function splitViaAgent(
   const prompt = splitterPrompt(
     prd, cfg, task, relative(base, dir), outputDirOf(name, cfg), (await specSize(base, name)) !== null,
     why ?? task.lastFailure ?? "manual split requested",
-    m.maxContext,
+    m.contextWindow,
   );
-  const env = ralphChildEnv(dir, name, cfg, "splitter", id, m.maxContext);
+  const env = ralphChildEnv(dir, name, cfg, "splitter", id, m.contextWindow);
   const logFile = join(dir, "iterations", `split-${id}.log`);
-  const r = await agentFn({ prompt, env, timeoutMs: cfg.timeoutS * 1000, logFile, modelId: m.id });
+  const r = await agentFn({ prompt, env, timeoutMs: cfg.timeoutS * 1000, logFile, modelId: m.selection });
 
   const after = await loadPrd(base, name);
   const ids = after.tasks.filter((t) => t.id.startsWith(`${id}.`) && !t.id.slice(id.length + 1).includes(".")).map((t) => t.id);
@@ -2074,8 +2077,8 @@ export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd
       log(`created run "${prd.name}" [${prd.mode}] with ${prd.tasks.length} task(s) in ${STATE_DIR}/${prd.name}/${spec ? " (spec copied to spec.md)" : ""}`);
       if (a.plan) {
         log("planning tasks from the description (non-interactive)…");
-        const topModel = await resolveModel(base, { id: a.model ?? null, baseOverride: a.base ?? null });
-        const prompt = planPrompt(prd, spec !== undefined, false, relative(base, runDir(base, name)), await loadConfig(base, name), topModel.maxContext);
+        const topModel = await resolveModel(base, { selection: a.model ?? null, baseOverride: a.base ?? null });
+        const prompt = planPrompt(prd, spec !== undefined, false, relative(base, runDir(base, name)), await loadConfig(base, name), topModel.contextWindow);
         const code = await (deps.planFn ?? defaultPlanFn)(name, prompt);
         log(await formatStatus(base, name));
         if (code !== 0) log(`⚠ planning exited with code ${code} — review the task list, or add tasks with \`ralph add\``);
@@ -2125,7 +2128,7 @@ export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd
     case "split": {
       const id = a.positional[3];
       if (name === undefined || id === undefined) throw new Error(CLI_USAGE);
-      const splitterModel = await resolveModel(base, { id: a.splitterModel ?? a.model ?? null, baseOverride: a.base ?? null });
+      const splitterModel = await resolveModel(base, { selection: a.splitterModel ?? a.model ?? null, baseOverride: a.base ?? null });
       const r = await splitViaAgent(base, name, id, deps.agentFn, undefined, splitterModel);
       log(r.text);
       return r.ok ? 0 : 1;

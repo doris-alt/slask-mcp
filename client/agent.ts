@@ -138,29 +138,38 @@ export const SYSTEM_PROMPT = [
 // no API key, so when the target is anything other than the real OpenAI
 // endpoint we pass a placeholder key instead of requiring one. Pointing at
 // the real OpenAI endpoint without a key is an error.
-function resolveApiConfig(base?: string | null): { baseURL: string; apiKey: string } {
+function resolveApiConfig({
+  base,
+  apiKey,
+}: { base?: string | null; apiKey?: string | null }): {
+  baseURL: string;
+  apiKey: string;
+} {
   const rawBase = base ?? process.env.API_BASE ?? DEFAULT_API_BASE;
-  const key = process.env.OPENAI_API_KEY ?? "";
+  const key = (apiKey ?? process.env.OPENAI_API_KEY ?? "").trim();
   const real = isRealOpenAi(rawBase);
   const effectiveKey = key || (real ? "" : "local");
   if (!effectiveKey) {
     throw new Error(
-      "OPENAI_API_KEY is not set and the target is the real OpenAI endpoint (" +
-        `${DEFAULT_API_BASE}). Set OPENAI_API_KEY to use the real API, or point ` +
-        "API_BASE (or --base-url) at an OpenAI-compatible server that needs no " +
-        "key (e.g. an Ollama host) to skip the key."
+      "no API key is set and the target is the real OpenAI endpoint (" +
+        `${DEFAULT_API_BASE}). Set OPENAI_API_KEY (or a provider "apiKey" in ` +
+        "models.json) to use the real API, or point API_BASE (or --base-url) at an " +
+        "OpenAI-compatible server that needs no key (e.g. an Ollama host) to skip the key."
     );
   }
   return { baseURL: ensureV1Path(rawBase), apiKey: effectiveKey };
 }
 
 /**
- * Build the OpenAI client. `base` (a `--base-url` flag) takes precedence over
- * `API_BASE`, which defaults to the real OpenAI endpoint.
+ * Build the OpenAI client. `base` (a `--base-url` flag or provider `baseUrl`)
+ * and the provider `apiKey` take precedence over `API_BASE` / `OPENAI_API_KEY`.
  */
-export function createOpenAiClient({ base }: { base?: string | null }): InstanceType<typeof OpenAI> {
-  const { baseURL, apiKey } = resolveApiConfig(base);
-  return new OpenAI({ baseURL, apiKey });
+export function createOpenAiClient({
+  base,
+  apiKey,
+}: { base?: string | null; apiKey?: string | null }): InstanceType<typeof OpenAI> {
+  const cfg = resolveApiConfig({ base, apiKey });
+  return new OpenAI({ baseURL: cfg.baseURL, apiKey: cfg.apiKey });
 }
 
 /**
@@ -201,9 +210,20 @@ export async function runAgentTurn(
   requestMessages: ConversationMessage[],
   onToolCall?: (record: ToolCallRecord) => void,
 ): Promise<string> {
-  const { openai, model, systemPrompt, tools, callTool } = cfg;
+  const { openai, model, systemPrompt, tools, callTool, maxTokens: modelCap } = cfg;
   const maxIterations = envInt("SLASK_MAX_TOOL_ITERATIONS", MAX_TOOL_ITERATIONS);
-  const maxTokens = envInt("SLASK_MAX_TOKENS", MAX_TOKENS);
+  // Completion cap: a valid SLASK_MAX_TOKENS env knob (the user, or Ralph's
+  // window-fit budget) wins, clamped to the model's declared output capability
+  // so a completion can never exceed it; otherwise the model's capability, and
+  // if neither is set the hard default (MAX_TOKENS).
+  const knobRaw = process.env.SLASK_MAX_TOKENS;
+  const knob = knobRaw !== undefined ? Number.parseInt(knobRaw, 10) : undefined;
+  const validKnob =
+    knob !== undefined && Number.isFinite(knob) && knob > 0 ? knob : undefined;
+  const maxTokens: number =
+    validKnob !== undefined
+      ? (modelCap !== undefined ? Math.min(validKnob, modelCap) : validKnob)
+      : (modelCap !== undefined ? modelCap : MAX_TOKENS);
   const maxResultChars = envInt("SLASK_MAX_TOOL_RESULT_CHARS", 0);
   const contextChars = envInt("SLASK_CONTEXT_CHARS", 0);
   const required = cfg.requireTool ?? [];

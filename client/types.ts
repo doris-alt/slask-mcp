@@ -136,6 +136,12 @@ export interface AgentTurnConfig {
   tools: OpenAiFunctionTool[];
   callTool: (name: string, args: Record<string, unknown>) => Promise<CallToolResult>;
   /**
+   * The model's declared output-capability ceiling (its `maxTokens`). Used by
+   * `runAgentTurn`: with no `SLASK_MAX_TOKENS` env knob set it becomes the completion
+   * cap; with the knob set it only acts as an upper bound on it.
+   */
+  maxTokens?: number;
+  /**
    * Tool(s) the turn must end with: if the model answers in prose (or its reply is
    * cut off) before one of them has been called successfully, it is told to call one
    * now (at most twice) instead of the turn ending without the result. Used for
