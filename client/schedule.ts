@@ -55,8 +55,9 @@ export interface ScheduleJob {
   at?: string;
   prompt: string;
   /**
-   * Optional models.json id for the fired child's model. When absent, the child
-   * falls back to the file's default entry (same as a plain --prompt run).
+   * Optional models.json selection (`provider/id`) for the fired child's model.
+   * When absent, the child falls back to the file's default entry (same as a
+   * plain --prompt run).
    */
   modelId?: string;
   createdAt: string;
@@ -69,7 +70,7 @@ export interface ScheduleSpec {
   /** Provide exactly one of `expr` (recurring cron) or `at` (one-shot ISO date/time). */
   expr?: string;
   at?: string;
-  /** Optional models.json id for the child's model. */
+  /** Optional models.json selection (`provider/id`) for the child's model. */
   modelId?: string | null;
 }
 
@@ -191,14 +192,14 @@ export async function addJob(
       "provide a cron expression (`expr`) or a date/time (`at`) for the job",
     );
   }
-  // A pinned `modelId` must reference a live `models.json` entry. Resolving
+  // A pinned `modelId` must reference a live `models.json` selection. Resolving
   // (rather than a raw lookup) also auto-seeds `models.json` from the
   // environment when it is missing, so the job's model is pinned before the
-  // daemon ever fires — and an unknown id fails here with the available-id
-  // list, not at fire time.
+  // daemon ever fires — and an unknown selection fails here with the available
+  // provider/id list, not at fire time.
   const rawModelId = (spec.modelId ?? "").trim();
   if (rawModelId !== "") {
-    await resolveModel(process.cwd(), { id: rawModelId, baseOverride: null });
+    await resolveModel(process.cwd(), { selection: rawModelId, baseOverride: null });
   }
   if (expr) {
     if (!cron.validate(expr)) {
@@ -251,7 +252,7 @@ export interface JobUpdate {
   at?: string;
   /** New prompt text (replaces the job's current prompt). */
   prompt?: string;
-  /** New models.json id (replaces the job's current model). */
+  /** New models.json selection (`provider/id`) (replaces the job's current model). */
   modelId?: string | null;
 }
 
@@ -261,8 +262,8 @@ export interface JobUpdate {
  * must be provided. Exactly one of `expr` / `at` may be given (the job stays either a
  * recurring cron or a one-shot); `expr` is validated as a cron expression and
  * `at` as a date/time (same rules as `addJob`). `prompt` must be non-empty.
- * An unknown id throws with the available full ids so the caller (the model)
- * can self-correct. Returns the updated job.
+ * An unknown selection throws with the full list of available `provider/id`
+ * selections so the caller (the model) can self-correct. Returns the updated job.
  */
 export async function updateJob(
   id: string,
@@ -281,7 +282,7 @@ export async function updateJob(
   if (!hasExpr && !hasAt && !hasPrompt && !hasModel) {
     throw new Error(
       "at least one of `expr` (new cron), `at` (new one-shot time), " +
-        "`prompt` (new text), or `modelId` (new model id) is required",
+        "`prompt` (new text), or `modelId` (new model selection) is required",
     );
   }
   if (hasExpr && hasAt) {
@@ -302,7 +303,7 @@ export async function updateJob(
   if (hasModel) {
     await resolveModel(
       process.cwd(),
-      { id: String(update.modelId).trim(), baseOverride: null },
+      { selection: String(update.modelId).trim(), baseOverride: null },
     );
   }
   const jobs = await loadJobs(file);
@@ -424,10 +425,10 @@ export async function runScheduler(options: RunSchedulerOptions = {}): Promise<S
   // Spawn this CLI as a one-shot child and resolve with an effective exit
   // code: 0 = ok, -1 = timed out (SIGTERM, then SIGKILL if still alive),
   // -2 = child failed to start, >0 = the child's own non-zero exit code.
-  // A job's pinned `modelId` goes through as `--model` (a models.json id);
-  // when absent the child falls back to models.json's default entry — a firing
-  // behaves exactly like a manual `slask-client --prompt <text>` run from the
-  // same directory.
+  // A job's pinned `modelId` goes through as `--model` (a `provider/id`
+  // selection); when absent the child falls back to models.json's default entry
+  // — a firing behaves exactly like a manual `slask-client --prompt <text>` run
+  // from the same directory.
   async function runChild(job: ScheduleJob, timeoutMs: number): Promise<number> {
     const args = ["--prompt", job.prompt, "--quiet"];
     if (job.modelId) {
@@ -710,9 +711,10 @@ export function scheduleTools(): OpenAiFunctionTool[] {
           "Create a new scheduled job. Either provide a 5-field cron `expr` (the " +
           "prompt runs on every match) or an ISO date/time `at` (the prompt runs " +
           "exactly once, at that time). In both cases the run behaves like a manual " +
-          "`slask-client --prompt` one-shot run; an optional `modelId` (a `models.json` " +
-          "id) pins which model the run uses — unknown ids are rejected with the " +
-          "available-id list, and without it the file's default model is used. " +
+          "`slask-client --prompt` one-shot run; an optional `modelId` (a " +
+          "`models.json` selection, `provider/id`) pins which model the run uses " +
+          "— unknown selections are rejected with the available provider/id list, " +
+          "and without it the file's default model is used. " +
           "Provide exactly one of `expr`/`at`. Use when the user asks to set up a " +
           "recurring task/reminder, or a one-time remind-me-at-a-specific-time. " +
           "Returns the new job's full id.",
@@ -730,9 +732,10 @@ export function scheduleTools(): OpenAiFunctionTool[] {
             modelId: {
               type: "string",
               description:
-                "optional models.json id pinning the model this job's runs use " +
-                "(validated against models.json in the launch cwd; unknown ids " +
-                "fail with the available-id list). Omitted → default model.",
+                "optional models.json selection (`provider/id`) pinning the model " +
+                "this job's runs use (validated against models.json in the launch " +
+                "cwd; unknown selections fail with the available provider/id list). " +
+                "Omitted → default model.",
             },
           },
           required: ["prompt"],
@@ -749,8 +752,9 @@ export function scheduleTools(): OpenAiFunctionTool[] {
           "(recurring) or an ISO date/time `at` (one-shot) — and/or the new " +
           "`prompt` and/or the new `modelId`; at least one is required. `expr` " +
           "and `at` are mutually exclusive. An optional `modelId` (a `models.json` " +
-          "id) changes which model the job runs with; unknown ids are rejected with " +
-          "the available-id list. Returns the updated job.",
+          "selection, `provider/id`) changes which model the job runs with; unknown " +
+          "selections are rejected with the available provider/id list. Returns the " +
+          "updated job.",
         parameters: {
           type: "object",
           properties: {
@@ -766,9 +770,9 @@ export function scheduleTools(): OpenAiFunctionTool[] {
             modelId: {
               type: "string",
               description:
-                "new models.json id pinning the model this job runs with (optional; " +
-                "unknown ids are rejected with the available-id list). Omitted → " +
-                "current model unchanged.",
+                "new models.json selection (`provider/id`) pinning the model this " +
+                "job runs with (optional; unknown selections are rejected with the " +
+                "available provider/id list). Omitted → current model unchanged.",
             },
           },
           required: ["id"],
@@ -888,9 +892,9 @@ export function scheduleSystemBlock(): string {
     "once, at that time). Exactly one of `expr`/`at` is required on `schedule_add`; " +
     "`schedule_update` may change the expr, at, prompt, or `modelId` of an existing " +
     "job (at least one must be given; expr and at are mutually exclusive). `modelId` " +
-    "is an optional `models.json` id (validated against the file in the launch cwd, " +
-    "unknown ids fail with the available-id list); without it a job's runs use the " +
-    "file's default model. Each firing runs the prompt " +
+    "is an optional models.json selection (`provider/id`), validated against the file " +
+    "in the launch cwd (unknown selections fail with the available provider/id list); " +
+    "without it a job's runs use the file's default model. Each firing runs the prompt " +
     "through the agent exactly like a manual `slask-client --prompt` one-shot run. " +
     "Jobs only fire while the `slask-client schedule` daemon is running; changes to " +
     "a job take effect within ~15 s without a restart. When the user asks for a " +

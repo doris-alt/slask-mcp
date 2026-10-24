@@ -1,20 +1,32 @@
 {
-  "models": [
-    {
-      "id": "fast",
-      "name": "gpt-4o-mini",
-      "default": true
-    },
-    {
-      "id": "smart",
-      "name": "gpt-4o",
-      "maxContext": 131072
-    },
-    {
-      "id": "local",
-      "name": "gemma4:12b-mlx",
-      "baseUrl": "http://your-local-server:11434",
-      "maxContext": 32768
+  "models": {
+    "providers": {
+      "custom-proxy": {
+        "baseUrl": "http://localhost:4000/v1",
+        "apiKey": "LITELLM_KEY",
+        "models": [
+          {
+            "id": "llama-3.1-8b",
+            "name": "Llama 3.1 8B",
+            "api": "openai-completions",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128000,
+            "maxTokens": 32000
+          }
+        ]
+      },
+      "real-openai": {
+        "baseUrl": "https://api.openai.com",
+        "models": [
+          {
+            "id": "gpt-4o-mini",
+            "name": "gpt-4o-mini",
+            "contextWindow": 131072
+          }
+        ]
+      }
     }
-  ]
+  }
 }

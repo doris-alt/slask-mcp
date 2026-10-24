@@ -24,14 +24,17 @@
 //
 // Chat (OpenAI agent) config — any OpenAI-compatible endpoint:
 //   models.json                 catalog of models in the launch cwd:
-//                               { "models": [{ id, name, baseUrl?, maxContext?,
-//                               default? }] }. --model/-m <id> selects an entry
-//                               by id; the entry with default:true (else the
-//                               first) is used with no id. A missing file is
-//                               auto-created from the environment (env is the
-//                               *seed*) and persisted, idempotently.
+//                               { "models": { "providers": { <id>:
+//                               { baseUrl?, apiKey?, models: [ { id, name,
+//                               contextWindow?, maxTokens?, … } ] } } } }.
+//                               --model/-m <provider/id> selects a model (a bare
+//                               <id> works when it is unique across providers);
+//                               with no flag the first provider's first model
+//                               runs. A missing file is auto-created from the
+//                               environment (env is the *seed*) and persisted,
+//                               idempotently.
 //   --base-url / -b <url>       session base-URL override; used only when the
-//                               selected entry has no baseUrl of its own
+//                               selected provider has no baseUrl of its own
 //   API_BASE                    fallback base URL (default: https://api.openai.com)
 //   MODEL                       seeds a missing models.json entry (id/name);
 //                               OPENAI_MODEL is a fallback. Env never replaces
@@ -99,14 +102,14 @@ Usage:
       Run the scheduler daemon: fires scheduled jobs while this process is
       alive; Ctrl+C to stop. Jobs are stored in .slask-schedule.json in the
       current directory (same convention as .env / mcp.json).
-  slask-client schedule add [at] <schedule> <prompt> [--model <id>]
+  slask-client schedule add [at] <schedule> <prompt> [--model <provider/id>]
       Add a job. <schedule> is either a 5-field cron expression (recurring:
       run <prompt> on every match, first fire is the next occurrence) or a
       space-free ISO date/time (one-shot: run <prompt> exactly once at that
       time). An optional leading literal \`at\` is ignored before a one-shot
       date/time for readability (e.g. add at "2026-10-20T09:30:00Z" p).
-      --model <id> selects a models.json entry for the fired job (when absent,
-      the file's default entry runs).
+      --model <provider/id> selects a models.json selection for the fired job
+      (when absent, the file's default model runs).
   slask-client schedule list
       List scheduled jobs: id, schedule (cron expr or one-shot time), prompt,
       last run / status.
@@ -125,10 +128,11 @@ Usage:
       --plan to have the model draft the task list from it (non-interactive).
   slask-client ralph spec <name> <file>
       Replace a run's project description.
-  slask-client ralph split <name> <task-id> [--splitter-model <id>]
+  slask-client ralph split <name> <task-id> [--splitter-model <provider/id>]
       Have the model replace a task that is too big with 2-4 smaller ones.
       (Also automatic when an iteration runs out of context/tool budget.)
-      --splitter-model <id> targets a models.json entry for the split work.
+      --splitter-model <provider/id> targets a models.json selection for the
+      split work.
       init takes --context <tokens> (the model's context window, default
       32000) and --tool-budget <n> (tool calls per iteration, default 25);
       iterations are sized and truncated to fit them.
@@ -136,18 +140,20 @@ Usage:
       Append a task.
   slask-client ralph reopen <name> <task-id> [--note <why>]
       Mark a finished task as not done so the next start runs it again.
-  slask-client ralph report <name> [--report-model <id>]
+  slask-client ralph report <name> [--report-model <provider/id>]
       Research: rewrite report.md from the findings (previous one is kept
-      as report.prev.md). All tasks must pass. --report-model <id> targets
-      a models.json entry for the rewrite.
-  slask-client ralph run <name> [--max N] [--model <id>] [--worker-model <id>]
-      [--checker-model <id>] [--splitter-model <id>] [--report-model <id>]
+      as report.prev.md). All tasks must pass. --report-model <provider/id>
+      targets a models.json selection for the rewrite.
+  slask-client ralph run <name> [--max N] [--model <provider/id>]
+      [--worker-model <provider/id>] [--checker-model <provider/id>]
+      [--splitter-model <provider/id>] [--report-model <provider/id>]
       Run the loop in the foreground. --max N = most iterations per task
-      (default 10; the count restarts for each task). --model <id> sets a
-      models.json entry for every role; the per-role flags override it (worker
-      = default task work, checker = verifier, splitter = auto-splits,
-      report = final research report). --model / role flags accept models.json
-      ids; unknown ids fail with the list of available ids.
+      (default 10; the count restarts for each task). --model <provider/id>
+      sets a model for every role; the per-role flags override it (worker =
+      default task work, checker = verifier, splitter = auto-splits, report =
+      final research report). --model / role flags accept a models.json
+      selection (provider/id, or a bare id if unique); unknown selections fail
+      with the list of available provider/id entries.
   slask-client ralph start <name> | stop <name> | status [name] | list
       Run in a detached process / stop / inspect. In chat, use /ralph or just
       ask the model to plan one. --model and role flags on start are forwarded
@@ -163,12 +169,17 @@ Options:
                          Relative --config/--from paths are relative to it.
   -c, --config <path>    MCP servers config file (JSON; default: mcp.json in the current dir)
       --no-default       Do not include the default slask server
-  -m, --model <id>       models.json entry to use (chat; default is the file's
-                         default entry). A models.json id, not a raw API name.
-      --worker-model <id>   Ralph: models.json id for the worker (task) role
-      --checker-model <id>  Ralph: models.json id for the checker (verifier) role
-      --splitter-model <id> Ralph: models.json id for the splitter role
-      --report-model <id>   Ralph: models.json id for the final report role
+  -m, --model <provider/id>   models.json selection to use (chat; default is
+                         the file's default model). A selection, not a raw API
+                         name.
+      --worker-model <provider/id>   Ralph: models.json selection for the
+                         worker (task) role
+      --checker-model <provider/id>  Ralph: models.json selection for the
+                         checker (verifier) role
+      --splitter-model <provider/id> Ralph: models.json selection for the
+                         splitter role
+      --report-model <provider/id>   Ralph: models.json selection for the
+                         final report role
   -p, --prompt <text>    Run one agent turn with this prompt, print the answer,
                          and exit (instead of the interactive REPL).
   -q, --quiet            Omit the startup banner with --prompt (daemon-fired
@@ -179,11 +190,14 @@ Options:
              SLASK_MCP_CONFIG (config file); API_BASE (default
              https://api.openai.com), MODEL/OPENAI_MODEL, OPENAI_API_KEY (chat).
              A local OpenAI-compatible server (e.g. Ollama) needs no API key.
-             MODEL/OPENAI_MODEL seed the models.json entry's id/name; API_BASE
-             and MAX_CONTEXT_TOKENS seed its baseUrl / maxContext. Once
-             models.json exists it is authoritative; the env values are only
-             used to (re)seed it. MAX_CONTEXT_TOKENS is the default context
-             window (32000) that Ralph uses when a model has no maxContext.
+             --model and the ralph role flags take a models.json selection
+             (provider/id, or a bare id if unique). MODEL/OPENAI_MODEL seed
+             the models.json provider "default" entry's id/name; API_BASE and
+             MAX_CONTEXT_TOKENS seed its baseUrl / contextWindow. The auto-seed
+             never persists an apiKey — keys stay in .env/env. Once models.json
+             exists it is authoritative; the env values are only used to
+             (re)seed it. MAX_CONTEXT_TOKENS is the default context window
+             (32000) that Ralph uses when a model has no contextWindow.
 
 Multiple servers:
   The default slask HTTP server is always included (named "slask", from
@@ -244,13 +258,13 @@ interface CliConfig {
     toolBudget?: string;
     desc?: string;
     note?: string;
-    /** models.json id for the worker role (`--worker-model`). */
+    /** models.json selection (`provider/id`) for the worker role. */
     workerModel?: string | null;
-    /** models.json id for the checker role (`--checker-model`). */
+    /** models.json selection (`provider/id`) for the checker role. */
     checkerModel?: string | null;
-    /** models.json id for the splitter role (`--splitter-model`). */
+    /** models.json selection (`provider/id`) for the splitter role. */
     splitterModel?: string | null;
-    /** models.json id for the report role (`--report-model`). */
+    /** models.json selection (`provider/id`) for the report role. */
     reportModel?: string | null;
   };
 }
@@ -384,11 +398,15 @@ async function handleScheduleCommand(config: CliConfig): Promise<void> {
       fail(cls.error);
       return;
     }
-    // --model (config.model) is a models.json id; validate eagerly so a bad
-    // id fails here with the available-id list, not at fire time.
+    // --model (config.model) is a models.json selection; validate eagerly so a
+    // bad selection fails here with the available provider/id list, not at fire
+    // time.
     let modelId: string | null = null;
     if (config.model !== null && config.model.trim() !== "") {
-      await resolveModel(process.cwd(), { id: config.model, baseOverride: null });
+      await resolveModel(process.cwd(), {
+        selection: config.model,
+        baseOverride: null,
+      });
       modelId = config.model.trim();
     }
     try {
@@ -641,19 +659,20 @@ async function main(): Promise<void> {
   // `ralph` manages its own state dir and spawns children for the agent work —
   // dispatch before touching any server, same pattern as `schedule`.
   if (sub === "ralph") {
-    // Resolve the top-level model (strict: an unknown id fails fast and lists
-    // the valid ids). `--model` is a models.json id; with no flag the file's
-    // default entry wins. Forward the canonical id plus any explicit role picks
+    // Resolve the top-level model (strict: an unknown selection fails fast and
+    // lists the valid provider/id entries). `--model` is a models.json selection
+    // (provider/id, or a bare id if unique); with no flag the file's default
+    // model wins. Forward the canonical selection plus any explicit role picks
     // so a detached `ralph run` re-parses the same entries (parser is
     // last-value-wins, so a role pick overrides the top default).
     const topModel = await resolveModel(process.cwd(), {
-      id: config.model ?? null,
+      selection: config.model ?? null,
       baseOverride: config.base ?? null,
     });
     const fwd: string[] = [
       ...baseFwd(config),
       "--model",
-      topModel.id,
+      topModel.selection,
       ...(config.base ? ["--base-url", config.base] : []),
       ...(config.ralph.workerModel ? ["--worker-model", config.ralph.workerModel] : []),
       ...(config.ralph.checkerModel ? ["--checker-model", config.ralph.checkerModel] : []),
@@ -715,7 +734,7 @@ async function main(): Promise<void> {
 
   if (!sub || sub === "chat") {
     const topModel = await resolveModel(process.cwd(), {
-      id: config.model ?? null,
+      selection: config.model ?? null,
       baseOverride: config.base ?? null,
     });
     // Publish forwardArgs so the interactive REPL can later start a ralph run
@@ -723,7 +742,7 @@ async function main(): Promise<void> {
     const fwd: string[] = [
       ...baseFwd(config),
       "--model",
-      topModel.id,
+      topModel.selection,
       ...(config.base ? ["--base-url", config.base] : []),
     ];
     setRalphForwardArgs(fwd);
@@ -732,12 +751,22 @@ async function main(): Promise<void> {
         registry,
         model: topModel.name,
         base: topModel.baseUrl,
+        apiKey: topModel.apiKey,
+        maxTokens: topModel.maxTokens,
+        selection: topModel.selection,
         prompt: config.prompt,
         quiet: config.quiet,
       });
       process.exit(code);
     } else {
-      await startChat({ registry, model: topModel.name, base: topModel.baseUrl });
+      await startChat({
+        registry,
+        model: topModel.name,
+        base: topModel.baseUrl,
+        apiKey: topModel.apiKey,
+        maxTokens: topModel.maxTokens,
+        selection: topModel.selection,
+      });
     }
     return;
   }

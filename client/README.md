@@ -145,55 +145,85 @@ warnings are printed once on stderr, before the command runs.
 
 ## Models
 
-The agent (chat, one-shot, Ralph, and scheduled jobs) talks to an OpenAI-compatible
-endpoint. Which model — and which endpoint — it uses is taken from **`models.json`
-in the launch directory**, the same cwd convention as `.env` and `mcp.json`. Copy
+The agent (chat, one-shot, Ralph, and scheduled jobs) talks to an **OpenAI-compatible
+endpoint**. Which model — and which endpoint — it uses is taken from **`models.json` in
+the launch directory**, the same cwd convention as `.env` and `mcp.json`. Copy
 `client/models.example.json` to `./models.json` to start with a ready-to-edit catalog:
 
 ```json
 {
-  "models": [
-    { "id": "fast",  "name": "gpt-4o-mini", "default": true },
-    { "id": "smart", "name": "gpt-4o", "maxContext": 131072 },
-    { "id": "local", "name": "gemma4:12b-mlx", "baseUrl": "http://your-host:11434" }
-  ]
+  "models": {
+    "providers": {
+      "custom-proxy": {
+        "baseUrl": "http://localhost:4000/v1",
+        "apiKey": "LITELLM_KEY",
+        "models": [
+          {
+            "id": "llama-3.1-8b",
+            "name": "Llama 3.1 8B",
+            "contextWindow": 128000,
+            "maxTokens": 32000
+          }
+        ]
+      },
+      "real-openai": {
+        "baseUrl": "https://api.openai.com",
+        "models": [
+          { "id": "gpt-4o-mini", "name": "gpt-4o-mini", "contextWindow": 131072 }
+        ]
+      }
+    }
+  }
 }
 ```
 
-Each entry has:
+The catalog is **grouped by provider**. A **provider** holds the shared endpoint for a
+bundle of models: `baseUrl` (endpoint root, optional — the client appends
+`/v1/chat/completions`) and `apiKey` (optional; keys normally live in `.env`/the env and
+are *not* written into the auto-seed file). A provider whose key comes from
+`OPENAI_API_KEY` — e.g. a real OpenAI endpoint — can omit `apiKey` entirely.
 
-- `id` — the selection key (used by `--model`, `schedule add --model`, and Ralph role
-  flags). Must be a non-empty, unique string.
-- `name` — the model name actually sent to the API. Required.
-- `baseUrl` (optional) — the endpoint root for this entry only (the client appends
-  `/v1/chat/completions`). Falls back to `--base-url` / `API_BASE` when absent.
-- `maxContext` (optional) — this model's context window in tokens (integer ≥ 2000);
-  Ralph sizes every iteration to it. Falls back to `MAX_CONTEXT_TOKENS` when absent.
-- `default` (optional, boolean) — when no `--model` id is given, the `default: true`
-  entry is used (the first entry if none is marked default).
+Each **model** under `providers.<name>.models` carries:
+
+- `id` — the selection key. Non-empty and unique *within* its provider. Selection is
+  `provider/id` (e.g. `custom-proxy/llama-3.1-8b`); a **bare `id`** is accepted when it
+  is unique across all providers.
+- `name` — the model name actually sent to the API `model:` field. Required.
+- `contextWindow` (optional) — the model's context window in tokens (integer ≥ 2000).
+  Ralph sizes every iteration to it (smallest of model / env / run setting).
+- `maxTokens` (optional) — the model's output-capability ceiling for the raw agent loop
+  (integer ≥ 1). A valid `SLASK_MAX_TOKENS` env knob (user or Ralph) still wins but is
+  clamped to ≤ the model's `maxTokens`.
+- `api`, `reasoning`, `input[]`, `cost{...}` (optional) — inert, forward-compatible
+  metadata: type-checked and stored, but not acted on yet. Unknown extra fields are
+  ignored.
 
 **The environment variables are the seed, not the source.** When `models.json` is
-missing, the client creates it once from `MODEL`/`OPENAI_MODEL` (id + name),
-`API_BASE` (`baseUrl`), and `MAX_CONTEXT_TOKENS` (`maxContext`), marks the seeded entry
-`default: true`, and persists it. An existing `models.json` is then authoritative: each
-entry's own `baseUrl`/`maxContext` win when present, and the env vars are otherwise not
-consulted (an entry that omits a field falls back to that field's env var, then built-in
-defaults — this is how the seeded entry keeps its values). Missing env vars are filled
-by built-ins (`MODEL`→`gpt-4o-mini`, `API_BASE`→`https://api.openai.com`,
-`MAX_CONTEXT_TOKENS`→32000), so a no-env run still bootstraps a single-entry file.
+missing, the client creates it once: a single `providers.default` provider seeded from
+`MODEL`/`OPENAI_MODEL` (`id` + `name`), `API_BASE` (`baseUrl`), and
+`MAX_CONTEXT_TOKENS` (`contextWindow`) — **never writing an `apiKey`**, so secrets stay
+in `.env`. An existing `models.json` is then authoritative (the seed is idempotent and
+skipped).
 
 Selection and precedence:
 
-- `--model`/`-m` takes a models.json **id** (not a raw API name). Unknown ids fail
-  immediately with an error listing the available ids.
-- Endpoint: the entry's `baseUrl` wins, else `--base-url`, else `API_BASE`, else
+- `--model`/`-m` (and the Ralph role flags / `schedule add --model`) take a models.json
+  **selection** — `provider/id`, or a bare id when unambiguous. Unknown selections fail
+  immediately with an error listing the available `provider/id` entries. With no
+  selection, the first provider's first model is used.
+- Endpoint: the provider's `baseUrl` wins, else `--base-url`, else `API_BASE`, else
   `https://api.openai.com` (all normalized to `/v1`).
-- Context window: the entry's `maxContext` wins, else `MAX_CONTEXT_TOKENS`, else 32000.
+- API key: the provider's `apiKey` wins, else `OPENAI_API_KEY`, else a `"local"`
+  placeholder (a real OpenAI endpoint with no key errors).
+- Context window (Ralph): smallest of the model's `contextWindow`,
+  `MAX_CONTEXT_TOKENS`, the run's `contextTokens` setting, else 32000.
+- Output cap (raw agent loop): a valid `SLASK_MAX_TOKENS` knob wins, clamped to ≤ the
+  model's `maxTokens`; else the model's `maxTokens`; else 1024.
 
 Per-task selection: top-level `--model` is the default for the Ralph roles, which can
 each be overridden (`--worker-model`, `--checker-model`, `--splitter-model`,
 `--report-model`), and each scheduled job can pin its own via
-`slask-client schedule add <sched> <prompt> --model <id>`.
+`slask-client schedule add <sched> <prompt> --model <provider/id>`.
 
 ## Interactive agent chat
 
@@ -556,8 +586,8 @@ task list (it also has `ralph_*` tools, so "plan a research run on X" works);
 |-------------------|-----|----------------|-------------------------------------------------------------------------------------------------------------|
 | -u, --url <url>   | -u  |                | MCP server endpoint (default: http://127.0.0.1:8000/mcp)                                                    |
 | -t, --token <tok> | -t  | SLASK_MCP_TOKEN| bearer token for the default server (required when the server is set up with a token; otherwise leave blank)|
-| -m, --model <id>  | -m  | MODEL          | models.json id for the model (chat); seeds the default entry when models.json is absent (default gpt-4o-mini) |
-| --base-url <url>  |     | API_BASE       | openai base url fallback (chat; default: https://api.openai.com; a models.json entry's baseUrl wins)         |
+| -m, --model <sel> | -m  | MODEL          | models.json selection (`provider/id`, or a bare id if unique) for the model (chat, Ralph, schedule); seeds a `providers.default` entry (never an apiKey) when models.json is absent (default `default/gpt-4o-mini`) |
+| --base-url <url>  |     | API_BASE       | openai base url fallback (chat; default: https://api.openai.com; a provider's baseUrl wins) |
 | -c, --config <path>| -c  | SLASK_MCP_CONFIG| extra servers (JSON); default: mcp.json in the current dir; missing explicit file is an error; missing default = no extra servers |
 | -p, --prompt <text>| -p  | (none)         | run one agent turn with the prompt, print the answer, and exit (instead of the REPL) |
 | OPENAI_API_KEY    |     | OPENAI_API_KEY | openai api key; only needed for the real openai endpoint (see API_BASE note)                                |

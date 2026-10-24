@@ -1,40 +1,70 @@
-// models.ts — multi-model support for the client.
+// models.ts — provider-based multi-model support for the client.
 //
 // The client can point at **many** OpenAI-compatible models. The catalog lives in
-// `models.json` in the launch cwd (same convention as `.env` / `mcp.json`), shaped
-// like:
+// `models.json` in the launch cwd (same convention as `.env` / `mcp.json`), shaped:
 //
 //   {
-//     "models": [
-//       { "id": "fast",  "name": "gpt-4o-mini",  "maxContext": 32000,  "default": true },
-//       { "id": "smart", "name": "gpt-4o", "baseUrl": "http://host:11434/v1",
-//         "maxContext": 131072 }
-//     ]
+//     "models": {
+//       "providers": {
+//         "custom-proxy": {
+//           "baseUrl": "http://localhost:4000/v1",
+//           "apiKey": "LITELLM_KEY",
+//           "models": [
+//             {
+//               "id": "llama-3.1-8b",
+//               "name": "Llama 3.1 8B",
+//               "api": "openai-completions",
+//               "reasoning": false,
+//               "input": ["text"],
+//               "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+//               "contextWindow": 128000,
+//               "maxTokens": 32000
+//             }
+//           ]
+//         }
+//       }
+//     }
 //   }
 //
-// - `id`       the selection key (used by `--model`, Ralph role flags, `schedule add --model`).
-// - `name`     the name sent to the API on every request.
-// - `baseUrl`  optional — that model's endpoint root; authoritative when present.
-// - `maxContext` optional — the model's context window in tokens (integer ≥ 2000).
-// - `default`  optional — marks which entry is the fallback when no `id` is selected.
+// The **provider** groups models that share an endpoint: `baseUrl` (endpoint root,
+// optional per provider) and `apiKey` (optional; keys normally come from the env
+// and are *not* written into the auto-seed file).
 //
-// Resolution (single point — `resolveModel`):
-//   * `models.json` in the cwd is the source of truth. When it is missing it is
-//     **auto-created** from the environment (a one-entry catalog) and persisted.
-//   * An entry's `baseUrl` beats `--base-url` (session override) beats `API_BASE`
-//     beats `DEFAULT_API_BASE`. An entry's `maxContext` beats `MAX_CONTEXT_TOKENS`
-//     beats `DEFAULT_CONTEXT_TOKENS`.
+// Each **model** under `providers.<name>.models` carries:
+//   * `id`          selection key — non-empty and unique *within* its provider.
+//   * `name`        the name sent to the API `model:` field on every request.
+//   * `contextWindow` optional — context window in tokens (integer ≥ 2000).
+//                     Drives Ralph sizing (`limitsOf`).
+//   * `maxTokens`   optional — output-capability ceiling for the raw agent loop
+//                     (integer ≥ 1). Applied in `runAgentTurn`; a valid
+//                     `SLASK_MAX_TOKENS` env knob (user or Ralph) still wins,
+//                     clamped to this capability.
+//   * `api` / `reasoning` / `input[]` / `cost{...}` — inert metadata: type-checked
+//     and stored for the future, not yet acted on. Unknown extra fields are
+//     ignored (lenient, matching the old validation).
 //
-// Environment variables remain the *seed/fallback*: `MODEL`/`OPENAI_MODEL` seed the
-// bootstrap entry's `id`/`name`; `API_BASE`/`MAX_CONTEXT_TOKENS` seed its base and
-// context window. They never replace the file — the file wins once it exists.
+// Selection (single point — `resolveModel`) is `provider/id`
+// (e.g. `custom-proxy/llama-3.1-8b`). A **bare** `id` is accepted when it is
+// unique across *all* providers; if it matches more than one provider the
+// selection is **ambiguous** and an error lists every match. With no selection
+// the **first** provider's **first** model is used (file/JSON insertion order).
+//
+// Base precedence: provider `baseUrl` > `--base-url` (session override) >
+//   `API_BASE` > `DEFAULT_API_BASE`; the result is normalized by `ensureV1Path`.
+// Key precedence: provider `apiKey` > `OPENAI_API_KEY` > the `"local"`
+//   placeholder (real OpenAI still requires a key → error).
+//
+// Environment vars remain the *seed*: on first run, if `models.json` is missing
+// it is auto-created from the env (a one-model catalog, provider `default`) and
+// persisted. `MODEL`/`OPENAI_MODEL` seed the `id`/`name`; `API_BASE` and
+// `MAX_CONTEXT_TOKENS` seed the base and context window. They never replace an
+// existing file — the file wins once it exists. Note the seed never writes `apiKey`.
 
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
   DEFAULT_API_BASE,
-  DEFAULT_CONTEXT_TOKENS,
   DEFAULT_MODEL,
   envContextTokens,
   ensureV1Path,
@@ -44,21 +74,73 @@ import {
 // Catalog shape
 // ---------------------------------------------------------------------------
 
-export interface ModelEntry {
-  /** Selection key. Non-empty and unique within the file. */
-  id: string;
-  /** Name sent to the API on every request. Non-empty. */
-  name: string;
-  /** Optional endpoint root for this model. Authoritative when present. */
-  baseUrl?: string;
-  /** Optional context window in tokens (integer ≥ 2000). */
-  maxContext?: number;
-  /** Optional: the fallback entry when no `id` is selected. */
-  default?: boolean;
+interface ModelCost {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
 }
 
-interface ModelsFile {
+interface ModelEntry {
+  /** Selection key. Non-empty and unique within its provider. */
+  id: string;
+  /** Name sent to the API `model:` field on every request. Non-empty. */
+  name: string;
+  /** Optional context window in tokens (integer ≥ 2000). Drives Ralph sizing. */
+  contextWindow?: number;
+  /** Optional output-capability ceiling for the raw agent loop (integer ≥ 1). */
+  maxTokens?: number;
+  /** Inert metadata. */
+  api?: string;
+  reasoning?: boolean;
+  input?: string[];
+  cost?: ModelCost;
+}
+
+interface ProviderDef {
+  /** Optional endpoint root (endpoint root; `/v1` appended by `ensureV1Path`). */
+  baseUrl?: string;
+  /** Optional API key. Wins over the `OPENAI_API_KEY` env; keys usually stay in env. */
+  apiKey?: string;
   models: ModelEntry[];
+}
+
+export interface ModelFile {
+  models: { providers: Record<string, ProviderDef> };
+}
+
+export interface ResolvedModel {
+  /** Provider name the selected model lives under. */
+  providerId: string;
+  /** The selected `id` (unique within its provider). */
+  id: string;
+  /** The name sent to the API. */
+  name: string;
+  /** `provider/id` — what is forwarded to child CLI runs so they pick the same model. */
+  selection: string;
+  /** The normalized base URL (endpoint root; `/v1` guaranteed via ensureV1Path). */
+  baseUrl: string;
+  /** The provider's raw `apiKey`, or null (caller falls back to env / "local"). */
+  apiKey: string | null;
+  /** Raw entry context window (undefined if unset — Ralph folds env/default). */
+  contextWindow?: number;
+  /** Raw entry output cap (undefined if unset — runAgentTurn folds the env knob). */
+  maxTokens?: number;
+}
+
+export interface ResolveModelOpts {
+  /**
+   * The model to select: `provider/id` (required provider part), or a bare `id`
+   * accepted only when it is unique across all providers. When null/omitted the
+   * first provider's first model is chosen. A bad selection throws, listing the
+   * available `provider/id` entries.
+   */
+  selection?: string | null;
+  /**
+   * Session base override (`--base-url`). Only used when the selected provider
+   * has no `baseUrl` of its own — the provider's base is authoritative.
+   */
+  baseOverride?: string | null;
 }
 
 const MODELS_FILE_NAME = "models.json";
@@ -89,59 +171,151 @@ async function atomicWrite(path: string, data: string): Promise<void> {
   await rename(tmp, path);
 }
 
-/**
- * Validate (and normalize) a single `models.json` entry. Throws on malformed
- * shape so a bad file fails at load time with a clear, actionable message.
- */
-function validateEntry(e: unknown, i: number): ModelEntry {
-  if (!e || typeof e !== "object" || Array.isArray(e)) {
-    throw new Error(`models.json: entry #${i} must be an object`);
+function validateCost(providerName: string, id: string, raw: unknown): ModelCost {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(
+      `models.json: provider "${providerName}" model "${id}" "cost" must be an object`,
+    );
   }
-  const o = e as Record<string, unknown>;
+  const o = raw as Record<string, unknown>;
+  const cost: ModelCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  const fields: Array<[keyof ModelCost, string]> = [
+    ["input", "input"],
+    ["output", "output"],
+    ["cacheRead", "cacheRead"],
+    ["cacheWrite", "cacheWrite"],
+  ];
+  for (const [key, label] of fields) {
+    if (o[label] !== undefined) {
+      const n = Number(o[label]);
+      if (!Number.isFinite(n) || n < 0) {
+        throw new Error(
+          `models.json: provider "${providerName}" model "${id}" "cost.${label}" must be ` +
+            `a non-negative number, got ${JSON.stringify(o[label])}`,
+        );
+      }
+      cost[key] = n;
+    }
+  }
+  return cost;
+}
+
+function validateModel(
+  providerName: string,
+  raw: unknown,
+  i: number,
+  seen: Set<string>,
+): ModelEntry {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(
+      `models.json: provider "${providerName}" model #${i} must be an object`,
+    );
+  }
+  const o = raw as Record<string, unknown>;
   const id = String(o.id ?? "").trim();
   const name = String(o.name ?? "").trim();
   if (id === "") {
-    throw new Error(`models.json: entry #${i} is missing a non-empty "id"`);
+    throw new Error(
+      `models.json: provider "${providerName}" model #${i} is missing a non-empty "id"`,
+    );
   }
   if (name === "") {
-    throw new Error(`models.json: entry #${i} (id="${id}") is missing a non-empty "name"`);
+    throw new Error(
+      `models.json: provider "${providerName}" model #${i} (id="${id}") is missing a non-empty "name"`,
+    );
   }
+  if (seen.has(id)) {
+    throw new Error(
+      `models.json: provider "${providerName}" has duplicate id "${id}" — ids must be ` +
+        `unique within a provider`,
+    );
+  }
+  seen.add(id);
   const entry: ModelEntry = { id, name };
-  if (o.baseUrl !== undefined) {
-    const b = String(o.baseUrl).trim();
-    if (b === "") {
-      throw new Error(`models.json: entry "${id}" has an empty "baseUrl"`);
-    }
-    entry.baseUrl = b;
-  }
-  if (o.maxContext !== undefined) {
-    const n = Number(o.maxContext);
+  if (o.contextWindow !== undefined) {
+    const n = Number(o.contextWindow);
     if (!Number.isInteger(n) || n < 2000) {
       throw new Error(
-        `models.json: entry "${id}" has an invalid "maxContext" ${JSON.stringify(
-          o.maxContext,
-        )} (must be an integer ≥ 2000)`,
+        `models.json: provider "${providerName}" model "${id}" has invalid ` +
+          `"contextWindow" ${JSON.stringify(o.contextWindow)} (must be an integer ≥ 2000)`,
       );
     }
-    entry.maxContext = n;
+    entry.contextWindow = n;
   }
-  if (o.default !== undefined) {
-    if (typeof o.default !== "boolean") {
-      throw new Error(`models.json: entry "${id}" "default" must be a boolean`);
+  if (o.maxTokens !== undefined) {
+    const n = Number(o.maxTokens);
+    if (!Number.isInteger(n) || n < 1) {
+      throw new Error(
+        `models.json: provider "${providerName}" model "${id}" has invalid ` +
+          `"maxTokens" ${JSON.stringify(o.maxTokens)} (must be an integer ≥ 1)`,
+      );
     }
-    entry.default = o.default;
+    entry.maxTokens = n;
+  }
+  // Inert metadata: validated when present, ignored otherwise.
+  if (o.api !== undefined && typeof o.api !== "string") {
+    throw new Error(
+      `models.json: provider "${providerName}" model "${id}" "api" must be a string`,
+    );
+  }
+  if (o.reasoning !== undefined && typeof o.reasoning !== "boolean") {
+    throw new Error(
+      `models.json: provider "${providerName}" model "${id}" "reasoning" must be a boolean`,
+    );
+  }
+  if (o.input !== undefined) {
+    if (!Array.isArray(o.input) || o.input.some((v) => typeof v !== "string")) {
+      throw new Error(
+        `models.json: provider "${providerName}" model "${id}" "input" must be an array of strings`,
+      );
+    }
+    entry.input = o.input;
+  }
+  if (o.cost !== undefined) {
+    entry.cost = validateCost(providerName, id, o.cost);
   }
   return entry;
 }
 
+function validateProvider(name: string, p: unknown): ProviderDef {
+  if (!p || typeof p !== "object" || Array.isArray(p)) {
+    throw new Error(`models.json: provider "${name}" must be an object`);
+  }
+  const o = p as Record<string, unknown>;
+  const provider: ProviderDef = { models: [] };
+  if (o.baseUrl !== undefined) {
+    const b = String(o.baseUrl).trim();
+    if (b === "") {
+      throw new Error(`models.json: provider "${name}" has an empty "baseUrl"`);
+    }
+    provider.baseUrl = b;
+  }
+  if (o.apiKey !== undefined) {
+    const k = String(o.apiKey).trim();
+    if (k === "") {
+      throw new Error(`models.json: provider "${name}" has an empty "apiKey"`);
+    }
+    provider.apiKey = k;
+  }
+  const modelsRaw = o.models;
+  if (!modelsRaw || !Array.isArray(modelsRaw) || modelsRaw.length === 0) {
+    throw new Error(
+      `models.json: provider "${name}" must have a non-empty "models" array`,
+    );
+  }
+  const seen = new Set<string>();
+  for (let i = 0; i < modelsRaw.length; i++) {
+    provider.models.push(validateModel(name, modelsRaw[i], i, seen));
+  }
+  return provider;
+}
+
 /**
- * Read `<cwd>/models.json`. Returns the entry list when the file is valid;
- * `null` when it is simply missing; a descriptive `Error` when it exists but
- * is malformed JSON or has the wrong shape.
+ * Read `<cwd>/models.json`. Returns the parsed catalog when the file is valid;
+ * `null` when it is simply missing; a descriptive `Error` when it exists but is
+ * malformed JSON or has the wrong shape.
  */
-export async function loadModelsFile(
-  cwd: string,
-): Promise<ModelEntry[] | null> {
+export async function loadModelsFile(cwd: string): Promise<ModelFile | null> {
   const raw = await readFileOrNull(modelsFileFor(cwd));
   if (raw === null) return null;
   let parsed: unknown;
@@ -150,32 +324,43 @@ export async function loadModelsFile(
   } catch {
     throw new Error(`${MODELS_FILE_NAME} in ${cwd} is not valid JSON — fix or delete it`);
   }
-  if (
-    !parsed ||
-    typeof parsed !== "object" ||
-    Array.isArray(parsed) ||
-    !("models" in parsed) ||
-    !Array.isArray((parsed as ModelsFile).models)
-  ) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(
-      `${MODELS_FILE_NAME} in ${cwd} must be JSON with a "models" array — fix or delete it`,
+      `${MODELS_FILE_NAME} in ${cwd} must be a JSON object with a "models" key`,
     );
   }
-  const entries = (parsed as ModelsFile).models.map((e, i) => validateEntry(e, i));
-  // ids must be unique — selection is by id.
-  const seen = new Set<string>();
-  for (const e of entries) {
-    if (seen.has(e.id)) {
-      throw new Error(`models.json: duplicate id "${e.id}" — ids must be unique`);
-    }
-    seen.add(e.id);
+  const top = parsed as { models?: unknown };
+  if (!top.models || typeof top.models !== "object" || Array.isArray(top.models)) {
+    throw new Error(
+      `${MODELS_FILE_NAME} in ${cwd} must be a JSON object with a "models" key`,
+    );
   }
-  return entries;
+  const models = top.models as { providers?: unknown };
+  if (
+    !models.providers ||
+    typeof models.providers !== "object" ||
+    Array.isArray(models.providers)
+  ) {
+    throw new Error(
+      `${MODELS_FILE_NAME} in ${cwd} must have a "models.providers" object`,
+    );
+  }
+  const providersRaw = models.providers as Record<string, unknown>;
+  const providers: Record<string, ProviderDef> = {};
+  for (const [name, p] of Object.entries(providersRaw)) {
+    providers[name] = validateProvider(name, p);
+  }
+  if (Object.keys(providers).length === 0) {
+    throw new Error(
+      `${MODELS_FILE_NAME} in ${cwd} has no providers — add at least one`,
+    );
+  }
+  return { models: { providers } };
 }
 
 /** Persist a catalog atomically to `<cwd>/models.json`. */
-export async function saveModelsFile(cwd: string, entries: ModelEntry[]): Promise<void> {
-  await atomicWrite(modelsFileFor(cwd), JSON.stringify({ models: entries }, null, 2) + "\n");
+export async function saveModelsFile(cwd: string, file: ModelFile): Promise<void> {
+  await atomicWrite(modelsFileFor(cwd), JSON.stringify(file, null, 2) + "\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -183,18 +368,27 @@ export async function saveModelsFile(cwd: string, entries: ModelEntry[]): Promis
 // ---------------------------------------------------------------------------
 
 /**
- * A one-entry catalog built from environment variables — what `models.json` is
- * bootstrapped from when the file does not yet exist. `MODEL`/`OPENAI_MODEL`
- * seed the `id`/`name`; `API_BASE` and `MAX_CONTEXT_TOKENS` are optional.
+ * A one-provider/one-model catalog built from the environment — what `models.json`
+ * is bootstrapped from when the file does not yet exist. `MODEL`/`OPENAI_MODEL`
+ * seed the model `id`/`name`; `API_BASE` (if set) and `MAX_CONTEXT_TOKENS` seed the
+ * provider base and the model's context window. The auto-seed **never writes an
+ * `apiKey`** — keys stay in the env (`.env`) and are added to a provider manually.
  */
-function modelsFromEnv(): ModelEntry {
-  const name = process.env.MODEL?.trim() || process.env.OPENAI_MODEL?.trim() || DEFAULT_MODEL;
-  const entry: ModelEntry = { id: name, name, default: true };
-  const apiBase = process.env.API_BASE?.trim();
-  if (apiBase) entry.baseUrl = apiBase;
+function modelsFromEnv(): ModelFile {
+  const name =
+    process.env.MODEL?.trim() || process.env.OPENAI_MODEL?.trim() || DEFAULT_MODEL;
+  const baseUrl = process.env.API_BASE?.trim() || undefined;
   const ctx = envContextTokens();
-  if (ctx !== undefined) entry.maxContext = ctx;
-  return entry;
+  const models: ModelEntry[] = [
+    {
+      id: name,
+      name,
+      ...(ctx !== undefined ? { contextWindow: ctx } : {}),
+    },
+  ];
+  const provider: ProviderDef = { models };
+  if (baseUrl) provider.baseUrl = baseUrl;
+  return { models: { providers: { default: provider } } };
 }
 
 /**
@@ -202,12 +396,12 @@ function modelsFromEnv(): ModelEntry {
  * environment (via `modelsFromEnv()`), persist it, and return the resulting
  * catalog. Idempotent: an existing valid file is returned unchanged.
  */
-export async function ensureModelsFile(cwd: string): Promise<ModelEntry[]> {
+export async function ensureModelsFile(cwd: string): Promise<ModelFile> {
   const existing = await loadModelsFile(cwd);
   if (existing !== null) {
     return existing;
   }
-  const seeded = [modelsFromEnv()];
+  const seeded = modelsFromEnv();
   await saveModelsFile(cwd, seeded);
   return seeded;
 }
@@ -216,69 +410,90 @@ export async function ensureModelsFile(cwd: string): Promise<ModelEntry[]> {
 // Resolution — the single selection point used by chat, Ralph, and schedule
 // ---------------------------------------------------------------------------
 
-export interface ResolvedModel {
-  /** The selected `id` (re-passed to child CLI runs so they pick the same entry). */
-  id: string;
-  /** The name sent to the API. */
-  name: string;
-  /** The normalized base URL (endpoint root; `/v1` guaranteed via ensureV1Path). */
-  baseUrl: string;
-  /** Effective context window in tokens. */
-  maxContext: number;
-}
-
-export interface ResolveModelOpts {
-  /**
-   * The `id` to select. When omitted/null, the entry with `default: true` is
-   * chosen (else the first entry). A non-empty id that is not in the file
-   * throws listing the available ids.
-   */
-  id?: string | null;
-  /**
-   * Session base override (`--base-url`). Only used when the selected entry has
-   * no `baseUrl` of its own — the entry's base is authoritative.
-   */
-  baseOverride?: string | null;
+function finishResolve(
+  pid: string,
+  provider: ProviderDef,
+  entry: ModelEntry,
+  opts: ResolveModelOpts,
+): ResolvedModel {
+  const baseUrl = ensureV1Path(
+    (provider.baseUrl ?? (opts.baseOverride ?? process.env.API_BASE ?? DEFAULT_API_BASE) ?? DEFAULT_API_BASE).trim(),
+  );
+  return {
+    providerId: pid,
+    id: entry.id,
+    name: entry.name,
+    selection: `${pid}/${entry.id}`,
+    baseUrl,
+    apiKey: provider.apiKey ?? null,
+    contextWindow: entry.contextWindow,
+    maxTokens: entry.maxTokens,
+  };
 }
 
 export async function resolveModel(
   cwd: string,
   opts: ResolveModelOpts = {},
 ): Promise<ResolvedModel> {
-  const entries = await ensureModelsFile(cwd);
-  if (entries.length === 0) {
-    // ensureModelsFile always seeds at least one entry, but guard anyway.
-    throw new Error("models.json has no entries — add at least one model");
+  const { providers } = (await ensureModelsFile(cwd)).models;
+  const available = Object.entries(providers).flatMap(([pid, def]) =>
+    def.models.map((e) => `${pid}/${e.id}`),
+  );
+  if (available.length === 0) {
+    throw new Error("models.json has no models — add a provider with at least one model");
   }
 
-  const selectedId = opts.id ? String(opts.id).trim() : null;
-  let entry: ModelEntry;
-  if (selectedId !== null) {
-    const m = entries.find((e) => e.id === selectedId);
-    if (m === undefined) {
+  const raw = opts.selection ? String(opts.selection).trim() : null;
+
+  if (raw === null) {
+    // No selection: first provider, first model (JSON insertion order).
+    const [pid, provider] = Object.entries(providers)[0]!;
+    return finishResolve(pid, provider, provider.models[0]!, opts);
+  }
+
+  const slash = raw.indexOf("/");
+  if (slash > 0) {
+    // provider/id
+    const pid = raw.slice(0, slash);
+    const mid = raw.slice(slash + 1);
+    const provider = providers[pid];
+    if (!provider) {
       throw new Error(
-        `unknown model id "${selectedId}" in ${cwd}/models.json ` +
-          `(available ids: ${entries.map((e) => e.id).join(", ")})`,
+        `unknown provider "${pid}" in ${cwd}/${MODELS_FILE_NAME} ` +
+          `(available: ${available.join(", ")})`,
       );
     }
-    entry = m;
-  } else {
-    entry = entries.find((e) => e.default === true) ?? entries[0];
+    const entry = provider.models.find((e) => e.id === mid);
+    if (!entry) {
+      throw new Error(
+        `unknown model "${mid}" in provider "${pid}" ` +
+          `(provider models: ${provider.models.map((e) => e.id).join(", ")}; all: ${available.join(", ")})`,
+      );
+    }
+    return finishResolve(pid, provider, entry, opts);
   }
 
-  const baseUrl = ensureV1Path(
-    entry.baseUrl ??
-      (opts.baseOverride ?? process.env.API_BASE ?? DEFAULT_API_BASE)
-      .trim(),
-  );
-  const maxContext = entry.maxContext ?? envContextTokens() ?? DEFAULT_CONTEXT_TOKENS;
-
-  return {
-    id: entry.id,
-    name: entry.name,
-    baseUrl,
-    maxContext,
-  };
+  // Bare id: only valid when it is unique across all providers.
+  const matches: Array<{ pid: string; provider: ProviderDef; entry: ModelEntry }> = [];
+  for (const [p, def] of Object.entries(providers)) {
+    const m = def.models.find((e) => e.id === raw);
+    if (m) matches.push({ pid: p, provider: def, entry: m });
+  }
+  if (matches.length === 0) {
+    throw new Error(
+      `unknown model "${raw}" in ${cwd}/${MODELS_FILE_NAME} ` +
+        `(available: ${available.join(", ")})`,
+    );
+  }
+  if (matches.length > 1) {
+    const all = matches.map((m) => `${m.pid}/${m.entry.id}`);
+    throw new Error(
+      `model "${raw}" is ambiguous — it exists in multiple providers ` +
+        `(matches: ${all.join(", ")}). Use a provider/id selection instead.`,
+    );
+  }
+  const { pid, provider, entry } = matches[0];
+  return finishResolve(pid, provider, entry, opts);
 }
 
 // ---------------------------------------------------------------------------

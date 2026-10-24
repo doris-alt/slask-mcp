@@ -329,8 +329,17 @@ export interface ChatState {
   openaiTools: OpenAiFunctionTool[];
   skills: Skill[];
   registry: Registry;
+  /** The `model:` value sent to the API (the catalog entry's `name`). */
   model: string;
+  /** The `provider/id` selection that produced this model (shown in the banner). */
+  selection?: string;
   base: string | null;
+  /**
+   * The model's declared output-capability ceiling (its `maxTokens`). Used by
+   * `runAgentTurn`: with no `SLASK_MAX_TOKENS` env knob set it becomes the
+   * completion cap; with the knob set it only acts as an upper bound on it.
+   */
+  maxTokens?: number;
   baseDir: string;
 }
 
@@ -343,17 +352,21 @@ async function buildChatState(options: {
   registry: Registry;
   model: string;
   base?: string | null;
+  apiKey?: string | null;
+  maxTokens?: number;
+  selection?: string;
   openai?: InstanceType<typeof OpenAI>;
 }): Promise<ChatState> {
   const { registry, model } = options;
   const base = options.base ?? null;
+  const apiKey = options.apiKey ?? null;
 
   let openai: InstanceType<typeof OpenAI>;
   if (options.openai !== undefined) {
     openai = options.openai;
   } else {
     try {
-      openai = createOpenAiClient({ base });
+      openai = createOpenAiClient({ base, apiKey });
     } catch (e) {
       die(e instanceof Error ? e.message : String(e));
     }
@@ -375,7 +388,9 @@ async function buildChatState(options: {
     skills,
     registry,
     model,
+    selection: options.selection,
     base,
+    maxTokens: options.maxTokens,
     baseDir: process.cwd(),
   };
 }
@@ -391,7 +406,11 @@ export function printBanner(state: ChatState, interactive: boolean): void {
   if (state.registry.keyedViews.length === 0) {
     console.log(`  server : ${color("dim", "(none reached)")}`);
   }
-  console.log(`  model  : ${color("cyan", state.model)}`);
+  const modelLabel =
+    state.selection !== undefined
+      ? `${state.selection} (${state.model})`
+      : state.model;
+  console.log(`  model  : ${color("cyan", modelLabel)}`);
   console.log(`  api    : ${color("cyan", effectiveBase)}`);
   // MCP tools (namespaced per server), the built-in file tools, and local-skill
   // tools all show here so the user sees every callable name up front.
@@ -495,7 +514,15 @@ export async function runTurn(
   history.push(userMsg);
   try {
     const answer = await runAgentTurn(
-      { openai, model, systemPrompt, tools, callTool, requireTool: requiredToolsForRole() },
+      {
+        openai,
+        model,
+        systemPrompt,
+        tools,
+        callTool,
+        requireTool: requiredToolsForRole(),
+        maxTokens: state.maxTokens,
+      },
       history,
       onToolCall
     );
@@ -604,14 +631,20 @@ export async function startChat({
   registry,
   model,
   base,
+  apiKey,
+  maxTokens,
+  selection,
   openai,
 }: {
   registry: Registry;
   model: string;
   base?: string | null;
+  apiKey?: string | null;
+  maxTokens?: number;
+  selection?: string;
   openai?: InstanceType<typeof OpenAI>;
 }): Promise<void> {
-  const state = await buildChatState({ registry, model, base, openai });
+  const state = await buildChatState({ registry, model, base, apiKey, maxTokens, selection, openai });
   const rl = createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -868,6 +901,9 @@ export async function runOneShot({
   registry,
   model,
   base,
+  apiKey,
+  maxTokens,
+  selection,
   prompt,
   openai,
   quiet,
@@ -875,6 +911,9 @@ export async function runOneShot({
   registry: Registry;
   model: string;
   base?: string | null;
+  apiKey?: string | null;
+  maxTokens?: number;
+  selection?: string;
   prompt: string;
   openai?: InstanceType<typeof OpenAI>;
   // Omit the startup banner (server/model/tools listing). Used by the
@@ -882,7 +921,7 @@ export async function runOneShot({
   // answer.
   quiet?: boolean;
 }): Promise<number> {
-  const state = await buildChatState({ registry, model, base, openai });
+  const state = await buildChatState({ registry, model, base, apiKey, maxTokens, selection, openai });
   if (!quiet) {
     printBanner(state, false);
   }

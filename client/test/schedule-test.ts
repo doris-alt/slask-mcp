@@ -1044,9 +1044,10 @@ try {
 
       {
         // test34: schedule_add with a `modelId` — auto-seeds models.json from env,
-        // persists the pin, and schedule_list surfaces it. An unknown id throws
-        // with the available-id list (only gpt-4o-mini exists after env-seeding).
-        // MODEL/OPENAI_MODEL are pinned so the seeded catalog is deterministic.
+        // persists the pin, and schedule_list surfaces it. The seeded catalog is
+        // a single `default` provider (one `gpt-4o-mini` model), so the pin is
+        // `default/gpt-4o-mini`. An unknown selection throws with the available
+        // provider/id list. MODEL is pinned so the seeded catalog is deterministic.
         const savedModel = process.env.MODEL;
         const savedOpenai = process.env.OPENAI_MODEL;
         process.env.MODEL = "gpt-4o-mini";
@@ -1055,26 +1056,31 @@ try {
           const addOut = await callScheduleTool("schedule_add", {
             expr: "0 9 * * *",
             prompt: "pinned model job",
-            modelId: "gpt-4o-mini",
+            modelId: "default/gpt-4o-mini",
           });
           assert(addOut.isError === false, `add modelId not an error: ${JSON.stringify(addOut)}`);
           const jobs = await listJobs();
-          const job = jobs.find((j) => j.modelId === "gpt-4o-mini") ?? jobs[0];
-          assert(job.modelId === "gpt-4o-mini", `modelId persisted: ${JSON.stringify(job.modelId)}`);
+          const job = jobs.find((j) => j.modelId === "default/gpt-4o-mini") ?? jobs[0];
+          assert(
+            job.modelId === "default/gpt-4o-mini",
+            `modelId persisted: ${JSON.stringify(job.modelId)}`,
+          );
           const addText = textFrom(addOut.content);
           assert(addText.includes("added job"), `add text: ${addText}`);
           assert(addText.includes(job.id), `add text includes id: ${addText}`);
           const seedRaw = await readFile(join(toolDir, "models.json"), "utf8");
-          const seeded: { id?: string }[] =
-            (JSON.parse(seedRaw) as { models: { id?: string }[] }).models;
+          const seeded = JSON.parse(seedRaw) as {
+            models?: { providers?: { default?: { models?: { id?: string }[] } } };
+          };
           assert(
-            seeded.some((m) => m.id === "gpt-4o-mini"),
-            `models.json auto-seeded with gpt-4o-mini: ${JSON.stringify(seeded)}`
+            seeded?.models?.providers?.default?.models?.some((m) => m.id === "gpt-4o-mini"),
+            `models.json auto-seeded with default/gpt-4o-mini: ${JSON.stringify(seeded)}`,
           );
+          assert(!seedRaw.includes('"apiKey"'), "seeded file holds no apiKey");
           const listOut = await callScheduleTool("schedule_list", {});
           assert(
-            textFrom(listOut.content).includes('model="gpt-4o-mini"'),
-            `schedule_list shows the model column: ${textFrom(listOut.content)}`
+            textFrom(listOut.content).includes('model="default/gpt-4o-mini"'),
+            `schedule_list shows the model column: ${textFrom(listOut.content)}`,
           );
           let err = "";
           try {
@@ -1087,11 +1093,12 @@ try {
             err = e instanceof Error ? e.message : String(e);
           }
           assert(
-            err.includes('unknown model id "nope"') && err.includes("available ids: gpt-4o-mini"),
-            `unknown modelId add -> throws, lists available: ${err}`
+            err.includes('unknown model "nope"') &&
+              err.includes("available: default/gpt-4o-mini"),
+            `unknown modelId add -> throws, lists available: ${err}`,
           );
           console.log(
-            "PASS test34 — schedule_add modelId auto-seeds/pins/persists; list shows it; unknown id throws"
+            "PASS test34 — schedule_add modelId auto-seeds/pins/persists; list shows it; unknown selection throws",
           );
         } finally {
           if (savedModel === undefined) delete process.env.MODEL;
@@ -1102,37 +1109,41 @@ try {
       }
 
       {
-        // test35: manual two-entry models.json — schedule_update switches the pinned
-        // model to another valid id; schedule_list shows the new one; an unknown
-        // modelId (on update) throws listing all available ids.
+        // test35: manual two-provider models.json — schedule_update switches the
+        // pinned selection to another valid `provider/id`; schedule_list shows the
+        // new one; an unknown selection (on update) throws listing all available
+        // provider/id entries; an unknown provider throws listing providers.
         const modelsFile = join(toolDir, "models.json");
         await writeFile(
           modelsFile,
           JSON.stringify({
-            models: [
-              { id: "fast", name: "fast-model", default: true },
-              { id: "slow", name: "slow-model", maxContext: 131072 },
-            ],
+            models: { providers: {
+              fast: { models: [{ id: "fast", name: "fast-model", contextWindow: 131072 }] },
+              slow: { models: [{ id: "slow", name: "slow-model" }] },
+            } },
           }),
           "utf8",
         );
         const addOut2 = await callScheduleTool("schedule_add", {
           expr: "0 9 * * *",
-          prompt: "two-entry job",
-          modelId: "slow",
+          prompt: "two-provider job",
+          modelId: "slow/slow",
         });
-        assert(addOut2.isError === false, `two-entry add not an error: ${JSON.stringify(addOut2)}`);
-        const job2 = (await listJobs()).find((j) => j.modelId === "slow") ?? (await listJobs())[0];
-        assert(job2.modelId === "slow", `pinned slow: ${JSON.stringify(job2.modelId)}`);
-        const upOut = await callScheduleTool("schedule_update", { id: job2.id, modelId: "fast" });
+        assert(addOut2.isError === false, `two-provider add not an error: ${JSON.stringify(addOut2)}`);
+        const job2 = (await listJobs()).find((j) => j.modelId === "slow/slow") ?? (await listJobs())[0];
+        assert(job2.modelId === "slow/slow", `pinned slow/slow: ${JSON.stringify(job2.modelId)}`);
+        const upOut = await callScheduleTool("schedule_update", { id: job2.id, modelId: "fast/fast" });
         assert(upOut.isError === false, `update modelId not an error: ${JSON.stringify(upOut)}`);
         const afterUp = (await listJobs()).find((j) => j.id === job2.id);
-        assert(afterUp?.modelId === "fast", `updated to fast: ${JSON.stringify(afterUp?.modelId)}`);
+        assert(
+          afterUp?.modelId === "fast/fast",
+          `updated to fast/fast: ${JSON.stringify(afterUp?.modelId)}`,
+        );
         assert(textFrom(upOut.content).includes("updated job"), `update text: ${textFrom(upOut.content)}`);
         const listOut2 = await callScheduleTool("schedule_list", {});
         assert(
-          textFrom(listOut2.content).includes('model="fast"'),
-          `list shows updated model: ${textFrom(listOut2.content)}`
+          textFrom(listOut2.content).includes('model="fast/fast"'),
+          `list shows updated model: ${textFrom(listOut2.content)}`,
         );
         let err2 = "";
         try {
@@ -1141,11 +1152,23 @@ try {
           err2 = e instanceof Error ? e.message : String(e);
         }
         assert(
-          err2.includes('unknown model id "nope"') && err2.includes("available ids: fast, slow"),
+          err2.includes('unknown model "nope"') &&
+            err2.includes("available: fast/fast, slow/slow"),
           `unknown update modelId -> throws, lists available: ${err2}`
         );
+        let err3 = "";
+        try {
+          await callScheduleTool("schedule_update", { id: afterUp?.id, modelId: "no-provider/x" });
+        } catch (e) {
+          err3 = e instanceof Error ? e.message : String(e);
+        }
+        assert(
+          err3.includes('unknown provider "no-provider"') &&
+            err3.includes("available: fast/fast, slow/slow"),
+          `unknown provider update -> throws, lists available: ${err3}`
+        );
         console.log(
-          "PASS test35 — schedule_update switches pinned model; unknown modelId throws listing available ids"
+          "PASS test35 — schedule_update switches pinned selection; unknown selection/provider throws listing available provider/id entries"
         );
       }
     } finally {
