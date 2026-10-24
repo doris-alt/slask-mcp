@@ -170,14 +170,15 @@ async function main(): Promise<void> {
     };
     const out = await runRalph({ base, name: "f", execFn, runAgentFn, log: quiet, autoHandlers: false });
     assert.equal(out.state, "stuck");
-    assert.equal(out.iterations, 2);
-    assert.equal(out.passed, 0);
-    assert.ok(!cmds.some((c) => c.startsWith("git commit")), "no commit on red");
-    assert.ok(!prompts[0].includes("FAILED verification"));
-    assert.ok(prompts[1].includes("FAILED verification") && prompts[1].includes("BOOM"));
-    const prd = await loadPrd(base, "f");
-    assert.equal(prd.tasks[0].failures, 2);
-    console.log("PASS test3 — code: red check -> no pass/commit, failure fed back, stuck after maxFailures");
+		assert.equal(out.iterations, 2);
+		assert.equal(out.passed, 0);
+		assert.ok(!cmds.some((c) => c.startsWith("git commit")), "no commit on red");
+		assert.ok(!prompts[0].includes("FAILED verification"));
+		const retryPrompt = prompts.find((p) => p.includes("FAILED verification"));
+		assert.ok(retryPrompt?.includes("FAILED verification") && retryPrompt.includes("BOOM"));
+		const prd = await loadPrd(base, "f");
+		assert.equal(prd.tasks[0].failures, 2);
+		console.log("PASS test3 — code: red check -> no pass/commit, failure fed back, stuck after maxFailures");
     await rm(base, { recursive: true, force: true });
   }
 

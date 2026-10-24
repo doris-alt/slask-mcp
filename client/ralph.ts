@@ -29,6 +29,7 @@
 // `autoHandlers: false`.
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
 import { appendFile, copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
@@ -64,7 +65,7 @@ export interface RalphTask {
   failures?: number;
   lastFailure?: string;
   notes?: string;
-  /** Downstream tasks that depend on this one. */
+  /** Prerequisite task ids that must pass before this task can be picked. */
   dependencies?: string[];
 }
 
@@ -241,6 +242,29 @@ async function saveKnowledgeBase(base: string, name: string, kb: RalphKnowledgeB
   await atomicWrite(join(runDir(base, name), "knowledge.json"), JSON.stringify(kb, null, 2) + "\n");
 }
 
+function sha256Hex(s: string): string {
+  return createHash("sha256").update(s).digest("hex");
+}
+
+function parseKnowledgeFromNote(note: string): { category: RalphKnowledgeEntry["category"]; value: string } {
+  const trimmed = note.trim();
+  const bracket = trimmed.match(/^\[(pattern|decision|gotcha|infrastructure)\]\s*(.*)$/i);
+  if (bracket) {
+    const rawCategory = bracket[1].toLowerCase();
+    const category = rawCategory as RalphKnowledgeEntry["category"];
+    const value = (bracket[2] ?? "").trim();
+    return { category, value: value || trimmed };
+  }
+  const colon = trimmed.match(/^(pattern|decision|gotcha|infrastructure)\s*:\s*(.*)$/i);
+  if (colon) {
+    const rawCategory = colon[1].toLowerCase();
+    const category = rawCategory as RalphKnowledgeEntry["category"];
+    const value = (colon[2] ?? "").trim();
+    return { category, value: value || trimmed };
+  }
+  return { category: "gotcha", value: trimmed };
+}
+
 export async function loadPrd(base: string, name: string): Promise<RalphPrd> {
   try {
     return await readJson<RalphPrd>(join(runDir(base, name), "prd.json"));
@@ -380,6 +404,8 @@ export interface NewTask {
   acceptanceCriteria?: string[];
   priority?: number;
   passes?: boolean;
+  /** Prerequisite task ids that must pass before this task can be picked. */
+  dependencies?: string[];
 }
 
 function toTask(t: NewTask, index: number): RalphTask {
@@ -392,6 +418,7 @@ function toTask(t: NewTask, index: number): RalphTask {
     acceptanceCriteria: (t.acceptanceCriteria ?? []).map((c) => String(c).trim()).filter(Boolean),
     priority: typeof t.priority === "number" ? t.priority : index + 1,
     passes: t.passes === true,
+    dependencies: (t.dependencies ?? []).map((d) => String(d).trim()).filter(Boolean),
   };
 }
 
@@ -704,7 +731,9 @@ export function maintenancePrompt(
     "1. Review the changes made across all tasks. Look for duplicated logic, inconsistent naming, or areas where the code can be simplified without changing behavior.",
     "2. Apply small, focused refactors to unify patterns and improve readability.",
     "3. Ensure that the code follows the project's conventions (as noted in progress.txt).",
-    "4. Verify your refactors with run_command (build/tests) to ensure no regressions were introduced.",
+    cfg.check
+      ? `4. Verify your refactors with run_command — run \`${cfg.check}\` to ensure no regressions were introduced.`
+      : "4. Verify your refactors with run_command (build/tests) to ensure no regressions were introduced.",
     "5. When finished, call ralph_complete_task with a summary of the refactors performed. Do NOT commit: the loop will handle the final commit.",
     "Keep changes conservative: do not change architecture or functionality, only polish and unify.",
   ].filter((l) => l !== "").join("\n");
@@ -784,12 +813,12 @@ export function workerPrompt(
           cfg.check
             ? `3. Verify with run_command — the loop will run \`${cfg.check}\` and the task only counts if it exits 0. Run its parts yourself (one command per call, no shell operators) and fix failures.`
             : "3. Verify your work with run_command (build/tests) where the project has them.",
-          "4. Record reusable learnings (patterns, gotchas, how to run things) with ralph_note.",
+          "4. Record reusable learnings (patterns, gotchas, how to run things) with ralph_note. Prefix the note with one of: [pattern], [decision], [gotcha], [infrastructure] (e.g. [pattern] Use atomic writes for files).",
           "5. When — and only when — the work is done, call ralph_complete_task with a short summary. Do NOT edit prd.json and do NOT commit: the loop verifies and commits.",
         ]
       : [
           `2. Research ONLY this task using the tools available to you (read only the earlier findings you need from ${outDir}/findings/). Write your findings to ${outDir}/findings/${task.id}.md (create the file with write_file): concrete facts, with source/provenance for each claim, organised to address every acceptance criterion explicitly. State uncertainty honestly; do not invent sources.`,
-          "3. Record reusable learnings (good sources, dead ends, terminology) with ralph_note.",
+          "3. Record reusable learnings (good sources, dead ends, terminology) with ralph_note. Prefix with one of: [pattern], [decision], [gotcha], [infrastructure].",
           "4. When — and only when — every criterion is addressed, call ralph_complete_task with a short summary. A separate checker will judge the findings file against the criteria. Do NOT edit prd.json.",
         ];
   const split =
@@ -1136,10 +1165,11 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
           await writeStatus(base, name, { state: "running", iteration, message: "Maintenance Phase" });
           const maintenanceLog = join(dir, "iterations", "maintenance.log");
           await mkdir(join(dir, "iterations"), { recursive: true });
-          
+
+          const hasSpec = (await specSize(base, name)) !== null;
           const m = await runAgent({
             prompt: maintenancePrompt(prd, cfg, relDir, hasSpec),
-            env: childEnv("worker", "MAINT", workerModel.contextWindow),
+            env: childEnv("worker", undefined, workerModel.contextWindow),
             timeoutMs: cfg.timeoutS * 1000,
             logFile: maintenanceLog,
             modelId: workerModel.selection,
@@ -1236,7 +1266,10 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
               logFile: join(dir, "iterations", `${nn}-verify.log`),
               modelId: workerModel.selection,
             });
-            reason = `check \`${cfg.check}\` failed (exit ${c.code}):\n\nVERIFIER REPORT:\n${vRes}`;
+            const vText = typeof (vRes as any)?.output === "string" ? (vRes as any).output : "";
+            reason =
+              `check \`${cfg.check}\` failed (exit ${c.code}):\n\nVERIFIER REPORT:\n${vText || "(empty)"}` +
+              `\n\nRAW CHECK OUTPUT:\n${c.output}`;
           }
         } else {
           ok = true;
@@ -1571,6 +1604,7 @@ const taskSchema = {
     title: { type: "string" },
     description: { type: "string" },
     acceptanceCriteria: { type: "array", items: { type: "string" }, description: "concrete, verifiable criteria" },
+    dependencies: { type: "array", items: { type: "string" }, description: "prerequisite task ids that must pass first" },
   },
   required: ["title"],
 };
@@ -1722,7 +1756,24 @@ export async function callRalphTool(
     case "ralph_note": {
       const t = str(args.text);
       if (t === "") throw new Error("`text` is required");
-      await appendProgress(base, resolveRun(args), `\n- ${process.env.SLASK_RALPH_TASK ? `[${process.env.SLASK_RALPH_TASK}] ` : ""}${t}`);
+
+      const run = resolveRun(args);
+      const note = t.trim();
+      const taskId = process.env.SLASK_RALPH_TASK ? process.env.SLASK_RALPH_TASK : undefined;
+      await appendProgress(base, run, `\n- ${taskId ? `[${taskId}] ` : ""}${note}`);
+
+      // Keep an additional structured, queryable memory for later iterations.
+      const kb = await readKnowledgeBase(base, run);
+      const parsed = parseKnowledgeFromNote(note);
+      const key = `note:${parsed.category}:${sha256Hex(note).slice(0, 16)}`;
+      kb.entries[key] = {
+        key,
+        value: parsed.value,
+        category: parsed.category,
+        updatedAt: new Date().toISOString(),
+        taskOrigin: taskId,
+      };
+      await saveKnowledgeBase(base, run, kb);
       return text("noted");
     }
     case "ralph_complete_task": {

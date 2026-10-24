@@ -10,7 +10,9 @@ how to watch it, and how to recover when it stops. For a short overview see the
 A **Ralph run** is a named list of small tasks. The loop works through them one at
 a time. Each iteration is a **fresh `slask-client --prompt` process with an empty
 context**; its only memory is files (`prd.json`, `progress.txt`, and git history
-for code). After the worker says a task is done, the loop **verifies it itself**
+for code). In addition, Ralph can maintain structured learnings in `knowledge.json`
+for later iterations (written by `ralph_note` when it’s prefixed).
+After the worker says a task is done, the loop **verifies it itself**
 before marking it passing:
 
 | Mode       | Worker does                                   | Loop verifies with                              | Result lands in                                  |
@@ -56,6 +58,7 @@ with `-C/--dir <path>` (any command) so you can start the client from anywhere:
 | `.slask-ralph/<name>/config.json`    | yes (when stopped) | verifier and limits (below) |
 | `.slask-ralph/<name>/spec.md`        | via `--spec` / `ralph spec` | the project description iterations read (a copy) |
 | `.slask-ralph/<name>/progress.txt`   | rarely       | append-only learnings; you may seed the "Codebase Patterns" section with project conventions |
+| `.slask-ralph/<name>/knowledge.json` | rarely       | structured learnings for code mode (written from `ralph_note` prefixes) |
 | `ralph-<name>/` (research output)    | no           | deliverables written by the loop |
 | `.slask-ralph/<name>/status.json`, `run.pid`, `run.log`, `iterations/`, `verdict.json` | no | loop bookkeeping and logs |
 
@@ -155,7 +158,8 @@ tool output.
       "description": "optional detail",
       "acceptanceCriteria": ["GET /health returns 200 {\"ok\":true}", "a test covers it"],
       "priority": 1,
-      "passes": false
+      "passes": false,
+      "dependencies": ["T0"]
     }
   ]
 }
@@ -194,7 +198,7 @@ snarktank/ralph's `userStories`. `ralph init` fails if the run already exists.
 ### Writing good tasks (the part that decides success)
 
 - One task = one iteration. If it needs more than a couple of sentences, split it.
-- Order by dependency. 2 to 5 concrete, checkable criteria per task.
+- Order by dependency: add `dependencies: ["T1", "T2", ...]` to a task to make it eligible only after those prerequisite tasks pass. 2 to 5 concrete, checkable criteria per task.
 - Code: make the first task create or repair the test harness if there isn't one.
 - Research: one question per task; require sources and stated uncertainty in the criteria.
   Don't add a "write the report" task; the loop does a final synthesis pass itself.
