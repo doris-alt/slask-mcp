@@ -64,6 +64,8 @@ export interface RalphTask {
   failures?: number;
   lastFailure?: string;
   notes?: string;
+  /** Downstream tasks that depend on this one. */
+  dependencies?: string[];
 }
 
 export interface RalphPrd {
@@ -72,6 +74,18 @@ export interface RalphPrd {
   description: string;
   branchName?: string;
   tasks: RalphTask[];
+}
+
+export interface RalphKnowledgeEntry {
+  key: string;
+  value: string;
+  category: "pattern" | "decision" | "gotcha" | "infrastructure";
+  updatedAt: string;
+  taskOrigin?: string;
+}
+
+export interface RalphKnowledgeBase {
+  entries: Record<string, RalphKnowledgeEntry>;
 }
 
 export interface RalphConfig {
@@ -213,6 +227,18 @@ async function atomicWrite(file: string, text: string): Promise<void> {
 
 async function readJson<T>(file: string): Promise<T> {
   return JSON.parse(await readFile(file, "utf8")) as T;
+}
+
+async function readKnowledgeBase(base: string, name: string): Promise<RalphKnowledgeBase> {
+  try {
+    return await readJson<RalphKnowledgeBase>(join(runDir(base, name), "knowledge.json"));
+  } catch {
+    return { entries: {} };
+  }
+}
+
+async function saveKnowledgeBase(base: string, name: string, kb: RalphKnowledgeBase): Promise<void> {
+  await atomicWrite(join(runDir(base, name), "knowledge.json"), JSON.stringify(kb, null, 2) + "\n");
 }
 
 export async function loadPrd(base: string, name: string): Promise<RalphPrd> {
@@ -479,9 +505,25 @@ export async function reopenTask(base: string, name: string, id: string, why?: s
 }
 
 export function pickNext(prd: RalphPrd): RalphTask | undefined {
-  return prd.tasks
-    .filter((t) => !t.passes)
-    .sort((a, b) => a.priority - b.priority)[0];
+  const pending = prd.tasks.filter((t) => !t.passes);
+  if (pending.length === 0) return undefined;
+
+  // A task is only ready if all its dependencies have passed.
+  const ready = pending.filter((t) => {
+    if (!t.dependencies) return true;
+    return t.dependencies.every((depId) => {
+      const dep = prd.tasks.find((x) => x.id === depId);
+      return dep?.passes === true;
+    });
+  });
+
+  if (ready.length === 0 && pending.length > 0) {
+    // Deadlock or circular dependency: pick the highest priority pending task
+    // to allow the worker to try and fix it or the splitter to break it.
+    return pending.sort((a, b) => a.priority - b.priority)[0];
+  }
+
+  return ready.sort((a, b) => a.priority - b.priority)[0];
 }
 
 export async function listRuns(base: string): Promise<string[]> {
@@ -644,6 +686,54 @@ export async function formatStatus(base: string, name: string): Promise<string> 
 // prompts
 // ---------------------------------------------------------------------------
 
+export function maintenancePrompt(
+  prd: RalphPrd,
+  cfg: RalphConfig,
+  relDir: string,
+  hasSpec = false,
+): string {
+  return [
+    "You are the MAINTENANCE agent in a Ralph coding loop. All planned tasks have now passed verification.",
+    "Your goal is to perform a final quality pass over the codebase to ensure consistency, remove redundancy, and polish the implementation.",
+    specLine(relDir, hasSpec),
+    `Overall Goal: ${prd.description || prd.name}`,
+    "Tasks performed:",
+    prd.tasks.map((t) => `- ${t.id}: ${t.title}`).join("\n"),
+    "",
+    "Your instructions:",
+    "1. Review the changes made across all tasks. Look for duplicated logic, inconsistent naming, or areas where the code can be simplified without changing behavior.",
+    "2. Apply small, focused refactors to unify patterns and improve readability.",
+    "3. Ensure that the code follows the project's conventions (as noted in progress.txt).",
+    "4. Verify your refactors with run_command (build/tests) to ensure no regressions were introduced.",
+    "5. When finished, call ralph_complete_task with a summary of the refactors performed. Do NOT commit: the loop will handle the final commit.",
+    "Keep changes conservative: do not change architecture or functionality, only polish and unify.",
+  ].filter((l) => l !== "").join("\n");
+}
+
+export function verifierPrompt(
+  prd: RalphPrd,
+  task: RalphTask,
+  failureOutput: string,
+  relDir: string,
+  hasSpec = false,
+): string {
+  return [
+    "You are the VERIFIER in a Ralph coding loop. Your job is to analyze why a task's verification command failed and provide a structured bug report for the worker.",
+    specLine(relDir, hasSpec),
+    `Task ${task.id} — ${task.title}`,
+    task.description ?? "",
+    "Acceptance criteria:",
+    criteriaText(task),
+    `The verification command failed with the following output:\n---\n${failureOutput}\n---`,
+    "Analyze the failure. Identify exactly which acceptance criterion is not met and why. Look for stack traces, lint errors, or logic failures.",
+    "Your response must be a concise 'Bug Report' for the worker. Focus on:",
+    "1. What exactly failed (the symptom).",
+    "2. Where to look in the code (the cause).",
+    "3. How to fix it to satisfy the criteria.",
+    "Do not be generic. Be specific and technical.",
+  ].filter((l) => l !== "").join("\n");
+}
+
 function criteriaText(t: RalphTask): string {
   return t.acceptanceCriteria.length ? t.acceptanceCriteria.map((c) => `- ${c}`).join("\n") : "- (none given — use judgment)";
 }
@@ -663,8 +753,13 @@ export function workerPrompt(
   outDir: string,
   hasSpec = false,
   modelMaxContext?: number,
+  kb: RalphKnowledgeBase = { entries: {} },
 ): string {
   const lim = limitsOf(cfg, modelMaxContext);
+  const kbText = Object.values(kb.entries)
+    .map((e) => `[${e.category}] ${e.key}: ${e.value} (origin: ${e.taskOrigin ?? "unknown"})`)
+    .join("\n");
+
   const head = [
     "You are ONE iteration of an autonomous Ralph loop. You have a fresh context: everything you know comes from files.",
     `Run directory: ${relDir}/  (relative to the current directory)`,
@@ -677,6 +772,7 @@ export function workerPrompt(
     criteriaText(task),
     "",
     `1. Read ${relDir}/progress.txt first (start with its "Codebase Patterns" section) to learn what earlier iterations found.`,
+    kbText ? `\n### Structured Project Knowledge\n${kbText}\n` : "",
   ];
   const retry = task.lastFailure
     ? ["", `A previous attempt at this task FAILED verification:\n${task.lastFailure}\nFix that this time.`]
@@ -1033,7 +1129,37 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
       if (aborted) return await finish("stopped", "interrupted");
       const prd = await loadPrd(base, name);
       const task = pickNext(prd);
-      if (task === undefined) break;
+      if (task === undefined) {
+        // All tasks passed. Now run the maintenance phase for code mode.
+        if (prd.mode === "code") {
+          log(`\n=== Maintenance Phase: Polishing the codebase ===`);
+          await writeStatus(base, name, { state: "running", iteration, message: "Maintenance Phase" });
+          const maintenanceLog = join(dir, "iterations", "maintenance.log");
+          await mkdir(join(dir, "iterations"), { recursive: true });
+          
+          const m = await runAgent({
+            prompt: maintenancePrompt(prd, cfg, relDir, hasSpec),
+            env: childEnv("worker", "MAINT", workerModel.contextWindow),
+            timeoutMs: cfg.timeoutS * 1000,
+            logFile: maintenanceLog,
+            modelId: workerModel.selection,
+          });
+          current = null;
+          if (aborted) return await finish("stopped", "interrupted");
+          
+          if (m.code === 0) {
+            log(`  ✓ Maintenance complete.`);
+            await appendProgress(base, name, `\n## ${new Date().toISOString()} — Maintenance: COMPLETED\n${m.output}`);
+            // Final commit for the maintenance pass
+            if (cfg.commit) {
+              await exec(`git add -A && git commit -m "refactor: final maintenance polish"`, base, 30_000);
+            }
+          } else {
+            log(`  ⚠ Maintenance ended with exit ${m.code}`);
+          }
+        }
+        break;
+      }
       if (task.id !== attemptTask) {
         attemptTask = task.id; // a new task (the previous one passed or was split): start counting afresh
         attempt = 0;
@@ -1054,7 +1180,7 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
       const logFile = join(dir, "iterations", `${nn}.log`);
       await mkdir(join(dir, "iterations"), { recursive: true });
       const w = await runAgent({
-        prompt: workerPrompt(prd, cfg, task, relDir, outDir, hasSpec, workerModel.contextWindow),
+        prompt: workerPrompt(prd, cfg, task, relDir, outDir, hasSpec, workerModel.contextWindow, await readKnowledgeBase(base, name)),
         env: childEnv("worker", task, workerModel.contextWindow),
         timeoutMs: cfg.timeoutS * 1000,
         logFile,
@@ -1100,7 +1226,18 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
           log(`  verifying: ${cfg.check}`);
           const c = await exec(cfg.check, base, cfg.timeoutS * 1000);
           ok = c.code === 0;
-          if (!ok) reason = `check \`${cfg.check}\` failed (exit ${c.code}):\n${tail(c.output)}`;
+          if (!ok) {
+            // Improvement: Use Verifier Agent to analyze the failure
+            log(`  ⚠ verification failed, running verifier agent...`);
+            const vRes = await runAgent({
+              prompt: verifierPrompt(after, t, c.output, relDir, hasSpec),
+              env: childEnv("worker", t, workerModel.contextWindow), // Use worker-like env
+              timeoutMs: cfg.timeoutS * 1000,
+              logFile: join(dir, "iterations", `${nn}-verify.log`),
+              modelId: workerModel.selection,
+            });
+            reason = `check \`${cfg.check}\` failed (exit ${c.code}):\n\nVERIFIER REPORT:\n${vRes}`;
+          }
         } else {
           ok = true;
         }
@@ -1129,6 +1266,19 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
         t.claimed = false;
         t.failures = 0;
         t.lastFailure = undefined;
+
+        // Improvement: Handle Cascading Re-verification
+        // Find tasks that depend on this one and mark them as failed/unpassed
+        // so they are re-verified if this task changed the codebase.
+        for (const other of after.tasks) {
+          if (other.dependencies?.includes(t.id)) {
+            other.passes = false;
+            other.claimed = false;
+            other.failures = 0;
+            other.lastFailure = `dependency ${t.id} was updated; re-verification required`;
+          }
+        }
+
         await savePrd(base, after);
         let commitNote = "";
         if (after.mode === "code" && cfg.commit) commitNote = await commitTask(exec, base, t);
