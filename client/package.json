@@ -20,9 +20,10 @@
     "test:agent-edges": "node dist/test/agent-edges-test.js",
     "test:env": "node dist/test/env-test.js",
     "test:ui": "node dist/test/ui-stub-test.js",
+    "test:models": "node dist/test/models-test.js",
     "test:files": "node dist/test/files-stub-test.js",
     "test:schedule": "node dist/test/schedule-test.js",
-    "test:all": "node dist/test/skills-stub-test.js && node dist/test/cli-parse-test.js && node dist/test/servers-test.js && node dist/test/client-helpers-test.js && node dist/test/agent-edges-test.js && node dist/test/env-test.js && node dist/test/ui-stub-test.js && node dist/test/files-stub-test.js && node dist/test/schedule-test.js && node dist/test/ralph-test.js",
+    "test:all": "node dist/test/skills-stub-test.js && node dist/test/cli-parse-test.js && node dist/test/servers-test.js && node dist/test/client-helpers-test.js && node dist/test/agent-edges-test.js && node dist/test/env-test.js && node dist/test/ui-stub-test.js && node dist/test/models-test.js && node dist/test/files-stub-test.js && node dist/test/schedule-test.js && node dist/test/ralph-test.js",
     "clean": "rm -rf dist",
     "test:ralph": "node dist/test/ralph-test.js"
   },

@@ -25,8 +25,9 @@ import type {
   ToolCallRecord,
 } from "./types.js";
 
-export const DEFAULT_MODEL = "gpt-4o-mini"; // cheap/fast for real OpenAI; override via MODEL/OPENAI_MODEL/--model
+export const DEFAULT_MODEL = "gpt-4o-mini"; // cheap/fast for real OpenAI; override via models.json/MODEL/OPENAI_MODEL/--model
 export const DEFAULT_API_BASE = "https://api.openai.com"; // normalize to /v1 below
+export const DEFAULT_CONTEXT_TOKENS = 32000; // model context window fallback; see models.json / MAX_CONTEXT_TOKENS
 const MAX_TOOL_ITERATIONS = 8; // safety cap: tool round-trips per turn
 const MAX_TOKENS = 1024; // hard cap on each completion
 
@@ -35,6 +36,18 @@ const MAX_TOKENS = 1024; // hard cap on each completion
 function envInt(name: string, fallback: number): number {
   const n = Number.parseInt(process.env[name] ?? "", 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * The model's context window from the environment (.env): `MAX_CONTEXT_TOKENS`.
+ * The value must be an integer ≥ 2000 to be used; a bad/empty value is treated as
+ * "not set" (undefined) so callers fall through to defaults.
+ */
+export function envContextTokens(): number | undefined {
+  const raw = process.env.MAX_CONTEXT_TOKENS;
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 2000 ? n : undefined;
 }
 
 // Context control (both off by default; Ralph iterations switch them on so a
@@ -88,7 +101,7 @@ export function pruneMessages(messages: ConversationMessage[], budget: number): 
 // The OpenAI SDK appends /chat/completions to your baseURL, so the base must
 // already point at the /v1 root. Normalize any input (with or without /v1,
 // with or without a trailing slash) to that form.
-function ensureV1Path(base: string): string {
+export function ensureV1Path(base: string): string {
   let url = base.replace(/\/+$/, "");
   if (!url.endsWith("/v1")) {
     url += "/v1";
