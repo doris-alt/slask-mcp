@@ -1,0 +1,20 @@
+{
+  "models": [
+    {
+      "id": "fast",
+      "name": "gpt-4o-mini",
+      "default": true
+    },
+    {
+      "id": "smart",
+      "name": "gpt-4o",
+      "maxContext": 131072
+    },
+    {
+      "id": "local",
+      "name": "gemma4:12b-mlx",
+      "baseUrl": "http://your-local-server:11434",
+      "maxContext": 32768
+    }
+  ]
+}

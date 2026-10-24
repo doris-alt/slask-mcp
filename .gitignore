@@ -3,6 +3,8 @@ client/dist/
 client/external/
 # Local per-user MCP server config (template: client/mcp.example.json).
 client/mcp.json
+# Local per-user model catalog (template: client/models.example.json).
+client/models.json
 # Local scratch / experiment directories (not part of the client).
 client/obscura/
 client/tmp/

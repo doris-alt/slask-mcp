@@ -8,7 +8,8 @@
 //
 // Jobs are stored in `<cwd>/.slask-schedule.json` (same cwd convention as
 // `.env` / `mcp.json`) and each firing spawns *this* CLI as a one-shot child
-// (`<same binary> --prompt <job.prompt> --quiet`), so a firing behaves
+// (`<same binary> --prompt <job.prompt> --quiet` plus `--model <job.modelId>`
+// when the job pins one), so a firing behaves
 // exactly like a manual `slask-client --prompt <text>` run from that directory
 // (the child inherits the daemon's cwd and environment, and there is no
 // shell — prompts are never interpreted as shell input).
@@ -40,6 +41,7 @@ import { dirname, join } from "node:path";
 import { runCliChild } from "./child.js";
 import type { ChildProcess } from "./child.js";
 import type { CallToolResult, OpenAiFunctionTool } from "./types.js";
+import { resolveModel } from "./models.js";
 
 // ---------------------------------------------------------------------------
 // Job model + storage
@@ -52,6 +54,11 @@ export interface ScheduleJob {
   /** One-shot job: the firing time as a normalized UTC ISO-8601 string. Set for one-shot jobs. */
   at?: string;
   prompt: string;
+  /**
+   * Optional models.json id for the fired child's model. When absent, the child
+   * falls back to the file's default entry (same as a plain --prompt run).
+   */
+  modelId?: string;
   createdAt: string;
   lastRun?: string;
   lastStatus?: "ok" | "failed" | "timeout";
@@ -62,6 +69,8 @@ export interface ScheduleSpec {
   /** Provide exactly one of `expr` (recurring cron) or `at` (one-shot ISO date/time). */
   expr?: string;
   at?: string;
+  /** Optional models.json id for the child's model. */
+  modelId?: string | null;
 }
 
 interface ScheduleFile {
@@ -182,6 +191,15 @@ export async function addJob(
       "provide a cron expression (`expr`) or a date/time (`at`) for the job",
     );
   }
+  // A pinned `modelId` must reference a live `models.json` entry. Resolving
+  // (rather than a raw lookup) also auto-seeds `models.json` from the
+  // environment when it is missing, so the job's model is pinned before the
+  // daemon ever fires — and an unknown id fails here with the available-id
+  // list, not at fire time.
+  const rawModelId = (spec.modelId ?? "").trim();
+  if (rawModelId !== "") {
+    await resolveModel(process.cwd(), { id: rawModelId, baseOverride: null });
+  }
   if (expr) {
     if (!cron.validate(expr)) {
       throw new Error(
@@ -199,6 +217,9 @@ export async function addJob(
     prompt: spec.prompt,
     createdAt: new Date().toISOString(),
   };
+  if (rawModelId !== "") {
+    job.modelId = rawModelId;
+  }
   if (expr) {
     job.expr = expr;
   } else {
@@ -219,7 +240,10 @@ export async function removeJob(id: string, file: string = defaultFile()): Promi
   await saveJobs(jobs, file);
 }
 
-/** Fields a `schedule_update` call may change. At least one must be present. */
+/**
+ * Fields a `schedule_update` call may change. At least one of `expr` / `at` /
+ * `prompt` / `modelId` must be present.
+ */
 export interface JobUpdate {
   /** New 5-field cron expression (replaces the job's current expr / at). */
   expr?: string;
@@ -227,12 +251,14 @@ export interface JobUpdate {
   at?: string;
   /** New prompt text (replaces the job's current prompt). */
   prompt?: string;
+  /** New models.json id (replaces the job's current model). */
+  modelId?: string | null;
 }
 
 /**
  * Change one or more fields of an existing job — the "change" behind
- * `schedule_update`. At least one of `expr` / `at` / `prompt` must be
- * provided. Exactly one of `expr` / `at` may be given (the job stays either a
+ * `schedule_update`. At least one of `expr` / `at` / `prompt` / `modelId`
+ * must be provided. Exactly one of `expr` / `at` may be given (the job stays either a
  * recurring cron or a one-shot); `expr` is validated as a cron expression and
  * `at` as a date/time (same rules as `addJob`). `prompt` must be non-empty.
  * An unknown id throws with the available full ids so the caller (the model)
@@ -250,10 +276,12 @@ export async function updateJob(
   const hasExpr = update.expr !== undefined && update.expr.trim() !== "";
   const hasAt = update.at !== undefined && update.at.trim() !== "";
   const hasPrompt = promptGiven;
-  if (!hasExpr && !hasAt && !hasPrompt) {
+  const hasModel =
+    update.modelId !== undefined && String(update.modelId).trim() !== "";
+  if (!hasExpr && !hasAt && !hasPrompt && !hasModel) {
     throw new Error(
-      "at least one of `expr` (new cron), `at` (new one-shot time), or " +
-        "`prompt` (new text) is required",
+      "at least one of `expr` (new cron), `at` (new one-shot time), " +
+        "`prompt` (new text), or `modelId` (new model id) is required",
     );
   }
   if (hasExpr && hasAt) {
@@ -269,6 +297,12 @@ export async function updateJob(
   if (hasAt && Number.isNaN(Date.parse(update.at!))) {
     throw new Error(
       `invalid date/time: "${update.at!}" (use ISO-8601, e.g. "2026-10-20T09:30:00Z")`,
+    );
+  }
+  if (hasModel) {
+    await resolveModel(
+      process.cwd(),
+      { id: String(update.modelId).trim(), baseOverride: null },
     );
   }
   const jobs = await loadJobs(file);
@@ -290,6 +324,9 @@ export async function updateJob(
   }
   if (hasPrompt) {
     job.prompt = String(update.prompt).trim();
+  }
+  if (hasModel) {
+    job.modelId = String(update.modelId).trim();
   }
   await saveJobs(jobs, file);
   return job;
@@ -334,8 +371,9 @@ export interface RunSchedulerOptions {
   /** Fake cron engine (tests). Default: node-cron. */
   scheduleFn?: ScheduleFn;
   /** Fake child runner (tests); resolves with the child exit code.
-     Default: spawn this CLI as `--prompt <job.prompt> --quiet` and
-     resolve with the child's exit code (-1 = timed out, -2 = spawn error). */
+     Default: spawn this CLI as `--prompt <job.prompt> --quiet` (plus
+     `--model <job.modelId>` when the job pins one) and resolve with the
+     child's exit code (-1 = timed out, -2 = spawn error). */
   runJobFn?: (job: ScheduleJob) => Promise<number>;
   /** Output sink (tests). Default: console.log. */
   log?: (line: string) => void;
@@ -386,8 +424,16 @@ export async function runScheduler(options: RunSchedulerOptions = {}): Promise<S
   // Spawn this CLI as a one-shot child and resolve with an effective exit
   // code: 0 = ok, -1 = timed out (SIGTERM, then SIGKILL if still alive),
   // -2 = child failed to start, >0 = the child's own non-zero exit code.
+  // A job's pinned `modelId` goes through as `--model` (a models.json id);
+  // when absent the child falls back to models.json's default entry — a firing
+  // behaves exactly like a manual `slask-client --prompt <text>` run from the
+  // same directory.
   async function runChild(job: ScheduleJob, timeoutMs: number): Promise<number> {
-    const { code } = await runCliChild(["--prompt", job.prompt, "--quiet"], {
+    const args = ["--prompt", job.prompt, "--quiet"];
+    if (job.modelId) {
+      args.push("--model", job.modelId);
+    }
+    const { code } = await runCliChild(args, {
       timeoutMs,
       onSpawn: (child) => {
         currentChild = child;
@@ -631,7 +677,8 @@ function scheduleListText(jobs: ScheduleJob[]): string {
     const last = j.lastRun
       ? `last: ${j.lastRun.slice(0, 16)} (${j.lastStatus})`
       : "last: none yet";
-    return `  - id=${j.id}\n    ${when} prompt="${j.prompt}" ${last}`;
+    const modelPart = j.modelId ? ` model="${j.modelId}"` : "";
+    return `  - id=${j.id}\n    ${when} prompt="${j.prompt}"${modelPart} ${last}`;
   });
   return `${jobs.length} job(s):\n${lines.join("\n")}`;
 }
@@ -647,8 +694,9 @@ export function scheduleTools(): OpenAiFunctionTool[] {
       function: {
         name: "schedule_list",
         description:
-          "List all scheduled jobs with their full UUID id, cron expression, prompt, " +
-          "and last-run/status. Returns 'no scheduled jobs yet' when there are none. " +
+          "List all scheduled jobs with their full UUID id, cron expression, " +
+          "prompt, model id, and last-run/status. Returns 'no scheduled jobs yet' " +
+          "when there are none. " +
           "Use when the user asks what is scheduled. The full id shown here is needed " +
           "by `schedule_update` and `schedule_remove`.",
         parameters: { type: "object", properties: {} },
@@ -662,9 +710,12 @@ export function scheduleTools(): OpenAiFunctionTool[] {
           "Create a new scheduled job. Either provide a 5-field cron `expr` (the " +
           "prompt runs on every match) or an ISO date/time `at` (the prompt runs " +
           "exactly once, at that time). In both cases the run behaves like a manual " +
-          "`slask-client --prompt` one-shot run. Provide exactly one of `expr`/`at`. " +
-          "Use when the user asks to set up a recurring task/reminder, or a one-time " +
-          "remind-me-at-a-specific-time. Returns the new job's full id.",
+          "`slask-client --prompt` one-shot run; an optional `modelId` (a `models.json` " +
+          "id) pins which model the run uses — unknown ids are rejected with the " +
+          "available-id list, and without it the file's default model is used. " +
+          "Provide exactly one of `expr`/`at`. Use when the user asks to set up a " +
+          "recurring task/reminder, or a one-time remind-me-at-a-specific-time. " +
+          "Returns the new job's full id.",
         parameters: {
           type: "object",
           properties: {
@@ -676,6 +727,13 @@ export function scheduleTools(): OpenAiFunctionTool[] {
                 "(space-free)",
             },
             prompt: { type: "string", description: "the prompt text to run on each firing" },
+            modelId: {
+              type: "string",
+              description:
+                "optional models.json id pinning the model this job's runs use " +
+                "(validated against models.json in the launch cwd; unknown ids " +
+                "fail with the available-id list). Omitted → default model.",
+            },
           },
           required: ["prompt"],
         },
@@ -688,9 +746,11 @@ export function scheduleTools(): OpenAiFunctionTool[] {
         description:
           "Change an existing scheduled job by its full UUID id (as shown by " +
           "`schedule_list`). Provide the new schedule — a 5-field cron `expr` " +
-          "(recurring) or an ISO date/time `at` (one-shot) — and/or the new `prompt`; " +
-          "at least one is required. `expr` and `at` are mutually exclusive. Returns " +
-          "the updated job.",
+          "(recurring) or an ISO date/time `at` (one-shot) — and/or the new " +
+          "`prompt` and/or the new `modelId`; at least one is required. `expr` " +
+          "and `at` are mutually exclusive. An optional `modelId` (a `models.json` " +
+          "id) changes which model the job runs with; unknown ids are rejected with " +
+          "the available-id list. Returns the updated job.",
         parameters: {
           type: "object",
           properties: {
@@ -703,6 +763,13 @@ export function scheduleTools(): OpenAiFunctionTool[] {
                 "(space-free)",
             },
             prompt: { type: "string", description: "new prompt text" },
+            modelId: {
+              type: "string",
+              description:
+                "new models.json id pinning the model this job runs with (optional; " +
+                "unknown ids are rejected with the available-id list). Omitted → " +
+                "current model unchanged.",
+            },
           },
           required: ["id"],
         },
@@ -738,6 +805,11 @@ export async function callScheduleTool(
   name: string,
   args: Record<string, unknown>,
 ): Promise<CallToolResult> {
+  // Non-empty trimmed string, or undefined when absent/empty — the same shape
+  // the CLI parser's last-value-wins flags produce.
+  const str = (v: unknown): string | undefined =>
+    typeof v === "string" && v.trim() !== "" ? v.trim() : undefined;
+
   switch (name) {
     case "schedule_list": {
       const text = scheduleListText(await listJobs());
@@ -747,15 +819,19 @@ export async function callScheduleTool(
       const expr = String(args.expr ?? "").trim();
       const at = String(args.at ?? "").trim();
       const prompt = String(args.prompt ?? "").trim();
+      const modelId = str(args.modelId);
       if (prompt === "") {
         throw new Error("`prompt` is required");
       }
       // addJob trims + validates: rejects both/neither of expr|at, validates the
-      // cron when expr is given, and rejects an `at` already in the past.
+      // cron when expr is given, rejects an `at` already in the past, and — when
+      // set — validates `modelId` against models.json (auto-seeding it from the
+      // environment if it is missing).
       const job = await addJob({
         prompt,
         expr: expr || undefined,
         at: at || undefined,
+        modelId,
       });
       const when = job.expr ? `expr="${job.expr}"` : `at="${job.at}"`;
       const detail = job.expr
@@ -769,14 +845,11 @@ export async function callScheduleTool(
       if (id === "") {
         throw new Error("`id` is required (see `schedule_list`)");
       }
-      const str = (v: unknown): string | undefined =>
-        typeof v === "string" && v.trim() !== ""
-          ? v.trim()
-          : undefined;
       const job = await updateJob(id, {
         expr: str(args.expr),
         at: str(args.at),
         prompt: str(args.prompt),
+        modelId: str(args.modelId),
       });
       const when = job.expr ? `expr="${job.expr}"` : `at="${job.at}"`;
       const text = `updated job ${job.id} — ${when}: ${job.prompt}`;
@@ -813,8 +886,11 @@ export function scheduleSystemBlock(): string {
     "`expr` — the prompt fires on every match) or *one-shot* (provide an ISO " +
     "date/time `at` — e.g. \"2026-10-20T09:30:00Z\" — and the prompt fires exactly " +
     "once, at that time). Exactly one of `expr`/`at` is required on `schedule_add`; " +
-    "`schedule_update` may change the expr, at, or prompt of an existing job (at " +
-    "least one; expr and at are mutually exclusive). Each firing runs the prompt " +
+    "`schedule_update` may change the expr, at, prompt, or `modelId` of an existing " +
+    "job (at least one must be given; expr and at are mutually exclusive). `modelId` " +
+    "is an optional `models.json` id (validated against the file in the launch cwd, " +
+    "unknown ids fail with the available-id list); without it a job's runs use the " +
+    "file's default model. Each firing runs the prompt " +
     "through the agent exactly like a manual `slask-client --prompt` one-shot run. " +
     "Jobs only fire while the `slask-client schedule` daemon is running; changes to " +
     "a job take effect within ~15 s without a restart. When the user asks for a " +

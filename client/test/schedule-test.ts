@@ -28,7 +28,7 @@
 //   * quiet: runOneShot({quiet: true}) omits the startup banner.
 
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1040,6 +1040,113 @@ try {
         assert(textFrom(backOut.content).includes("updated job"), `update-back text`);
 
         console.log("PASS test27c — schedule_update with `at` switches cron↔one-shot");
+      }
+
+      {
+        // test34: schedule_add with a `modelId` — auto-seeds models.json from env,
+        // persists the pin, and schedule_list surfaces it. An unknown id throws
+        // with the available-id list (only gpt-4o-mini exists after env-seeding).
+        // MODEL/OPENAI_MODEL are pinned so the seeded catalog is deterministic.
+        const savedModel = process.env.MODEL;
+        const savedOpenai = process.env.OPENAI_MODEL;
+        process.env.MODEL = "gpt-4o-mini";
+        delete process.env.OPENAI_MODEL;
+        try {
+          const addOut = await callScheduleTool("schedule_add", {
+            expr: "0 9 * * *",
+            prompt: "pinned model job",
+            modelId: "gpt-4o-mini",
+          });
+          assert(addOut.isError === false, `add modelId not an error: ${JSON.stringify(addOut)}`);
+          const jobs = await listJobs();
+          const job = jobs.find((j) => j.modelId === "gpt-4o-mini") ?? jobs[0];
+          assert(job.modelId === "gpt-4o-mini", `modelId persisted: ${JSON.stringify(job.modelId)}`);
+          const addText = textFrom(addOut.content);
+          assert(addText.includes("added job"), `add text: ${addText}`);
+          assert(addText.includes(job.id), `add text includes id: ${addText}`);
+          const seedRaw = await readFile(join(toolDir, "models.json"), "utf8");
+          const seeded: { id?: string }[] =
+            (JSON.parse(seedRaw) as { models: { id?: string }[] }).models;
+          assert(
+            seeded.some((m) => m.id === "gpt-4o-mini"),
+            `models.json auto-seeded with gpt-4o-mini: ${JSON.stringify(seeded)}`
+          );
+          const listOut = await callScheduleTool("schedule_list", {});
+          assert(
+            textFrom(listOut.content).includes('model="gpt-4o-mini"'),
+            `schedule_list shows the model column: ${textFrom(listOut.content)}`
+          );
+          let err = "";
+          try {
+            await callScheduleTool("schedule_add", {
+              expr: "0 8 * * *",
+              prompt: "bad model",
+              modelId: "nope",
+            });
+          } catch (e) {
+            err = e instanceof Error ? e.message : String(e);
+          }
+          assert(
+            err.includes('unknown model id "nope"') && err.includes("available ids: gpt-4o-mini"),
+            `unknown modelId add -> throws, lists available: ${err}`
+          );
+          console.log(
+            "PASS test34 — schedule_add modelId auto-seeds/pins/persists; list shows it; unknown id throws"
+          );
+        } finally {
+          if (savedModel === undefined) delete process.env.MODEL;
+          else process.env.MODEL = savedModel;
+          if (savedOpenai === undefined) delete process.env.OPENAI_MODEL;
+          else process.env.OPENAI_MODEL = savedOpenai;
+        }
+      }
+
+      {
+        // test35: manual two-entry models.json — schedule_update switches the pinned
+        // model to another valid id; schedule_list shows the new one; an unknown
+        // modelId (on update) throws listing all available ids.
+        const modelsFile = join(toolDir, "models.json");
+        await writeFile(
+          modelsFile,
+          JSON.stringify({
+            models: [
+              { id: "fast", name: "fast-model", default: true },
+              { id: "slow", name: "slow-model", maxContext: 131072 },
+            ],
+          }),
+          "utf8",
+        );
+        const addOut2 = await callScheduleTool("schedule_add", {
+          expr: "0 9 * * *",
+          prompt: "two-entry job",
+          modelId: "slow",
+        });
+        assert(addOut2.isError === false, `two-entry add not an error: ${JSON.stringify(addOut2)}`);
+        const job2 = (await listJobs()).find((j) => j.modelId === "slow") ?? (await listJobs())[0];
+        assert(job2.modelId === "slow", `pinned slow: ${JSON.stringify(job2.modelId)}`);
+        const upOut = await callScheduleTool("schedule_update", { id: job2.id, modelId: "fast" });
+        assert(upOut.isError === false, `update modelId not an error: ${JSON.stringify(upOut)}`);
+        const afterUp = (await listJobs()).find((j) => j.id === job2.id);
+        assert(afterUp?.modelId === "fast", `updated to fast: ${JSON.stringify(afterUp?.modelId)}`);
+        assert(textFrom(upOut.content).includes("updated job"), `update text: ${textFrom(upOut.content)}`);
+        const listOut2 = await callScheduleTool("schedule_list", {});
+        assert(
+          textFrom(listOut2.content).includes('model="fast"'),
+          `list shows updated model: ${textFrom(listOut2.content)}`
+        );
+        let err2 = "";
+        try {
+          await callScheduleTool("schedule_update", { id: afterUp?.id, modelId: "nope" });
+        } catch (e) {
+          err2 = e instanceof Error ? e.message : String(e);
+        }
+        assert(
+          err2.includes('unknown model id "nope"') && err2.includes("available ids: fast, slow"),
+          `unknown update modelId -> throws, lists available: ${err2}`
+        );
+        console.log(
+          "PASS test35 — schedule_update switches pinned model; unknown modelId throws listing available ids"
+        );
       }
     } finally {
       process.chdir(workDir);

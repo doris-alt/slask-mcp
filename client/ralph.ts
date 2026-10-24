@@ -35,6 +35,15 @@ import { join, relative, resolve } from "node:path";
 import { runCliChild } from "./child.js";
 import type { ChildProcess } from "./child.js";
 import type { CallToolResult, OpenAiFunctionTool } from "./types.js";
+import {
+  DEFAULT_CONTEXT_TOKENS,
+  envContextTokens,
+} from "./agent.js";
+import {
+  flagValue,
+  resolveModel,
+} from "./models.js";
+import type { ResolvedModel } from "./models.js";
 
 // ---------------------------------------------------------------------------
 // model + storage
@@ -99,27 +108,27 @@ export interface RalphStatus {
 }
 
 export const STATE_DIR = ".slask-ralph";
-export const DEFAULT_CONTEXT_TOKENS = 32000;
 export const DEFAULT_TOOL_BUDGET = 25;
 export const MAX_SPLIT_DEPTH = 2; // T2 -> T2.1 -> T2.1.1, no further
-
-/** The model's context window from the environment (.env): MAX_CONTEXT_TOKENS. */
-export function envContextTokens(): number | undefined {
-  const raw = process.env.MAX_CONTEXT_TOKENS;
-  if (raw === undefined || raw.trim() === "") return undefined;
-  const n = Number(raw);
-  return Number.isInteger(n) && n >= 2000 ? n : undefined;
-}
+// DEFAULT_CONTEXT_TOKENS / envContextTokens live in agent.ts (shared model
+// defaults) and are imported at the top of this file.
 
 /**
- * Per-iteration limits for a run. The context window is the smaller of the run's
- * `contextTokens` (if set) and MAX_CONTEXT_TOKENS from the environment (if set), so a
- * run never plans or reads beyond the model's real window; default 32000 when neither
- * is set. Every iteration role (worker, checker, splitter) gets these via ralphChildEnv.
+ * Per-iteration limits for a run. The context window is the *smallest* of the
+ * role model's declared `contextTokens` (if set) and MAX_CONTEXT_TOKENS from
+ * the environment (if set), so a run never plans or reads beyond the model's
+ * real window; default 32000 when neither is set. The `cfg.contextTokens`
+ * (the run's own setting) is always taken, too, so a smaller run setting wins.
+ * Every iteration role (worker, checker, splitter, report) gets these via
+ * ralphChildEnv.
+ *
+ * `source` names which bound set the effective window: the role model's own
+ * `contextTokens` (highest — the model's real ceiling), then the environment
+ * `MAX_CONTEXT_TOKENS`, then the run's `contextTokens`, then the default.
  */
-export function limitsOf(cfg: Partial<RalphConfig>): {
+export function limitsOf(cfg: Partial<RalphConfig>, modelMaxContext?: number): {
   contextTokens: number;
-  source: "env" | "config" | "default";
+  source: "model" | "env" | "config" | "default";
   toolBudget: number;
   contextChars: number;
   resultChars: number;
@@ -128,9 +137,23 @@ export function limitsOf(cfg: Partial<RalphConfig>): {
   maxItems: number;
 } {
   const env = envContextTokens();
-  const candidates = [cfg.contextTokens, env].filter((n): n is number => n !== undefined);
+  const model = modelMaxContext;
+  const candidates = [model, env, cfg.contextTokens].filter(
+    (n): n is number => n !== undefined,
+  );
   const contextTokens = candidates.length ? Math.min(...candidates) : DEFAULT_CONTEXT_TOKENS;
-  const source = candidates.length === 0 ? "default" : contextTokens === env ? "env" : "config";
+  let source: "model" | "env" | "config" | "default";
+  if (candidates.length === 0) {
+    source = "default";
+  } else if (model !== undefined && contextTokens === model) {
+    source = "model";
+  } else if (env !== undefined && contextTokens === env) {
+    source = "env";
+  } else if (cfg.contextTokens !== undefined && contextTokens === cfg.contextTokens) {
+    source = "config";
+  } else {
+    source = "default";
+  }
   const toolBudget = cfg.toolBudget ?? DEFAULT_TOOL_BUDGET;
   const contextChars = Math.floor(contextTokens * 2.5); // conservative chars/token (HTML/JSON-heavy output)
   return {
@@ -632,13 +655,22 @@ function specLine(relDir: string, hasSpec: boolean): string {
     : "";
 }
 
-export function workerPrompt(prd: RalphPrd, cfg: RalphConfig, task: RalphTask, relDir: string, outDir: string, hasSpec = false): string {
+export function workerPrompt(
+  prd: RalphPrd,
+  cfg: RalphConfig,
+  task: RalphTask,
+  relDir: string,
+  outDir: string,
+  hasSpec = false,
+  modelMaxContext?: number,
+): string {
+  const lim = limitsOf(cfg, modelMaxContext);
   const head = [
     "You are ONE iteration of an autonomous Ralph loop. You have a fresh context: everything you know comes from files.",
     `Run directory: ${relDir}/  (relative to the current directory)`,
     `Overall goal: ${prd.description || prd.name}`,
     specLine(relDir, hasSpec),
-    `Budget: this iteration has about ${limitsOf(cfg).toolBudget} tool calls and a ~${limitsOf(cfg).contextTokens}-token context. Tool outputs are truncated and old ones are dropped, so read only what you need and finish early. Never read a whole large file: use grep_file to find the lines you need, then read_file with a small offset/bytes slice.`,
+    `Budget: this iteration has about ${lim.toolBudget} tool calls and a ~${lim.contextTokens}-token context. Tool outputs are truncated and old ones are dropped, so read only what you need and finish early. Never read a whole large file: use grep_file to find the lines you need, then read_file with a small offset/bytes slice.`,
     `Your task: ${task.id} — ${task.title}`,
     task.description ?? "",
     "Acceptance criteria:",
@@ -692,8 +724,17 @@ export function synthesisPrompt(prd: RalphPrd, relDir: string, outDir: string, h
   ].filter((l) => l !== "").join("\n");
 }
 
-export function splitterPrompt(prd: RalphPrd, cfg: RalphConfig, task: RalphTask, relDir: string, outDir: string, hasSpec: boolean, why: string): string {
-  const lim = limitsOf(cfg);
+export function splitterPrompt(
+  prd: RalphPrd,
+  cfg: RalphConfig,
+  task: RalphTask,
+  relDir: string,
+  outDir: string,
+  hasSpec: boolean,
+  why: string,
+  modelMaxContext?: number,
+): string {
+  const lim = limitsOf(cfg, modelMaxContext);
   return [
     "You are the SPLITTER in a Ralph loop, with a fresh context. Your ONLY job is one call to ralph_split_task. Do NOT do the task, and do NOT write analysis, notes or summaries in your reply.",
     `Task ${task.id} — ${task.title} did not fit in one iteration (${why}). An iteration has only ~${lim.contextTokens} tokens of context and ${lim.toolBudget} tool calls.`,
@@ -711,9 +752,16 @@ export function splitterPrompt(prd: RalphPrd, cfg: RalphConfig, task: RalphTask,
  * absent. `interactive` (chat) lets it ask clarifying questions first;
  * headless (`ralph init --plan`) must decide alone and log its assumptions.
  */
-export function planPrompt(prd: RalphPrd, hasSpec: boolean, interactive: boolean, relDir: string, cfg: Partial<RalphConfig> = {}): string {
+export function planPrompt(
+  prd: RalphPrd,
+  hasSpec: boolean,
+  interactive: boolean,
+  relDir: string,
+  cfg: Partial<RalphConfig> = {},
+  modelMaxContext?: number,
+): string {
   const name = prd.name;
-  const lim = limitsOf(cfg);
+  const lim = limitsOf(cfg, modelMaxContext);
   return [
     `Plan the tasks for the existing Ralph run "${name}" (mode: ${prd.mode}). Goal: ${prd.description || "(see the spec)"}`,
     hasSpec
@@ -749,6 +797,13 @@ export interface AgentRunArgs {
   env: Record<string, string>;
   timeoutMs: number;
   logFile: string;
+  /**
+   * The models.json id to hand to the child via `--model`. When set, the
+   * default runners append it *after* `forwardArgs`, so last-value-wins makes the
+   * role's model override the top-level session default. Omitted = inherit whatever
+   * `forwardArgs` (the session `--model`) already carried.
+   */
+  modelId?: string;
 }
 export interface ExecResult {
   code: number;
@@ -760,6 +815,21 @@ export interface RunRalphOptions {
   name: string;
   /** Override config.maxIterations (max iterations per task). */
   maxIterations?: number;
+  /** The `--base-url` session override, used only when the selected entry has no base of its own. */
+  baseOverride?: string | null;
+  /**
+   * models.json id for the top-level / role-default model (the `--model` flag).
+   * Omitted/null = resolve the file default (the `default: true` entry, else first).
+   */
+  modelId?: string | null;
+  /** models.json id for the *worker* role (fresh-context iterations). Omitted = modelId. */
+  workerModelId?: string | null;
+  /** models.json id for the *checker* role (research verification). Omitted = modelId. */
+  checkerModelId?: string | null;
+  /** models.json id for the *splitter* role (task splitting). Omitted = modelId. */
+  splitterModelId?: string | null;
+  /** models.json id for the *report* role (final synthesis). Omitted = modelId. */
+  reportModelId?: string | null;
   /** Flags forwarded to each child (e.g. --model). Default: setRalphForwardArgs(). */
   extraArgs?: string[];
   log?: (line: string) => void;
@@ -808,15 +878,22 @@ const defaultExec = (cmd: string, cwd: string, timeoutMs: number): Promise<ExecR
     });
   });
 
-/** Env for an iteration child: role/task identity + context-window limits. */
+/**
+ * Env for an iteration child: role/task identity + context-window limits.
+ *
+ * `modelMaxContext` (optional) is the resolved context window of the specific
+ * role's model; it beats the env/config values when present. Omitted = legacy
+ * behaviour (env > config > default).
+ */
 export function ralphChildEnv(
   dir: string,
   name: string,
   cfg: RalphConfig,
   role: "worker" | "checker" | "splitter",
   taskId: string,
+  modelMaxContext?: number,
 ): Record<string, string> {
-  const lim = limitsOf(cfg);
+  const lim = limitsOf(cfg, modelMaxContext);
   return {
     SLASK_RALPH_DIR: dir,
     SLASK_RALPH_NAME: name,
@@ -851,6 +928,22 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
   const maxIterations = opts.maxIterations ?? cfg.maxIterations;
   const outDir = outputDirOf(name, cfg);
 
+  // Resolve the role models up front — an unknown id fails fast here with the
+  // available-id list (strict). A role with no explicit id inherits the top
+  // model; the top level with no id uses the file default.
+  const resolveRole = async (
+    id?: string | null,
+    fallback?: ResolvedModel,
+  ): Promise<ResolvedModel> =>
+    id
+      ? resolveModel(base, { id, baseOverride: opts.baseOverride ?? null })
+      : (fallback ?? resolveModel(base, { baseOverride: opts.baseOverride ?? null }));
+  const topModel = await resolveRole(opts.modelId);
+  const workerModel = await resolveRole(opts.workerModelId, topModel);
+  const checkerModel = await resolveRole(opts.checkerModelId, topModel);
+  const splitterModel = await resolveRole(opts.splitterModelId, topModel);
+  const reportModel = await resolveRole(opts.reportModelId, topModel);
+
   // lock: one loop per run
   const other = await readPid(base, name);
   if (other !== null && other !== process.pid) {
@@ -872,21 +965,37 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
   }
   opts.signal?.addEventListener("abort", abort);
 
+  // The role's model is appended *after* `extraArgs`; the parser is
+  // last-value-wins, so it overrides the top-level `--model` inherited from
+  // `forwardArgs` when a specific role model was chosen.
   const runAgent =
     opts.runAgentFn ??
     ((a: AgentRunArgs) =>
-      runCliChild(["--prompt", a.prompt, "--quiet", ...extraArgs], {
-        timeoutMs: a.timeoutMs,
-        env: a.env,
-        capture: true,
-        onOutput: (chunk) => void appendFile(a.logFile, chunk).catch(() => {}),
-        onSpawn: (c) => {
-          current = c;
+      runCliChild(
+        [
+          "--prompt",
+          a.prompt,
+          "--quiet",
+          ...extraArgs,
+          ...(a.modelId ? ["--model", a.modelId] : []),
+        ],
+        {
+          timeoutMs: a.timeoutMs,
+          env: a.env,
+          capture: true,
+          onOutput: (chunk) => void appendFile(a.logFile, chunk).catch(() => {}),
+          onSpawn: (c) => {
+            current = c;
+          },
         },
-      }));
+      ));
 
-  const childEnv = (role: "worker" | "checker" | "splitter", task?: RalphTask): Record<string, string> =>
-    ralphChildEnv(dir, name, cfg, role, task?.id ?? "");
+  const childEnv = (
+    role: "worker" | "checker" | "splitter",
+    task?: RalphTask,
+    modelMaxContext?: number,
+  ): Record<string, string> =>
+    ralphChildEnv(dir, name, cfg, role, task?.id ?? "", modelMaxContext);
 
   // `iteration` counts every worker run in this loop (status.json, iterations/NN.log);
   // `attempt` counts tries at the CURRENT task: it restarts at 1 for each new task, so
@@ -943,10 +1052,11 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
       const logFile = join(dir, "iterations", `${nn}.log`);
       await mkdir(join(dir, "iterations"), { recursive: true });
       const w = await runAgent({
-        prompt: workerPrompt(prd, cfg, task, relDir, outDir, hasSpec),
-        env: childEnv("worker", task),
+        prompt: workerPrompt(prd, cfg, task, relDir, outDir, hasSpec, workerModel.maxContext),
+        env: childEnv("worker", task, workerModel.maxContext),
         timeoutMs: cfg.timeoutS * 1000,
         logFile,
+        modelId: workerModel.id,
       });
       current = null;
       if (aborted) return await finish("stopped", "interrupted");
@@ -970,7 +1080,7 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
           log(`  ⚠ ${t.id} did not fit in one iteration (${why}) — splitting it`);
           let sr: SplitOutcome;
           try {
-            sr = await splitViaAgent(base, name, t.id, (a) => runAgent(a), why);
+            sr = await splitViaAgent(base, name, t.id, (a) => runAgent(a), why, splitterModel);
           } catch (e) {
             sr = { ok: false, ids: [], code: -2, reason: e instanceof Error ? e.message : String(e), text: "" };
           }
@@ -996,9 +1106,10 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
         log("  verifying: checker pass");
         await runAgent({
           prompt: checkerPrompt(after, t, outDir, relDir, hasSpec),
-          env: childEnv("checker", t),
+          env: childEnv("checker", t, checkerModel.maxContext),
           timeoutMs: cfg.timeoutS * 1000,
           logFile: join(dir, "iterations", `${nn}-check.log`),
+          modelId: checkerModel.id,
         });
         current = null;
         if (aborted) return await finish("stopped", "interrupted");
@@ -1038,7 +1149,7 @@ export async function runRalph(opts: RunRalphOptions): Promise<RalphOutcome> {
     const done = await loadPrd(base, name);
     if (done.mode === "research" && done.tasks.length > 0) {
       log("\n=== final synthesis ===");
-      await synthesize(base, name, cfg, done, runAgent);
+      await synthesize(base, name, cfg, done, runAgent, reportModel.maxContext, reportModel.id);
       current = null;
     }
     return await finish("done", done.mode === "research" ? `report: ${outDir}/report.md` : undefined);
@@ -1062,22 +1173,34 @@ async function synthesize(
   cfg: RalphConfig,
   prd: RalphPrd,
   runAgent: (a: AgentRunArgs) => Promise<ExecResult>,
+  reportModelMaxContext?: number,
+  reportModelId?: string,
 ): Promise<ExecResult> {
   const dir = runDir(base, name);
   const outDir = outputDirOf(name, cfg);
   await mkdir(join(dir, "iterations"), { recursive: true });
   await copyFile(join(base, outDir, "report.md"), join(base, outDir, "report.prev.md")).catch(() => {});
+  // The report child keeps the `"worker"` env role (identical toolset — `ralphRole()`
+  // collapses it to worker anyway, which is exactly what synthesis needs: the worker
+  // toolset, including `ralph_complete_task`). The *empty* task is what marks it as
+  // the synthesis step. The report model's context window is threaded through
+  // `reportModelMaxContext` rather than flipping the env role.
   return runAgent({
     prompt: synthesisPrompt(prd, relative(base, dir) || ".", outDir, (await specSize(base, name)) !== null),
-    env: ralphChildEnv(dir, name, cfg, "worker", ""),
+    env: ralphChildEnv(dir, name, cfg, "worker", "", reportModelMaxContext),
     timeoutMs: cfg.timeoutS * 1000,
     logFile: join(dir, "iterations", "report.log"),
+    ...(reportModelId ? { modelId: reportModelId } : {}),
   });
 }
 
 export interface RunReportOptions {
   base?: string;
   name: string;
+  /** models.json id for the report role. Omitted/null = resolve the file default. */
+  reportModelId?: string | null;
+  /** The `--base-url` session override. Omitted/null = null. */
+  baseOverride?: string | null;
   runAgentFn?: (a: AgentRunArgs) => Promise<ExecResult>;
   log?: (s: string) => void;
 }
@@ -1095,21 +1218,35 @@ export async function runReport(opts: RunReportOptions): Promise<{ ok: boolean; 
   const cfg = await loadConfig(base, name);
   const outDir = outputDirOf(name, cfg);
   const dir = runDir(base, name);
+  // Resolve the report model (fail-fast on unknown ids, listing available ids).
+  const reportModel = await resolveModel(base, {
+    id: opts.reportModelId ?? null,
+    baseOverride: opts.baseOverride ?? null,
+  });
   const runAgent =
     opts.runAgentFn ??
     ((a: AgentRunArgs) =>
-      runCliChild(["--prompt", a.prompt, "--quiet", ...forwardArgs], {
-        timeoutMs: a.timeoutMs,
-        env: a.env,
-        capture: true,
-        onOutput: (chunk) => void appendFile(a.logFile, chunk).catch(() => {}),
-      }));
+      runCliChild(
+        [
+          "--prompt",
+          a.prompt,
+          "--quiet",
+          ...forwardArgs,
+          ...(a.modelId ? ["--model", a.modelId] : []),
+        ],
+        {
+          timeoutMs: a.timeoutMs,
+          env: a.env,
+          capture: true,
+          onOutput: (chunk) => void appendFile(a.logFile, chunk).catch(() => {}),
+        },
+      ));
   await writeFile(join(dir, "run.pid"), String(process.pid));
   const startedAt = Date.now();
   try {
     await writeStatus(base, name, { state: "running", iteration: 0, message: "rewriting the report" });
     (opts.log ?? console.log)(`rewriting ${outDir}/report.md from ${prd.tasks.length} task(s)…`);
-    const r = await synthesize(base, name, cfg, prd, runAgent);
+    const r = await synthesize(base, name, cfg, prd, runAgent, reportModel.maxContext, reportModel.id);
     const written = await stat(join(base, outDir, "report.md")).then((s) => s.mtimeMs >= startedAt - 1000, () => false);
     const ok = r.code === 0 && written;
     const message = ok ? `report: ${outDir}/report.md` : `report not written (exit ${r.code}); log: ${STATE_DIR}/${name}/iterations/report.log`;
@@ -1565,6 +1702,10 @@ export const RALPH_HELP = [
   "  /ralph start <name>                              run the loop in the background",
   "  /ralph stop <name>                               stop a running loop",
   "",
+  "Model selection: the REPL takes positional args only. Pick a models.json " +
+  "entry from the shell CLI (e.g. slask-client ralph run <name> " +
+  "--worker-model fast --report-model smart) or via the schedule / MCP tools.",
+  "",
   "Typical flow for a big project:",
   "  /ralph init shop code tasks/prd-shop.md   ->   /ralph plan shop   ->   /ralph start shop",
 ].join("\n");
@@ -1754,12 +1895,25 @@ export interface RalphCliArgs {
   toolBudget?: string;
   desc?: string;
   note?: string;
+  /** models.json id for the top-level / role-default model (`--model`). */
+  model?: string | null;
+  /** The `--base-url` session override. */
+  base?: string | null;
+  /** models.json id for the worker role (`--worker-model`). Omitted = model. */
+  workerModel?: string | null;
+  /** models.json id for the checker role (`--checker-model`). Omitted = model. */
+  checkerModel?: string | null;
+  /** models.json id for the splitter role (`--splitter-model`). Omitted = model. */
+  splitterModel?: string | null;
+  /** models.json id for the report role (`--report-model`). Omitted = model. */
+  reportModel?: string | null;
 }
 
 const CLI_USAGE =
   "usage: slask-client ralph <init|add|run|start|stop|status|list> [name] — " +
-  "init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>] [--context <tokens>] [--tool-budget <n>]; spec <name> <file>; split <name> <task-id>; add <name> <title> [--criteria \"a;b\"] [--desc <text>]; reopen <name> <task-id> [--note <why>]; report <name>; " +
-  "run <name> [--max N]; start|stop <name>; status [name]; list";
+  "init <name> [--mode code|research] [--check <cmd>] [--from prd.json] [--spec <file> [--plan]] [--out <dir>] [--context <tokens>] [--tool-budget <n>]; spec <name> <file>; split <name> <task-id> [--splitter-model <id>]; add <name> <title> [--criteria \"a;b\"] [--desc <text>]; reopen <name> <task-id> [--note <why>]; report <name> [--report-model <id>]; " +
+  "run <name> [--max N] [--model <id>] [--worker-model <id>] [--checker-model <id>] [--splitter-model <id>] [--report-model <id>]; start|stop <name>; status [name]; list " +
+  "(--model and role flags take models.json ids; unknown ids fail with the available-id list)";
 
 /** The `slask-client ralph …` subcommand. Returns the process exit code. */
 export interface RalphCliDeps {
@@ -1779,12 +1933,21 @@ const defaultPlanFn = async (name: string, prompt: string): Promise<number> =>
 
 const defaultAgentFn = async (a: AgentRunArgs): Promise<ExecResult> => {
   await mkdir(join(a.env.SLASK_RALPH_DIR, "iterations"), { recursive: true });
-  return runCliChild(["--prompt", a.prompt, "--quiet", ...forwardArgs], {
-    timeoutMs: a.timeoutMs,
-    env: a.env,
-    capture: true,
-    onOutput: (c) => void appendFile(a.logFile, c).catch(() => {}),
-  });
+  return runCliChild(
+    [
+      "--prompt",
+      a.prompt,
+      "--quiet",
+      ...forwardArgs,
+      ...(a.modelId ? ["--model", a.modelId] : []),
+    ],
+    {
+      timeoutMs: a.timeoutMs,
+      env: a.env,
+      capture: true,
+      onOutput: (c) => void appendFile(a.logFile, c).catch(() => {}),
+    },
+  );
 };
 
 export interface SplitOutcome {
@@ -1813,6 +1976,7 @@ export async function splitViaAgent(
   id: string,
   agentFn: (a: AgentRunArgs) => Promise<ExecResult> = defaultAgentFn,
   why?: string,
+  model?: ResolvedModel,
 ): Promise<SplitOutcome> {
   const prd = await loadPrd(base, name);
   const task = prd.tasks.find((x) => x.id === id);
@@ -1824,13 +1988,16 @@ export async function splitViaAgent(
   const cfg = await loadConfig(base, name);
   const dir = runDir(base, name);
   await writeFile(join(dir, "split-result.json"), "").catch(() => {});
+  // The splitter role's model (threaded by the caller, else the file default).
+  const m = model ?? (await resolveModel(base, { baseOverride: null }));
   const prompt = splitterPrompt(
     prd, cfg, task, relative(base, dir), outputDirOf(name, cfg), (await specSize(base, name)) !== null,
     why ?? task.lastFailure ?? "manual split requested",
+    m.maxContext,
   );
-  const env = ralphChildEnv(dir, name, cfg, "splitter", id);
+  const env = ralphChildEnv(dir, name, cfg, "splitter", id, m.maxContext);
   const logFile = join(dir, "iterations", `split-${id}.log`);
-  const r = await agentFn({ prompt, env, timeoutMs: cfg.timeoutS * 1000, logFile });
+  const r = await agentFn({ prompt, env, timeoutMs: cfg.timeoutS * 1000, logFile, modelId: m.id });
 
   const after = await loadPrd(base, name);
   const ids = after.tasks.filter((t) => t.id.startsWith(`${id}.`) && !t.id.slice(id.length + 1).includes(".")).map((t) => t.id);
@@ -1907,7 +2074,8 @@ export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd
       log(`created run "${prd.name}" [${prd.mode}] with ${prd.tasks.length} task(s) in ${STATE_DIR}/${prd.name}/${spec ? " (spec copied to spec.md)" : ""}`);
       if (a.plan) {
         log("planning tasks from the description (non-interactive)…");
-        const prompt = planPrompt(prd, spec !== undefined, false, relative(base, runDir(base, name)), await loadConfig(base, name));
+        const topModel = await resolveModel(base, { id: a.model ?? null, baseOverride: a.base ?? null });
+        const prompt = planPrompt(prd, spec !== undefined, false, relative(base, runDir(base, name)), await loadConfig(base, name), topModel.maxContext);
         const code = await (deps.planFn ?? defaultPlanFn)(name, prompt);
         log(await formatStatus(base, name));
         if (code !== 0) log(`⚠ planning exited with code ${code} — review the task list, or add tasks with \`ralph add\``);
@@ -1943,14 +2111,22 @@ export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd
     }
     case "report": {
       if (name === undefined) throw new Error(CLI_USAGE);
-      const r = await runReport({ base, name, runAgentFn: deps.agentFn, log });
+      const r = await runReport({
+        base,
+        name,
+        runAgentFn: deps.agentFn,
+        log,
+        reportModelId: a.reportModel ?? a.model ?? null,
+        baseOverride: a.base ?? null,
+      });
       log(r.text);
       return r.ok ? 0 : 1;
     }
     case "split": {
       const id = a.positional[3];
       if (name === undefined || id === undefined) throw new Error(CLI_USAGE);
-      const r = await splitViaAgent(base, name, id, deps.agentFn);
+      const splitterModel = await resolveModel(base, { id: a.splitterModel ?? a.model ?? null, baseOverride: a.base ?? null });
+      const r = await splitViaAgent(base, name, id, deps.agentFn, undefined, splitterModel);
       log(r.text);
       return r.ok ? 0 : 1;
     }
@@ -1960,6 +2136,12 @@ export async function handleRalphCli(a: RalphCliArgs, base: string = process.cwd
         base,
         name,
         maxIterations: a.max ? Number.parseInt(a.max, 10) : undefined,
+        baseOverride: a.base ?? null,
+        modelId: a.model ?? null,
+        workerModelId: a.workerModel ?? a.model ?? null,
+        checkerModelId: a.checkerModel ?? a.model ?? null,
+        splitterModelId: a.splitterModel ?? a.model ?? null,
+        reportModelId: a.reportModel ?? a.model ?? null,
         log,
       });
       return out.state === "done" ? 0 : 1;
